@@ -317,7 +317,7 @@ def _auth(policy, state, enforce, *, discovered=False):
     )
 
 
-def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=False, behind_base=False):
+def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=False, behind_base=False, file_tools=False, event_type=None):
     from mimir import access_control
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import policy_scope
@@ -339,6 +339,11 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
             root = state.checkout_lease.lease_root
             state = RepoReviewState(scope)
             create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    if event_type is not None:
+        scope = replace(scope, event_type=event_type)
+        root = state.checkout_lease.lease_root
+        state = RepoReviewState(scope)
+        create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
     # This test's forge remote is a local bare Git repository.
     monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: scope.canonical_repo)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
@@ -349,6 +354,14 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
         ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
         _plugin_slot_policy=policy,
     )
+    if file_tools:
+        service = build_trigger_service_principal(
+            canonical=auth.canonical_principal, trigger="poller", profile="github",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=(*policy.tools, "edit_file", "write_file"), creation_path="test",
+        )
+        auth = replace(auth, service_authority=service, is_service=True,
+                       repo_review_state=state, repo_pr_action_scope=scope)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     from mimir.access_control import pr_checkout_lease_attestation
     with policy_scope(policy):
@@ -356,14 +369,28 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
     gate = BudgetGateMiddleware(policy)
     args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
 
+    from mimir.readonly_backend import WriteGuardBackend
+    backend = WriteGuardBackend(state.checkout_lease.path.parent, [state.checkout_lease.path.name])
+    filesystem_tools = {
+        "edit_file": StructuredTool.from_function(backend.edit, name="edit_file", description="Edit file"),
+        "write_file": StructuredTool.from_function(backend.write, name="write_file", description="Write file"),
+    }
+
     def invoke(name, _artifact=None, **extra):
+        arguments = extra if name in filesystem_tools else {**args, **extra}
         request = ToolCallRequest(
-            tool_call={"name": name, "args": {**args, **extra}, "id": name,
+            tool_call={"name": name, "args": arguments, "id": name,
                        "type": "tool_call"},
-            tool=policy.tools[name].factory(), state={}, runtime=Runtime(context=auth),
+            tool=filesystem_tools[name] if name in filesystem_tools else policy.tools[name].factory(),
+            state={}, runtime=Runtime(context=auth),
         )
 
         def handler(call):
+            if name in filesystem_tools:
+                method = backend.edit if name == "edit_file" else backend.write
+                result = method(**call.tool_call["args"])
+                assert result.error is None, result.error
+                return ToolMessage(content="File updated", tool_call_id=name)
             if name == "repo_checkout":
                 from mimir_cultivate.repository import _publish_attested_lease_result
                 _publish_attested_lease_result(SimpleNamespace(context=auth), state)
@@ -421,21 +448,107 @@ def test_conflicted_operation_inspect_abort_same_trusted_turn(tmp_path, monkeypa
 
 
 def _decision(auth, scope, name, **extra):
-    return ToolRegistry().authorize_tool(
-        name, auth, enforce=True, policy=auth._plugin_slot_policy,
-        arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number, **extra},
-    )
+    from mimir.plugins.core import policy_scope
+
+    with policy_scope(auth._plugin_slot_policy):
+        return ToolRegistry().authorize_tool(
+            name, auth, enforce=True, policy=auth._plugin_slot_policy,
+            target_channel=extra.get("file_path") if name in {"edit_file", "write_file"} else None,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number, **extra},
+        )
 
 
 @pytest.mark.parametrize("kind", ["rebase", "merge"])
-@pytest.mark.parametrize("tool", ["repo_push", "repo_commit", "repo_stage", "repo_restore_file", "write_file", "edit_file"])
+@pytest.mark.parametrize("tool", ["repo_push", "repo_commit", "repo_stage", "repo_restore_file", "write_file", "edit_file", "repo_test"])
 def test_interrupted_operation_does_not_grant_other_writes(tmp_path, monkeypatch, kind, tool):
-    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True, file_tools=True)
     assert invoke(f"repo_{kind}").status == "error"
     assert not auth.ifc_state.has_untrusted_active_ingest()
     decision = _decision(auth, scope, tool, path=str(state.checkout_lease.path / "tracked.txt"),
                          file_path=str(state.checkout_lease.path / "tracked.txt"), content="must not write")
-    assert not decision.allowed, (tool, decision)
+    assert decision.allowed == (kind == "merge" and tool != "repo_push"), (tool, decision)
+
+
+@pytest.mark.parametrize("tool", ["edit_file", "write_file", "repo_stage", "repo_restore_file", "repo_test", "repo_commit"])
+@pytest.mark.parametrize("invalid", [
+    "no_evidence", "other_turn", "other_scope", "other_lease", "observed_base",
+    "base_ref", "nested_operation", "foreign_merge_head", "non_base_target",
+])
+def test_interrupted_merge_writes_require_matching_evidence(tmp_path, monkeypatch, tool, invalid):
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True, file_tools=True)
+    assert invoke("repo_merge").status == "error"
+    receipt = state.interrupted_operation
+    lease = state.checkout_lease
+    assert receipt is not None
+    if invalid == "no_evidence":
+        object.__setattr__(state, "interrupted_operation", None)
+    elif invalid in {"other_turn", "other_scope", "other_lease", "observed_base", "base_ref"}:
+        field = {"other_turn": "turn_nonce", "other_scope": "scope_id",
+                 "other_lease": "lease_identity"}.get(invalid, invalid)
+        value = (str(lease.path), "other") if invalid == "other_lease" else "other"
+        object.__setattr__(state, "interrupted_operation", replace(receipt, **{field: value}))
+    elif invalid == "nested_operation":
+        (lease.path / ".git/rebase-apply").mkdir()
+    else:
+        target = scope.observed_head_sha
+        (lease.path / ".git/MERGE_HEAD").write_text(target + "\n")
+        if invalid == "non_base_target":
+            object.__setattr__(state, "interrupted_operation", replace(receipt, target=target))
+    decision = _decision(auth, scope, tool, file_path=str(lease.path / "tracked.txt"), content="refused")
+    assert not decision.allowed, (invalid, tool, decision)
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+
+
+def test_conflicted_merge_resolve_stage_commit_push_same_trusted_turn(tmp_path, monkeypatch):
+    from mimir_cultivate import repository
+
+    origin, scope, state, auth, invoke = _remediation_turn(
+        tmp_path, monkeypatch, conflicting=True, file_tools=True,
+        event_type="pr_changes_requested_stale",
+    )
+    assert invoke("repo_merge").status == "error"
+    lease = state.checkout_lease
+    path = lease.path / "tracked.txt"
+    conflicted = path.read_text()
+    assert "<<<<<<<" in conflicted
+    assert not _decision(auth, scope, "repo_push").allowed
+    result = invoke("edit_file", file_path=str(path), old_string=conflicted,
+                    new_string="base property\nhead property\n")
+    assert result.status == "success", result.content
+    assert path.read_text() == "base property\nhead property\n"
+    result = invoke("write_file", file_path=str(lease.path / "resolution.txt"), content="resolved\n")
+    assert result.status == "success", result.content
+    result = invoke("repo_restore_file", revision=scope.observed_head_sha,
+                    source_path="tracked.txt", destination_path="restored.txt")
+    assert result.status == "success", result.content
+    assert (lease.path / "restored.txt").read_text()
+    paths = ("tracked.txt", "resolution.txt", "restored.txt")
+    # First clear the proven unmerged index entry, then stage new resolution files.
+    result = invoke("repo_stage", paths=("tracked.txt",))
+    assert result.status == "success", result.content
+    result = invoke("repo_stage", paths=paths)
+    assert result.status == "success", result.content
+    tested = []
+
+    async def execute(self, selectors, *, suite):
+        # Only the contained subprocess is stubbed; actual repo_test authorization,
+        # checkout validation and IFC classification still run with MERGE_HEAD.
+        repository.RepoGitTools(self._state).validated_checkout_root()
+        tested.append(True)
+        return repository.ProjectTestResult(True, "ok", 0)
+
+    monkeypatch.setattr(repository.RepoProjectTests, "execute", execute)
+    result = invoke("repo_test")
+    assert result.status == "success", result.content
+    assert tested == [True]
+    result = invoke("repo_commit", paths=(*paths, "base-test", "head-test", "suite"), message="resolve scoped merge")
+    assert result.status == "success", result.content
+    assert not (lease.path / ".git/MERGE_HEAD").exists()
+    assert state.interrupted_operation is None
+    result = invoke("repo_push")
+    assert result.status == "success", result.content
+    assert _git(origin, "rev-parse", scope.destination_ref) == state.git_expected_head
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
 
 
 def test_conflicted_rebase_continue_failures_stay_trusted_then_complete(tmp_path, monkeypatch):

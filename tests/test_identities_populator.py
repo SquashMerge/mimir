@@ -15,6 +15,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 from mimir.event_logger import init_logger
 from mimir.identities import IdentityResolver
 from mimir.identities_populator import (
@@ -1107,7 +1109,7 @@ def test_discord_role_writer_refuses_admin_with_optimization(tmp_path):
             "else:",
             "    raise RuntimeError('optimized interpreter accepted admin roles')",
         ]), str(tmp_path)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "rejected"

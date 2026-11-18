@@ -22,6 +22,8 @@ import pytest
 import asyncio
 from importlib.metadata import PackageNotFoundError, version
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 pytestmark = pytest.mark.usefixtures("authorized_fake_backend_gate")
 
 
@@ -109,7 +111,7 @@ print(json.dumps(results))
         inode = lock.stat().st_ino
         child = subprocess.run(
             [sys.executable, "-c", script, str(tmp_path)],
-            capture_output=True, text=True, check=True, timeout=30,
+            capture_output=True, text=True, check=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
         )
         assert json.loads(child.stdout) == [not pruning, False]
         with factory_checkout_interlock(tmp_path / "other", pruning=True) as other:
@@ -12081,7 +12083,7 @@ print(json.dumps([str(path) for path in pruned]))
 """
         child = subprocess.run(
             [sys.executable, "-c", script, str(tmp_path), str(repo)],
-            capture_output=True, text=True, timeout=30, check=True,
+            capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS, check=True,
         )
         return json.loads(child.stdout)
     historical = {"reason": "opaque and nonauthoritative"}

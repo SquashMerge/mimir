@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 from mimir import github_identity as core_identity
 from mimir.tools.refusals import ToolPolicyRefusal
 
@@ -139,8 +141,10 @@ assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
 """
     env = {**os.environ, "MIMIR_PLUGINS": "", "GITHUB_TOKEN": "process-token",
            "GH_TOKEN": "stray-token", "MIMIR_GITHUB_SELF_LOGIN": "reviewer"}
+    # Hang guard, not a latency bound: imports may be slow on a loaded host.
     result = subprocess.run(
-        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=30,
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert result.returncode == 0, result.stderr
 

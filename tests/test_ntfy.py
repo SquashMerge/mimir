@@ -33,6 +33,8 @@ from unittest.mock import AsyncMock
 import aiohttp
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 from mimir import ntfy
 
 
@@ -1315,7 +1317,8 @@ assert a.classification == 'wedge'
 assert a.last_tick is None
 assert a.monitoring_since.isoformat() == sys.argv[4]
 """, str(events_file), str(scheduler), later.isoformat(), now.isoformat()],
-        capture_output=True, text=True, timeout=30,
+        # Hang guard for the fresh interpreter, not the scheduler's grace period.
+        capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert result.returncode == 0, result.stderr
     await ntfy.fire_scheduler_wedge_alarm_if_warranted(

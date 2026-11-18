@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 from mimir import github_identity as core_identity
 
 from mimir.tools import _shell_env
@@ -331,7 +333,8 @@ assert result.returncode != 0
 assert "PermissionError" in result.stderr
 '''
     result = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30,
+        [sys.executable, "-c", script], capture_output=True, text=True,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert result.returncode == 0, result.stderr
 
@@ -381,18 +384,20 @@ sys.stdin.read()
             "exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(probe),
         )]
         env = _shell_env.interactive_shell_env()
-        before = subprocess.run(argv, env=env, capture_output=True, timeout=10)
+        before = subprocess.run(
+            argv, env=env, capture_output=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
+        )
         assert before.returncode == 0, before.stderr
         sibling.stdin.write("start cli\n")
         sibling.stdin.flush()
         assert sibling.stdout.readline().strip() == "after"
         after = subprocess.run(
-            argv, env=env, capture_output=True, text=True, timeout=10,
+            argv, env=env, capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
         )
         assert after.returncode != 0
         assert "PermissionError" in after.stderr
         sibling.stdin.close()
-        assert sibling.wait(timeout=10) == 0
+        assert sibling.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
     finally:
         if sibling.poll() is None:
             sibling.kill()

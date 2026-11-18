@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 from mimir.identities import IdentityResolver
 from mimir import identities_populator as _pop
 from mimir.identities_populator import capture_dm_channel, merge_into_yaml
@@ -572,20 +574,20 @@ else:
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     second = None
     try:
-        assert select.select([first.stdout], [], [], 15)[0]
+        assert select.select([first.stdout], [], [], SUBPROCESS_HANG_GUARD_SECONDS)[0]
         assert first.stdout.readline().strip() == b"started"
-        assert select.select([first.stdout], [], [], 15)[0]
+        assert select.select([first.stdout], [], [], SUBPROCESS_HANG_GUARD_SECONDS)[0]
         assert first.stdout.readline().strip() == b"loaded"
         second = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), operation, "2"],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-        assert select.select([second.stdout], [], [], 15)[0]
+        assert select.select([second.stdout], [], [], SUBPROCESS_HANG_GUARD_SECONDS)[0]
         assert second.stdout.readline().strip() == b"started"
         # The second process cannot load a stale snapshot while the first
         # transaction is paused after reading but before writing.
         assert not select.select([second.stdout], [], [], 0.2)[0]
-        _, error = first.communicate(b"continue\n", timeout=15)
+        _, error = first.communicate(b"continue\n", timeout=SUBPROCESS_HANG_GUARD_SECONDS)
         assert first.returncode == 0, error
-        output, error = second.communicate(timeout=15)
+        output, error = second.communicate(timeout=SUBPROCESS_HANG_GUARD_SECONDS)
         assert second.returncode == 0, error
         assert output.strip() == b"loaded"
         if operation == "mint":

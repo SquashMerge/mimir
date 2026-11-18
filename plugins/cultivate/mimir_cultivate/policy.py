@@ -615,17 +615,26 @@ def _live_scoped_pr_lease(
             or attached.destination_ref != scope.destination_ref
             or getattr(review_state, "action_scope", None) is not scope):
         return refuse("lease identity or bound review state differs from scope")
-    # Even a merge whose HEAD has not moved is an interrupted operation. Do not
-    # let the ordinary branch/head match authorize publication or file writes.
-    git_dir = path / ".git"
-    interrupted = any((git_dir / marker).exists() for marker in (
-        "rebase-merge", "rebase-apply", "MERGE_HEAD",
-    ))
-    if interrupted:
-        if not _valid_interrupted_operation(scope, review_state, tool_name, turn_nonce):
-            return refuse("interrupted operation lacks matching turn-local recovery evidence")
-        return attached
-    observed = _observed_checkout_state(path)
+    try:
+        # A checkout-admitted earlier-turn operation has narrow recovery authority,
+        # not same-turn write authority. Both paths use the repository's single
+        # interrupted-checkout identity observer.
+        recovered = attached.recovery_checkout_state(scope)
+        if recovered is not None:
+            observed = recovered
+        else:
+            from .repository import interrupted_pr_checkout
+
+            interrupted = interrupted_pr_checkout(attached, scope)
+            if interrupted is not None:
+                if not _valid_interrupted_operation(
+                    scope, review_state, tool_name, turn_nonce, interrupted=interrupted,
+                ):
+                    return refuse("interrupted operation lacks matching turn-local recovery evidence")
+                return attached
+            observed = _observed_checkout_state(path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return refuse(f"invalid interrupted checkout: {exc}")
     if isinstance(observed, str):
         return refuse(f"checkout Git state differs from scope: {observed}")
     if observed != (
@@ -658,13 +667,21 @@ def _live_scoped_pr_lease(
     return attached
 
 
-def _valid_interrupted_operation(scope, state, tool_name, turn_nonce) -> bool:
-    """Validate Git's recovery identity as well as the host's own start receipt."""
-    from .repository import hardened_git_command, _PROTECTED_BRANCH_REFS
+def _valid_interrupted_operation(scope, state, tool_name, turn_nonce, *, interrupted=None) -> bool:
+    """Add same-turn operation authority to the shared Git recovery identity."""
+    from .repository import hardened_git_command, interrupted_pr_checkout, _PROTECTED_BRANCH_REFS
 
     evidence = state.interrupted_operation
     lease = state.checkout_lease
     if not isinstance(evidence, InterruptedPROperation) or not turn_nonce:
+        return False
+    try:
+        interrupted = interrupted or interrupted_pr_checkout(lease, scope)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (interrupted is None or interrupted.kind != evidence.kind
+            or interrupted.branch != scope.head_ref
+            or interrupted.original_head != evidence.original_head):
         return False
     if (evidence.scope_id != scope.scope_id
             or evidence.lease_identity != (str(lease.path), lease.recovery_id)
@@ -681,7 +698,12 @@ def _valid_interrupted_operation(scope, state, tool_name, turn_nonce) -> bool:
         if scope.event_type == "pr_mergeability_conflicting":
             allowed.add("repo_rebase")
     elif evidence.kind == "merge":
-        allowed.add("repo_merge_abort")
+        # Resolving our own merge does not detach or advance HEAD. Preserve the
+        # ordinary scoped writes through commit, but never publish MERGE_HEAD.
+        allowed.update({
+            "repo_merge_abort", "edit_file", "write_file", "repo_stage",
+            "repo_restore_file", "repo_test", "repo_commit",
+        })
     else:
         return False
     if tool_name not in allowed:

@@ -21,6 +21,8 @@ from unittest.mock import Mock, call
 
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 pytest.importorskip("mimir_cultivate", reason="Worklink executor belongs to Cultivate")
 
 from mimir_cultivate.worklink.checkout import CheckoutAuthorization, _mint_checkout_authorization
@@ -3871,7 +3873,8 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
         payload = (
             "import subprocess, sys; "
             f"sys.exit(subprocess.run([sys.executable, '-c', {grandchild!r}], "
-            "start_new_session=True, timeout=5).returncode)"
+            # Hang guard for the grandchild, not an identity-switch latency bound.
+            f"start_new_session=True, timeout={SUBPROCESS_HANG_GUARD_SECONDS}).returncode)"
         )
         if git_intake:
             git = shutil.which("git", path="/usr/bin:/bin")

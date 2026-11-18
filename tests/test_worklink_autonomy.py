@@ -27,6 +27,7 @@ from typing import Sequence
 import pytest
 
 from tests.plugin_selection import cultivate_selected
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
 
 if not cultivate_selected():
     pytest.skip("Worklink autonomy requires selected Cultivate", allow_module_level=True)
@@ -2473,7 +2474,7 @@ def test_poller_import_path_repair_uses_explicit_source_dir_without_editable_ins
         env={"MIMIR_SOURCE_DIR": str(source_dir), "PATH": os.environ.get("PATH", "")},
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -2504,7 +2505,7 @@ def test_poller_import_path_repair_adds_source_venv_site_packages(tmp_path: Path
         env={"MIMIR_SOURCE_DIR": str(source_dir), "PATH": os.environ.get("PATH", "")},
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr

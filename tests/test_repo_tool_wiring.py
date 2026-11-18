@@ -747,6 +747,79 @@ async def test_poller_prechecks_own_remediation_before_first_pr_read(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["rebase", "merge", "detached", "other_branch", "wrong_origin"])
+async def test_poller_interrupted_checkout_never_crashes_run_turn(
+    tmp_path, monkeypatch, selected_repo_policy, kind,
+):
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
+    from mimir.models import AgentEvent
+    from mimir.plugins.core import policy_scope
+    from tests.test_agent import _build_agent, _FakeAgent, _FakeSessionManager
+    from tests.test_repo_tools import _interrupted_lease, _git
+    from mimir_cultivate import repository
+
+    lease, scope, state, _ = _interrupted_lease(
+        tmp_path, monkeypatch, kind="merge" if kind == "merge" else "rebase",
+    )
+    refused = kind in {"detached", "other_branch", "wrong_origin"}
+    if kind == "wrong_origin":
+        _git(lease.path, "remote", "set-url", "origin", "/wrong/origin")
+    elif refused:
+        _git(lease.path, "rebase", "--abort")
+        if kind == "detached":
+            _git(lease.path, "checkout", "--detach")
+        else:
+            import subprocess
+            _git(lease.path, "checkout", "-b", "other-branch")
+            assert subprocess.run(["git", "-C", str(lease.path), "rebase", "origin/main"],
+                                  capture_output=True).returncode == 1
+    auth = _auth(scope)
+    auth = replace(
+        auth, repo_pr_scope_registry=RepoPRScopeRegistry((state,)), repo_review_state=state,
+        trigger="poller", canonical_principal="poller:github-activity",
+        service_authority=replace(auth.service_authority, canonical="poller:github-activity",
+                                  trigger="poller", authority_profile="github",
+                                  capabilities=("pr_metadata", "repo_checkout")),
+        scoped_pr_grants=ScopedPRGrants(
+            "poller:github-activity", (scope,), protocols=selected_repo_policy.scoped_actions,
+            _issuer=_SCOPED_PR_ISSUER,
+        ),
+    )
+    monkeypatch.setattr("mimir.agent._create_turn_auth_context", lambda *a, **k: auth)
+    seen = []
+
+    class Recover(_FakeAgent):
+        async def astream(self, inputs, *, config, context=None, stream_mode="values"):
+            seen.append((state.checkout_lease, str(inputs)))
+            if not refused:
+                runtime = SimpleNamespace(context=context)
+                abort = repository.repo_merge_abort if kind == "merge" else repository.repo_rebase_abort
+                result = abort.func(scope.canonical_repo, scope.pr_number, runtime=runtime)
+                seen.append(result)
+                seen.append(repository.repo_diff.func(scope.canonical_repo, scope.pr_number, runtime=runtime))
+            yield {"messages": []}
+
+    agent = _build_agent(tmp_path, fake_agent=Recover([]), fake_saga=None,
+                         session_manager=_FakeSessionManager())
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(
+        policy=selected_repo_policy, plugins=(), turn_preflight=None,
+    ))
+    with policy_scope(selected_repo_policy):
+        await agent.run_turn(AgentEvent(trigger="poller", channel_id="poller:github-activity", content="recover"))
+    # astream errors are caught by run_turn: assert its outcomes outside the model.
+    assert seen
+    if refused:
+        assert seen[0][0] is None
+        assert state.checkout_lease is None
+    else:
+        assert seen[0][0] is state.checkout_lease
+        assert str(lease.path) in seen[0][1]
+        assert len(seen) == 3
+        assert seen[1]["ok"] and seen[2]["ok"]
+        assert state.checkout_lease.interrupted_operation is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["stopped", "reminted", "refused", "post_refused", "post_ok_refusal", "invalid_reason", "ok_refusal"])
 async def test_poller_precheckout_handles_stopped_and_reminted_preflight(
     tmp_path, monkeypatch, selected_repo_policy, outcome,
