@@ -1236,6 +1236,14 @@ class WorklinkRunner:
         except RuntimeError as exc:
             return WorklinkRunResult(issue.issue_id, None, "refused", reason=str(exc))
 
+        retained_worker = load_run_state(self.home, issue.issue_id)
+        if retained_worker is not None and retained_worker.shim_pid is not None:
+            return WorklinkRunResult(
+                issue.issue_id, retained_worker.attempt, "refused",
+                reason="contained worker retirement is unverified; retain recovery "
+                       "state before admitting a fresh attempt",
+            )
+
         claims = ChainlinkClaims(
             chainlink_bin=self.chainlink_bin,
             agent_id=self.agent_id,
@@ -1268,6 +1276,11 @@ class WorklinkRunner:
                 if process_is_alive(existing):
                     raise WorklinkError(
                         f"live run state already exists for issue {issue.issue_id}"
+                    )
+                if existing.shim_pid is not None:
+                    raise WorklinkError(
+                        "contained worker retirement is unverified; retain recovery "
+                        "state before admitting a fresh attempt"
                     )
             save_run_state(
                 self.home,
@@ -1471,6 +1484,9 @@ class WorklinkRunner:
                     try:
                         handle = await compute.launch(spec)
                     except BaseException as exc:
+                        from .compute import ComputeCleanupError
+                        if isinstance(exc, ComputeCleanupError):
+                            remember_session(exc.handle, True)
                         from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
                         if isinstance(exc, (SessionAdmissionCancelled, SessionAdmissionError)):
                             recovery = exc.handle
@@ -1527,7 +1543,13 @@ class WorklinkRunner:
                             except RuntimeError:
                                 terminal_release.retain_for_recovery = True
                                 raise
-                        await compute.cleanup(handle)
+                        try:
+                            await compute.cleanup(handle)
+                        except RuntimeError:
+                            retain_session = True
+                            session_handle = handle
+                            terminal_release.retain_for_recovery = True
+                            raise
                         retain_session = False
 
             def remember_session(handle: LaunchHandle | None, retained: bool) -> None:
@@ -2193,6 +2215,9 @@ class WorklinkRunner:
                         try:
                             handle = await compute.launch(repair_spec)
                         except BaseException as exc:
+                            from .compute import ComputeCleanupError
+                            if isinstance(exc, ComputeCleanupError) and on_session_state is not None:
+                                on_session_state(exc.handle, True)
                             from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
                             if isinstance(exc, (SessionAdmissionCancelled, SessionAdmissionError)):
                                 if on_session_state is not None:

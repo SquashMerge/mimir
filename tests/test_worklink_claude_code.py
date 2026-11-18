@@ -102,6 +102,122 @@ async def test_claude_containment_does_not_depend_on_compute_name(order, monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["launch", "wait", "cleanup"])
+async def test_contained_cancellation_drains_exact_worker_before_forgetting(order, boundary):
+    launched, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    launch_release = asyncio.Event()
+    invocation_started = asyncio.Event()
+    entered_wait = asyncio.Event()
+    identifiers = []
+
+    class Process:
+        pid = os.getpid()
+
+        async def wait(self):
+            entered_wait.set()
+            await release.wait()
+            return 0
+
+    class Client:
+        async def launch(self, **kwargs):
+            launched.set()
+            if boundary == "launch":
+                await launch_release.wait()
+            return Process()
+
+        async def cancel(self, identifier):
+            identifiers.append(identifier)
+            cancelled.set()
+
+    backend = compute.LocalSubprocessComputeBackend(_worker_uid=os.getuid(), _worker_client=Client())
+    spec = spec_for(order)
+    if boundary == "launch":
+        task = asyncio.create_task(backend.launch(spec))
+        await launched.wait()
+        task.cancel()
+        launch_release.set()  # Finish the accepted identity-bound handshake.
+        await entered_wait.wait()
+        await cancelled.wait()
+        handle = next(iter(backend._handles.values()))
+    else:
+        handle = await backend.launch(spec)
+        await entered_wait.wait()
+        if boundary == "wait":
+            async def invoke():
+                try:
+                    invocation_started.set()
+                    await backend.wait(handle, 30)
+                finally:
+                    await backend.cleanup(handle)
+            task = asyncio.create_task(invoke())
+            await invocation_started.wait()
+            task.cancel()
+        else:
+            task = asyncio.create_task(backend.cleanup(handle))
+    try:
+        await asyncio.wait_for(cancelled.wait(), 5)
+        assert identifiers == [handle.identifier]
+        assert backend._handles[handle.identifier] == handle
+        assert not task.done()
+        if boundary == "cleanup":
+            task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert handle.identifier not in backend._jobs
+        assert handle.identifier not in backend._handles
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["lost", "refused", "cancel-refused"])
+async def test_contained_unverified_retirement_preserves_handle_and_collector(order, failure):
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    cancelled = []
+
+    class Process:
+        pid = os.getpid()
+
+        async def wait(self):
+            entered.set()
+            await release.wait()
+            if failure != "cancel-refused":
+                raise RuntimeError(f"supervisor terminal report {failure}")
+            return 0
+
+    class Client:
+        async def launch(self, **kwargs):
+            return Process()
+
+        async def cancel(self, identifier):
+            cancelled.append(identifier)
+            if failure == "cancel-refused":
+                raise RuntimeError("cancellation refused")
+
+    backend = compute.LocalSubprocessComputeBackend(_worker_uid=os.getuid(), _worker_client=Client())
+    handle = await backend.launch(spec_for(order))
+    await entered.wait()
+    job = backend._jobs[handle.identifier][0]
+    try:
+        if failure != "cancel-refused":
+            release.set()
+            with pytest.raises(RuntimeError, match="terminal report"):
+                await backend.wait(handle, 30)
+        with pytest.raises(compute.ComputeCleanupError) as raised:
+            await backend.cleanup(handle)
+        assert raised.value.handle == handle
+        assert cancelled == [handle.identifier]
+        assert backend._handles[handle.identifier] == handle
+        assert backend._jobs[handle.identifier][0] is job
+    finally:
+        release.set()
+        await asyncio.gather(job, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("changes", [{"timed_out": True}, {"output_truncated": True},
                                     {"output_overflow": True}, {"launch_error": "launch failed"}])
 async def test_incomplete_launch_precedes_auth_and_redacts_artifacts(order, changes):
@@ -151,6 +267,56 @@ async def test_deterministic_leaf_gates_do_not_inherit_model_credentials(order):
     assert "worker_identifier" not in gate.backend_config
     assert gate.execution.substrate == "contained_subprocess"
     assert "CLAUDE_CODE_OAUTH_TOKEN" in spec.env
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["verified", "lost"])
+async def test_deterministic_gate_cancellation_requires_terminal_retirement(order, terminal):
+    from mimir_cultivate.worklink.evidence import _run_compute_gate
+
+    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    handles, identifiers = [], []
+
+    class Process:
+        pid = os.getpid()
+
+        async def wait(self):
+            entered.set()
+            await release.wait()
+            if terminal == "lost":
+                raise RuntimeError("supervisor lost")
+            return 0
+
+    class Client:
+        async def launch(self, **kwargs):
+            return Process()
+
+        async def cancel(self, identifier):
+            identifiers.append(identifier)
+            cancelled.set()
+
+    backend = compute.LocalSubprocessComputeBackend(_worker_uid=os.getuid(), _worker_client=Client())
+    task = asyncio.create_task(_run_compute_gate(
+        "uv run pytest -q", checkout=order.checkout, work_spec=spec_for(order),
+        compute=backend, on_launch=handles.append))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        await asyncio.wait_for(cancelled.wait(), 5)
+        [handle] = handles
+        assert identifiers == [handle.identifier]
+        assert handle.identifier in backend._jobs
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError if terminal == "verified" else compute.ComputeCleanupError):
+            await asyncio.wait_for(task, 5)
+        assert (handle.identifier in backend._jobs) is (terminal == "lost")
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.gather(*(entry[0] for entry in backend._jobs.values()), return_exceptions=True)
 
 
 @pytest.mark.parametrize("profile", ["claude_leaf", "claude_factory"])

@@ -32,6 +32,13 @@ from mimir_cultivate.worklink.checkout import (
 @pytest.fixture(autouse=True)
 def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+    # Setup, production calls and assertions must resolve the same fixture-owned
+    # identity, including when the invoking controller supplies command config.
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     previous = os.umask(0o022)
     try:
         yield

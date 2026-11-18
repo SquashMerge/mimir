@@ -14655,3 +14655,146 @@ def test_claude_quota_result_uses_common_hold_and_claim_forgiveness(tmp_path, mo
     # The same typed hold marker is what the claim budget's forgiveness reader consumes.
     assert claims.attempts_used([claim.to_comment(), hold]) == 0
     assert claims.next_attempt([claim.to_comment(), hold]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["initial", "repair"])
+@pytest.mark.parametrize("failure", ["cancel", "lost", "refused", "success"])
+async def test_contained_leaf_and_ci_repair_retirement_boundaries(tmp_path, monkeypatch, phase, failure):
+    from mimir_cultivate.worklink import compute, orchestrator as orch
+    from mimir_cultivate.worklink.execution_policy import CLAUDE_LEAF
+
+    repo, checkout = tmp_path / "repo", tmp_path / "checkout"
+    checkout.mkdir()
+    calls, runner = _orchestrator_runner(repo, checkout)
+    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    launches, cancellations = [], []
+    target = 1 if phase == "initial" else 2
+
+    class Process:
+        pid = os.getpid()
+
+        def __init__(self, index):
+            self.index = index
+
+        async def wait(self):
+            if self.index == target:
+                entered.set()
+                await release.wait()
+                if failure in {"lost", "refused"}:
+                    raise RuntimeError(f"supervisor terminal report {failure}")
+            return 0
+
+    class Client:
+        async def launch(self, **kwargs):
+            launches.append(kwargs["identifier"])
+            return Process(len(launches))
+
+        async def cancel(self, identifier):
+            cancellations.append(identifier)
+            cancelled.set()
+
+    class Backend(FakeBackend):
+        def capabilities(self):
+            return Caps("contained", False, False, False, None, CLAUDE_LEAF)
+
+        def work_spec(self, *args, **kwargs):
+            return replace(super().work_spec(*args, **kwargs), env={}, local_argv=("/bin/true",))
+
+    backend = Backend()
+    bound = compute.LocalSubprocessComputeBackend(_worker_uid=os.getuid(), _worker_client=Client())
+    registry = BackendRegistry()
+    registry.register(backend)
+    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "for_path_checkout",
+                        classmethod(lambda cls, *args, **kwargs: bound))
+    monkeypatch.setattr("mimir_cultivate.worklink.identities.get_identities",
+                        lambda: SimpleNamespace(worklink_uid=os.getuid()))
+    monkeypatch.setattr(orch.ControllerGitPublication, "capture", lambda *args: None)
+    monkeypatch.setattr(orch, "_create_backend_checkout", lambda *args, **kwargs:
+                        CheckoutLease(441, 1, repo, checkout, "issue/441-a1", "main", isolated_checkout=True))
+    monkeypatch.setattr(WorklinkRunner, "_preserve_unpublished_attempt", lambda *args: None)
+    monkeypatch.setattr(orch, "_make_executor_report_dir", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch.RepositoryInventory, "load", lambda *args: SimpleNamespace(
+        declared=True, repository=lambda slug: SimpleNamespace(
+            worklink_gate="ci", quick_gate_command="echo ok", base_branch="main")))
+    monkeypatch.setattr(orch, "_gate_checkout_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "_with_outside_checkout_detection", lambda validation, **kwargs: validation)
+    for name in ("_commit_checkout_changes", "_ensure_clean_checkout", "_git_push"):
+        monkeypatch.setattr(orch, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "_open_pr", lambda *args, **kwargs: "https://github.com/owner/repo/pull/1")
+    monkeypatch.setattr(orch, "_repo_slug", lambda *args, **kwargs: "owner/repo")
+    monkeypatch.setattr(orch, "_with_head_sha", lambda validation, *args, **kwargs: validation)
+    monkeypatch.setattr(orch, "_update_ci_pr_body", lambda *args: None)
+    monkeypatch.setattr("mimir_cultivate.worklink.ci_gate._head", lambda *args: "abc123")
+
+    async def ready(*args):
+        pass
+
+    async def observe(**kwargs):
+        return EvidenceValidation("completed", True, (), WorklinkEvidence(
+            issue=441, attempt=1, backend=backend.name, branch="issue/441-a1", checkout=str(checkout),
+            started_at="2026-11-18T00:00:00+00:00", finished_at="2026-11-18T00:00:01+00:00",
+            files_changed=["changed.txt"], diff_stat="changed", commands=[], tests=None,
+            pr_url=None, status="completed", head_sha="abc123"))
+
+    async def ci(*args, **kwargs):
+        return SimpleNamespace(outcome="red" if len(launches) < 2 and phase == "repair" else "green",
+                               reason="test failed", excerpt="bounded log", checks=())
+
+    monkeypatch.setattr(orch, "ready_pr", ready)
+    monkeypatch.setattr(orch, "observe_evidence", observe)
+    monkeypatch.setattr(orch, "wait_for_ci", ci)
+    controller = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry)
+    task = asyncio.create_task(controller.run(441, backend_name=backend.name))
+    waiting = asyncio.create_task(entered.wait())
+    try:
+        await asyncio.wait((task, waiting), timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        assert not task.done(), task.result()
+        assert entered.is_set()
+        handle = bound._handles[launches[-1]]
+        if failure == "cancel":
+            task.cancel()
+            await asyncio.wait_for(cancelled.wait(), 5)
+            assert cancellations == [handle.identifier]
+            assert handle.identifier in bound._jobs
+            assert ["chainlink", "locks", "release", "441"] not in calls
+            assert not task.done()
+        release.set()
+        if failure == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        else:
+            result = await asyncio.wait_for(task, 10)
+            assert result.status == ("completed" if failure == "success" else "failed"), result.reason
+        state = load_run_state(tmp_path, 441)
+        if failure in {"lost", "refused"}:
+            assert state is not None and state.handle_identifier == handle.identifier
+            assert handle.identifier in bound._jobs
+            assert ["chainlink", "locks", "release", "441"] not in calls
+            # A dead shim does not prove retirement of its separately sessioned payload.
+            monkeypatch.setattr(orch, "process_is_alive", lambda state: False)
+            refused = await controller.run(441, backend_name=backend.name)
+            assert refused.status == "refused"
+            assert "retirement is unverified" in refused.reason
+            assert load_run_state(tmp_path, 441) == state
+            assert len(launches) == target
+        elif failure == "success":
+            assert state is None
+            assert not bound._jobs
+            assert ["chainlink", "locks", "release", "441"] in calls
+            # Verified retirement and terminal release permit a new admission.
+            monkeypatch.setattr(ChainlinkClaims, "review_ready_evidence", lambda *args, **kwargs: None)
+            checkout.mkdir()
+            result = await controller.run(441, backend_name=backend.name)
+            assert result.status == "completed", result.reason
+        else:
+            assert state is not None
+            assert handle.identifier not in bound._jobs
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.gather(*(entry[0] for entry in bound._jobs.values()), return_exceptions=True)

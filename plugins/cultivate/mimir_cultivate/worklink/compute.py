@@ -151,7 +151,8 @@ class ComputeBackend(Protocol):
 
 class ComputeCleanupError(RuntimeError):
     def __init__(self, handle: LaunchHandle) -> None:
-        super().__init__("daemon session quiescence unverified; retain checkout and recovery state")
+        worker = "daemon session" if handle.substrate == "opencode_daemon" else "contained worker"
+        super().__init__(f"{worker} quiescence unverified; retain checkout and recovery state")
         self.handle = handle
 
 
@@ -950,15 +951,18 @@ class LocalSubprocessComputeBackend:
                 stderr_sink.close()
 
         task = asyncio.create_task(collect_contained())
-        try:
-            process = await asyncio.shield(started)
-        except asyncio.CancelledError:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            raise
-        except (OSError, RuntimeError, ValueError) as exc:
-            await asyncio.gather(task, return_exceptions=True)
-            raise ComputeLaunchError(str(exc)) from exc
+        interrupted = False
+        while True:
+            try:
+                process = await asyncio.shield(started)
+                break
+            except asyncio.CancelledError:
+                if started.cancelled():
+                    raise
+                interrupted = True
+            except (OSError, RuntimeError, ValueError) as exc:
+                await asyncio.gather(task, return_exceptions=True)
+                raise ComputeLaunchError(str(exc)) from exc
         pid = getattr(process, "pid", None)
         ticks = None
         if isinstance(pid, int):
@@ -975,6 +979,9 @@ class LocalSubprocessComputeBackend:
         self._handles[identifier] = handle
         self._worker_clients[identifier] = client
         self._output_files[identifier] = (stdout_path, stderr_path)
+        if interrupted:
+            await self.cleanup(handle)
+            raise asyncio.CancelledError
         return handle
 
     async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -1125,6 +1132,30 @@ class LocalSubprocessComputeBackend:
             raise KeyError(f"unknown {self.name} handle: {handle.identifier}")
         if known is None:
             return
+        interrupted = False
+        job, _spec, _command = self._job(handle)
+        if isinstance(job, asyncio.Task):
+            async def retire() -> None:
+                try:
+                    if not job.done() or job.cancelled() or job.exception() is not None:
+                        await _cancel_worker(self._worker_clients[handle.identifier], handle.identifier)
+                    collected = await asyncio.wait_for(
+                        asyncio.shield(job), _WORKER_COLLECTION_TIMEOUT_S
+                    )
+                    if not isinstance(collected, CollectedExecutionResult):
+                        raise RuntimeError("contained execution returned an invalid result")
+                except (Exception, asyncio.CancelledError) as exc:
+                    raise ComputeCleanupError(handle) from exc
+
+            # Caller cancellation must not detach retirement. Keep the exact
+            # identity and collector until its terminal report proves quiescence.
+            retirement = asyncio.create_task(retire())
+            while True:
+                try:
+                    await asyncio.shield(retirement)
+                    break
+                except asyncio.CancelledError:
+                    interrupted = True
         capture = self._direct_captures.get(handle.identifier)
         if capture is not None:
             if capture.monitor_task is not None:
@@ -1146,6 +1177,8 @@ class LocalSubprocessComputeBackend:
         if capture is not None:
             capture.stdout_sink.close()
             capture.stderr_sink.close()
+        if interrupted:
+            raise asyncio.CancelledError
 
     def _job(self, handle: LaunchHandle) -> tuple[object, WorkSpec, tuple[str, ...]]:
         if (
