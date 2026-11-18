@@ -9221,6 +9221,7 @@ class ToolAuthorization:
     repo_pr_diagnostics_bound: bool = False
     forge_scope_mismatch: dict[str, Any] | None = None
     policy: Any = field(default=None, repr=False, compare=False)
+    grant_refusal_reason: str | None = None
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
@@ -9239,7 +9240,7 @@ class ToolAuthorization:
             "granted_actions": sorted(
                 getattr(scope, "allowed_operations", frozenset())
             ),
-            "refusal_reason": self.reason if not self.allowed else None,
+            "refusal_reason": self.grant_refusal_reason or (self.reason if not self.allowed else None),
             "forge_scope_mismatch": self.forge_scope_mismatch,
         }
 
@@ -9403,17 +9404,26 @@ def framework_checkout_resumable(
 def _valid_scoped_pr_grant(
     auth_context: AuthContext | None, owner: str | None, action: Any,
     protocol: Any, scope: Any, review_state: Any, *, tool_name: str | None = None,
+    diagnostics: list[str] | None = None,
 ) -> bool:
-    grants = getattr(auth_context, "scoped_pr_grants", None)
-    if (not isinstance(grants, ScopedPRGrants)
-              or protocol is None or protocol.owner != owner
-              or grants._protocols.get(owner) is not protocol
-             or type(action) is not protocol.action_type
-              or (getattr(protocol, "trusted_scope", None) is not None
-                  and type(scope) is not protocol.trusted_scope.scope_type)
-              or scope is None or getattr(scope, "owner", None) != owner
-             or grants.principal != getattr(auth_context, "canonical_principal", None)):
+    def refuse(code: str) -> bool:
+        if diagnostics is not None:
+            diagnostics.append(code)
         return False
+
+    grants = getattr(auth_context, "scoped_pr_grants", None)
+    if not isinstance(grants, ScopedPRGrants):
+        return refuse("grants_missing")
+    if protocol is None or protocol.owner != owner or grants._protocols.get(owner) is not protocol:
+        return refuse("grant_protocol_mismatch")
+    if type(action) is not protocol.action_type:
+        return refuse("grant_action_type_mismatch")
+    if (scope is None or getattr(scope, "owner", None) != owner
+            or (getattr(protocol, "trusted_scope", None) is not None
+                and type(scope) is not protocol.trusted_scope.scope_type)):
+        return refuse("grant_scope_type_mismatch")
+    if grants.principal != getattr(auth_context, "canonical_principal", None):
+        return refuse("grant_principal_mismatch")
     slot_policy = getattr(auth_context, "_plugin_slot_policy", None)
     if (slot_policy is not None and owner in slot_policy.state_slots
             and slot_policy.scoped_actions.get(owner) is protocol):
@@ -9428,10 +9438,10 @@ def _valid_scoped_pr_grant(
         if registered_state is None and registry is not None:
             registered_state = registry.resolve(scope.canonical_repo, scope.pr_number)
         if registered_state is not review_state or review_state.action_scope is not scope:
-            return False
+            return refuse("review_state_superseded")
     designated_checkout = getattr(protocol, "checkout_tool", None)
     if designated_checkout is not None and tool_name is None:
-        return False
+        return refuse("grant_tool_missing")
     is_checkout = action is protocol.checkout_action and (
         designated_checkout is None or tool_name == designated_checkout
     )
@@ -9443,29 +9453,53 @@ def _valid_scoped_pr_grant(
         # itself attested this turn. It is validated as that lease's follow-on.
         is_checkout = False
         grant = grants.get(owner, scope, action.value, checkout=False)
-    if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
-            or grant.owner != owner or grant.principal != grants.principal
-            or grant.turn_nonce != grants.nonce or time.monotonic() >= grant.expires_at
-            or grant.scope_id != scope.scope_id or grant.repository != scope.canonical_repo
-            or grant.pull_request != scope.pr_number or grant.head != scope.observed_head_sha):
-        return False
+    if grant is None:
+        return refuse("grant_missing")
+    for invalid, code in (
+        (grant._issuer is not _SCOPED_PR_ISSUER, "grant_issuer_mismatch"),
+        (grant.owner != owner, "grant_owner_mismatch"),
+        (grant.principal != grants.principal, "grant_principal_mismatch"),
+        (grant.turn_nonce != grants.nonce, "grant_turn_mismatch"),
+        (time.monotonic() >= grant.expires_at, "grant_expired"),
+        (grant.scope_id != scope.scope_id, "grant_scope_mismatch"),
+        (grant.repository != scope.canonical_repo, "grant_repository_mismatch"),
+        (grant.pull_request != scope.pr_number, "grant_pr_mismatch"),
+        (grant.head != scope.observed_head_sha, "grant_head_mismatch"),
+    ):
+        if invalid:
+            return refuse(code)
     if is_checkout:
         if grant.lease_identity is not None:
-            return False
+            return refuse("checkout_grant_has_lease")
     else:
+        live = None
+        codes: list[str] = []
         live_lease = protocol.live_lease
-        # Owners may bind a narrowly allowed recovery operation to this turn.
-        # Older protocols keep their two-argument contract and gain no bypass.
-        recovery_args = {}
-        if live_lease is not None and "tool_name" in inspect.signature(live_lease).parameters:
-            recovery_args = {"tool_name": tool_name, "turn_nonce": grants.nonce}
-        live = live_lease(scope, review_state, **recovery_args) if live_lease is not None else None
-        if live is None or grant.lease_identity != (str(live.path), live.recovery_id):
-            return False
+        if live_lease is not None:
+            # Older protocols keep their two-argument contract and gain no
+            # recovery bypass; diagnostics remain fixed, host-owned codes.
+            try:
+                parameters = inspect.signature(live_lease).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            recovery_args = {}
+            if "tool_name" in parameters:
+                recovery_args.update(tool_name=tool_name, turn_nonce=grants.nonce)
+            if "refusal_codes" in parameters:
+                recovery_args["refusal_codes"] = codes
+            live = live_lease(scope, review_state, **recovery_args)
+        if live is None:
+            # Never copy plugin/forge text into the audit reason.
+            code = codes[0] if codes and codes[0] in {"lease_invalid", "lease_head_mismatch"} else "lease_validation_failed"
+            return refuse(code)
+        if grant.lease_identity != (str(live.path), live.recovery_id):
+            return refuse("grant_lease_mismatch")
     try:
-        return protocol.validate_scope(action, scope, grant) is True
+        if protocol.validate_scope(action, scope, grant) is not True:
+            return refuse("grant_scope_validation_failed")
+        return True
     except (TypeError, ValueError, AttributeError):
-        return False
+        return refuse("grant_scope_validation_failed")
 
 
 def register_server_discovered_review_grant(auth_context: AuthContext, state: Any) -> None:
@@ -9614,8 +9648,10 @@ def authorize_repo_pr_tool(
     missing_actions = tuple(
         action for action in required_actions if action not in granted_actions
     )
+    grant_diagnostics: list[str] = []
     grant_valid = not registered_plugin or _valid_scoped_pr_grant(
         auth_context, owner, action, protocol, scope, review_state, tool_name=tool_name,
+        diagnostics=grant_diagnostics,
     )
     in_scope = (
         scope is not None
@@ -9692,6 +9728,7 @@ def authorize_repo_pr_tool(
         flow_direction=flow_direction,
         repo_pr_action_scope=scope,
         repo_pr_diagnostics_bound=diagnostics_bound,
+        grant_refusal_reason=grant_diagnostics[0] if grant_diagnostics else None,
     )
 
 

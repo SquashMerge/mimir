@@ -106,3 +106,43 @@ The 2.3.0 queued-input probe observes only `log.synced`; the historical live-pro
 lifecycle/follow evidence remains under `opencode_2_2_7/session-lifecycle.json`, not
 relabelled as a 2.3.0 provider run. Deployment/provider verification remains the
 operator's post-merge gate, not evidence claimed by this capture.
+
+## #2164: question tool and child permission inheritance
+
+Additional byte-exact excerpts were extracted on 2026-11-17 from a fresh download
+of the **same hash-identified** arm64 npm artifact above, without executing it,
+starting a daemon, Docker, provider access, or touching a live deployment:
+
+```sh
+uv run python tests/fixtures/worklink/opencode_2_3_0/inspect-source.py .factory/2164-capture/opencode
+```
+
+The extractor and `source-inspection.json` now also retain:
+
+- `question_permission_and_form` (offset 177072912): the tool calls
+  `o.assert({action:"question",resources:["*"],...$u(y)})` **before** `T.ask`,
+  which creates a form titled `Questions`, with `metadata.kind: "question"`.
+- `question_field_text` (177073636): fields use `key: qN`, `title: e.header`,
+  `description: e.question`, type string/multiselect and option value/label pairs.
+- `session_parent_lookup` (177168432): `pe` is the session looked up by
+  `H.parentID`; the parent also supplies the location.
+- `session_permission_inheritance` (177168938): creation publishes
+  `permissions:H.permissions??pe?.permissions`. This is a **copy at creation**,
+  not dynamic ancestor evaluation; explicit child permissions replace inheritance.
+- `subagent_session_create` (177969895) and
+  `command_subagent_session_create` (177824374): native tool/command child creation
+  supplies `parentID`, agent and model, but **no permissions override**.
+
+Together with the already captured agent-then-session concatenation, last-match
+evaluation and final-deny-before-project-grants, this establishes that a Worklink
+session's question deny follows native subagents at every depth, even if a factory
+profile agent allows questions. No `daemon_config.py` or factory definitions need
+changing. The fake models this exact nullish inheritance, and tests apply it to
+every agent from `factory-result.json`, including `backend-builder`.
+
+The existing full OpenAPI document supplies `Form.Info`, `Form.Reply`, pending-only
+`GET /api/session/{sessionID}/form` and paginated session listing with `parentID`.
+Form injection/replies and child trees in tests are **synthetic**, schema-validated
+scenarios, not claims of an executed provider or factory run. No new live probe
+was run for #2164. Worklink exposes only read methods for forms; a fixture-only
+manual reply verifies that its reply recorder would catch auto-answer regressions.
