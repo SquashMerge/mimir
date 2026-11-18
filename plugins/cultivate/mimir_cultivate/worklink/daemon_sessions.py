@@ -125,8 +125,11 @@ class ControllerRecord:
     deadline_at_ms: int
     cleanup_error: str | None = None
     cleanup_processes: list[list[int]] = field(default_factory=list)
+    operator_resume: str = "none"
 
     def validate(self) -> None:
+        if self.operator_resume not in {"none", "dispatching", "admitted"}:
+            raise ValueError("invalid operator resume state")
         if (not isinstance(self.operation_id, str)
                 or not re.fullmatch(r"[0-9a-f-]{36}", self.operation_id)
                 or not isinstance(self.launch_generation, str)
@@ -760,6 +763,105 @@ class SessionController:
         finally:
             os.close(directory)
 
+    def require_attempt(self, issue: int, attempt: int) -> None:
+        if (self.record.issue_id, self.record.attempt) != (issue, attempt):
+            raise DaemonClientError("retained_attempt_mismatch")
+        if self.record.kind != "epic":
+            raise DaemonClientError("retained_not_epic_driver")
+
+    async def quiescence(self) -> str | None:
+        """Read-only, stable ended witness across the entire owned tree.
+
+        Unlike cancellation this must never stop live work or drain resumes.
+        Ignore the old controller deadline: recovery has its own bounded RPC.
+        """
+        async def witness(*, shells: bool = True):
+            tree = await self.client.session_tree(self.record.opencode_session_id)
+            tails = {}
+            for session in tree:
+                sid = session["id"]
+                if await self.client.pending_forms(sid):
+                    raise DaemonClientError("retained_pending_form")
+                inbox = await self.client.inbox(sid)
+                for item in inbox["data"]:
+                    _message(item, session_id=sid)
+                if inbox["data"]:
+                    reason = ("retained_pending_resume" if any(
+                        m["type"] == "synthetic" for m in inbox["data"]) else "retained_pending_input")
+                    raise DaemonClientError(reason)
+                messages = await self._messages(sid)
+                # An empty never-started descendant is idle; the driver must
+                # have a durable ended turn, not merely an absent heartbeat.
+                if not messages and sid != self.record.opencode_session_id:
+                    tails[sid] = None
+                elif not messages or messages[-1]["type"] != "idle":
+                    return None
+                else:
+                    tails[sid] = messages[-1]["id"]
+            if shells and await self._tree_shells(tree):
+                raise DaemonClientError("retained_running_shells")
+            if self.record.cleanup_processes:
+                raise DaemonClientError("retained_process_cleanup_unverified")
+            return tails
+
+        self._cancelling = True
+        try:
+            async with asyncio.timeout(25):
+                first = await witness()
+                if first is None:
+                    return "retained_running"
+                second = await witness(shells=False)
+                if first != second:
+                    raise DaemonClientError("retained_activity_changed")
+                return None
+        except TimeoutError:
+            raise DaemonClientError("retained_quiescence_timeout") from None
+        finally:
+            self._cancelling = False
+
+    async def recover_epic(self, *, issue: int, attempt: int, action: str) -> dict:
+        self.require_attempt(issue, attempt)
+        if action == "session_rearm" and self._retired:
+            return {"recovery": "fresh"}
+        if self._retired:
+            raise DaemonClientError("retained_already_released")
+        # A dispatched resume is never replayed, including after a lost ACK.
+        if action == "session_rearm" and self.record.operator_resume != "none":
+            self._persist(operator_resume="none")
+            return {"recovery": "continued"}
+        if action == "session_resume" and self.record.operator_resume != "none":
+            raise DaemonClientError("retained_resume_already_dispatched")
+        try:
+            reason = await self.quiescence()
+        except DaemonClientError as exc:
+            if action == "session_rearm" and exc.reason in {
+                    "retained_running_shells", "retained_pending_resume", "retained_pending_input"}:
+                return {"recovery": "reattach"}
+            raise
+        if reason:
+            if action == "session_rearm":
+                return {"recovery": "reattach"}
+            raise DaemonClientError(reason)
+        if action == "session_resume":
+            self._persist(deadline_at_ms=int(time.time() * 1000) + 86400000)
+            messages = await self._messages()
+            users = [m["id"] for m in messages if m["type"] == "user"]
+            if len(users) > 16:
+                raise DaemonClientError("retained_resume_history_bound")
+            # Persist intent BEFORE delivery. A lost ACK must not send twice.
+            self._persist(baseline_message_ids=users, input_id=None, admission_state="dispatching",
+                          execution_state="pending", stop_requested=False, cancellation_state="none",
+                          deadline_at_ms=int(time.time() * 1000) + 86400000,
+                          operator_resume="dispatching")
+            text = (f"Continue the persisted factory run chainlink-{issue} using factory resume semantics. "
+                    "Resume its saved state and next step; do not create a new run or story.")
+            admitted = await self.client.prompt(self.record.opencode_session_id, text, resume=True)
+            _message(admitted["data"], session_id=self.record.opencode_session_id)
+            self._persist(input_id=admitted["data"]["id"], admission_state="admitted", operator_resume="admitted")
+            return {"resumed": True}
+        await self.release()
+        return {"recovery": "fresh"} if action == "session_rearm" else {"released": True}
+
 
 def session_environment(pass_env: object, *, home: Path, git_settings: object,
                         credentials: dict[str, str]) -> dict[str, str]:
@@ -881,7 +983,16 @@ async def _executor_operation(request: dict) -> dict:
                     raise ValueError("session daemon generation is stale")
                 if path.exists():
                     retained = SessionController.recover(client, path, generation=request["generation"], checkout=checkout)
-                    return {"admission_state": "conflict", "opencode_session_id": retained.record.opencode_session_id}
+                    if request["request"]["kind"] == "epic":
+                        try:
+                            decision = await retained.recover_epic(issue=request["issue"], attempt=request["attempt"],
+                                                                   action="session_rearm")
+                        except DaemonClientError as exc:
+                            return {"admission_state": "refused", "reason": exc.reason}
+                        if decision["recovery"] != "fresh":
+                            return {"admission_state": "conflict", "opencode_session_id": retained.record.opencode_session_id}
+                    else:
+                        return {"admission_state": "conflict", "opencode_session_id": retained.record.opencode_session_id}
                 home.mkdir(mode=0o700, exist_ok=True)
                 (home / "tmp").mkdir(mode=0o700, exist_ok=True)
                 env = session_environment(request["pass_env"], home=home, git_settings=request["git_settings"],
@@ -904,6 +1015,15 @@ async def _executor_operation(request: dict) -> dict:
                 controller.sensitive_values = (api["password"], *(os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ))
                 if controller.record.opencode_session_id != request["opencode_session_id"]:
                     raise ValueError("session ownership mismatch")
+                if (controller.record.issue_id, controller.record.attempt) != (request["issue"], request["attempt"]):
+                    raise DaemonClientError("retained_attempt_mismatch")
+            if request["op"] in {"session_rearm", "session_release_quiescent", "session_resume"}:
+                if controller is None:
+                    if request["op"] == "session_rearm":
+                        return {"recovery": "fresh"}
+                    raise DaemonClientError("retained_session_absent")
+                return await controller.recover_epic(issue=request["issue"], attempt=request["attempt"],
+                                                     action=request["op"])
             if request["op"] == "session_tree_activity":
                 if controller is None:
                     raise ValueError("session activity unavailable after daemon replacement")

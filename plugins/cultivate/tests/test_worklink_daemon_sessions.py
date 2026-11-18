@@ -27,6 +27,144 @@ async def create(client, tmp_path, kind="leaf"):
     )
 
 
+@pytest.mark.parametrize("action", ["session_rearm", "session_release_quiescent", "session_resume"])
+@pytest.mark.parametrize("mismatch", ["issue", "attempt", "leaf"])
+async def test_retained_recovery_requires_exact_epic_owner(tmp_path, action, mismatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "leaf" if mismatch == "leaf" else "epic")
+        daemon.finish(controller.record.opencode_session_id, outcome="interrupted")
+        with pytest.raises(DaemonClientError, match="retained_not_epic_driver" if mismatch == "leaf"
+                           else "retained_attempt_mismatch"):
+            await controller.recover_epic(issue=2126 if mismatch == "issue" else 2125,
+                attempt=2 if mismatch == "attempt" else 1, action=action)
+        assert controller.path.exists()
+        assert not any(route.endswith("/prompt") for _, route, _, _ in daemon.requests if mismatch != "leaf")
+
+
+@pytest.mark.parametrize("action", ["session_release_quiescent", "session_resume"])
+@pytest.mark.parametrize("blocker", ["running", "child-running", "shell", "root-shell", "resume", "form", "question",
+                                    "input", "process", "unavailable", "changed"])
+async def test_retained_operator_recovery_refuses_unverified_quiescence(tmp_path, monkeypatch, action, blocker):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        root = controller.record.opencode_session_id
+        child = daemon.child_session(root, str(tmp_path))
+        daemon.finish(root, outcome="interrupted")
+        reason = {
+            "running": "retained_running", "child-running": "retained_running",
+            "shell": "retained_running_shells", "root-shell": "retained_running_shells",
+            "resume": "retained_pending_resume", "form": "retained_pending_form",
+            "question": "retained_pending_form", "input": "retained_pending_input",
+            "process": "retained_process_cleanup_unverified", "unavailable": "daemon HTTP failure",
+            "changed": "retained_activity_changed",
+        }[blocker]
+        if blocker == "running":
+            await client.prompt(root, "test-owned work")
+        elif blocker == "child-running":
+            await client.prompt(child, "test-owned work")
+        elif blocker in {"shell", "root-shell"}:
+            daemon.start_shell(root if blocker == "root-shell" else child, str(tmp_path))
+        elif blocker == "resume":
+            shell = daemon.start_shell(child, str(tmp_path))
+            daemon.shells[shell]["status"] = "exited"
+            daemon.enqueue_synthetic(child, shell)
+        elif blocker in {"form", "question"}:
+            form = daemon.question(child)
+            if blocker == "form":
+                form["metadata"]["kind"] = "other"
+        elif blocker == "input":
+            daemon.auto_deliver = False
+            await client.prompt(child, "test-owned input")
+        elif blocker == "process":
+            controller._persist(cleanup_processes=[[200, 100]])
+        elif blocker == "unavailable":
+            daemon.faults[("GET", f"/api/session/{root}")].append(SyntheticFault(status=500))
+        elif blocker == "changed":
+            shells = controller._tree_shells
+            async def race(tree):
+                result = await shells(tree)
+                item = daemon.enqueue(root, "racing input")
+                daemon.deliver(root, item["id"])
+                daemon.finish(root, outcome="interrupted")
+                return result
+            monkeypatch.setattr(controller, "_tree_shells", race)
+        before = len(daemon.requests)
+        with pytest.raises(DaemonClientError) as error:
+            await controller.recover_epic(issue=2125, attempt=1, action=action)
+        assert reason in str(error.value)
+        assert controller.path.exists()
+        assert all(method == "GET" for method, _, _, _ in daemon.requests[before:])
+
+
+async def test_retained_resume_delivers_one_fixed_input_and_reconciles_lost_ack(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        root = controller.record.opencode_session_id
+        daemon.finish(root, outcome="interrupted")
+        controller._persist(deadline_at_ms=1)
+        daemon.faults[("POST", f"/api/session/{root}/prompt")].append(SyntheticFault(after=True, disconnect=True))
+        with pytest.raises(DaemonClientError):
+            await controller.recover_epic(issue=2125, attempt=1, action="session_resume")
+        recovered = SessionController.recover(client, controller.path, generation="generation-1", checkout=tmp_path)
+        with pytest.raises(DaemonClientError, match="retained_resume_already_dispatched"):
+            await recovered.recover_epic(issue=2125, attempt=1, action="session_resume")
+        assert await recovered.recover_epic(issue=2125, attempt=1, action="session_rearm") == {"recovery": "continued"}
+        prompts = [body for method, route, _, body in daemon.requests if method == "POST" and route.endswith("/prompt")]
+        assert prompts == [{"text": "Continue the persisted factory run chainlink-2125 using factory resume semantics. "
+                           "Resume its saved state and next step; do not create a new run or story.", "resume": True}]
+        assert (await recovered.observe()).execution_state == "started"
+        daemon.finish(root)
+        assert (await recovered.observe()).execution_state == "succeeded"
+
+
+async def test_operator_can_release_an_ended_resume_before_supervision(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        root = controller.record.opencode_session_id
+        daemon.finish(root, outcome="interrupted")
+        await controller.recover_epic(issue=2125, attempt=1, action="session_resume")
+        daemon.finish(root, outcome="interrupted")
+        assert await controller.recover_epic(issue=2125, attempt=1,
+                                             action="session_release_quiescent") == {"released": True}
+        assert not controller.path.exists()
+
+
+async def test_operator_resume_refuses_excessive_prior_inputs(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        root = controller.record.opencode_session_id
+        daemon.finish(root, outcome="interrupted")
+        for _ in range(16):
+            item = daemon.enqueue(root, "test-owned historical input")
+            daemon.deliver(root, item["id"])
+            daemon.finish(root, outcome="interrupted")
+        before = len(daemon.requests)
+        with pytest.raises(DaemonClientError, match="retained_resume_history_bound"):
+            await controller.recover_epic(issue=2125, attempt=1, action="session_resume")
+        assert not any(method == "POST" for method, _, _, _ in daemon.requests[before:])
+
+
+@pytest.mark.parametrize("field", ["text", "input", "prompt", "run_id"])
+def test_resume_session_rejects_caller_supplied_input_at_executor_boundary(field):
+    from mimir_cultivate.worklink.worker_exec import _handle_session
+    request = dict.fromkeys(("version", "op", "executor_identity", "issue", "attempt", "device", "inode",
+                             "path", "generation", "opencode_session_id"), "fixture")
+    request["op"] = "session_resume"
+    request[field] = "operator or forge supplied instructions"
+    with pytest.raises(RuntimeError, match="exact contract"):
+        _handle_session(None, request, [123])
+
+
+def test_resume_session_cli_has_no_free_text_option():
+    import argparse
+    from mimir_cultivate.commands import add_argparse
+    parser = argparse.ArgumentParser()
+    add_argparse(parser.add_subparsers())
+    for extra in (["--text", "arbitrary instructions"], ["arbitrary instructions"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["worklink", "resume-session", "2125", "--attempt", "1", "--confirm-quiescent", *extra])
+
+
 @pytest.mark.parametrize("kind", ["leaf", "spawn", "epic"])
 async def test_every_session_kind_denies_question(tmp_path, kind):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:

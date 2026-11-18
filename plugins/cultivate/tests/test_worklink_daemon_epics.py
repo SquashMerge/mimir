@@ -79,6 +79,9 @@ class EpicBoundary:
     async def session_release(self, handle):
         await self.controller.release()
 
+    async def session_rearm(self, handle):
+        return (await self.controller.recover_epic(issue=2125, attempt=1, action="session_rearm"))["recovery"]
+
 
 async def admit(tmp_path, daemon, client):
     sandbox = tmp_path / "checkout/.factory-sandboxes/chainlink-2125"
@@ -107,6 +110,118 @@ async def admit(tmp_path, daemon, client):
         session_checkout=str(checkout))
     save_factory_record(tmp_path, record)
     return spec, boundary, compute, handle, record
+
+
+def wire_retained_executor(tmp_path, monkeypatch, daemon, boundary):
+    """Use the real executor operation, replacing only the UID/socket boundary."""
+    import hashlib
+    from mimir_cultivate.worklink import daemon_config, daemon_health, daemon_service, daemon_sessions, identities
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    root = tmp_path / "executor"
+    root.mkdir(mode=0o700)
+    (root / "sessions").mkdir(mode=0o700)
+    key = hashlib.sha256(f"{boundary.checkout}:2125:1".encode()).hexdigest()
+    path = root / "sessions" / f"{key}.json"
+    boundary.controller.path.replace(path)
+    boundary.controller.path = boundary.controller._record_path = path
+    daemon_service.atomic_json(root / "launch.json", {"launch_generation": "epic-generation"},
+                              uid=os.geteuid(), gid=os.getegid(), mode=0o600)
+    monkeypatch.setattr(daemon_config, "DAEMON_ROOT", str(root))
+    monkeypatch.setattr(identities, "get_identities", lambda: SimpleNamespace(worklink_uid=os.geteuid()))
+    monkeypatch.setattr(identities, "assert_worklink_identity", lambda ids: None)
+    monkeypatch.setattr(daemon_health, "load_api", lambda paths, uid: {
+        "url": daemon.base_url, "username": daemon.username, "password": daemon.password})
+    monkeypatch.setattr(daemon_service, "RuntimePaths", lambda: SimpleNamespace(daemon=root))
+    async def rpc(self, operation, payload):
+        info = self.path_checkout.stat()
+        return await daemon_sessions._executor_operation({
+            "op": operation, "path": str(self.path_checkout), "issue": self.issue_id, "attempt": self.attempt,
+            "device": info.st_dev, "inode": info.st_ino, **payload})
+    monkeypatch.setattr(WorkerClient, "_session_rpc", rpc)
+    return WorkerClient.for_path_checkout(boundary.checkout, issue_id=2125, attempt=1, run_uid=os.geteuid())
+
+
+@pytest.mark.parametrize("action", ["release-session", "resume-session"])
+@pytest.mark.parametrize("condition", ["success", "shell", "pending-resume", "question", "form", "wrong-attempt",
+                                       "wrong-issue", "leaf", "active-claim", "unconfirmed"])
+async def test_operator_session_commands_real_executor(tmp_path, monkeypatch, action, condition):
+    import argparse
+    from contextlib import nullcontext
+    from mimir_cultivate import commands
+    from mimir_cultivate.worklink import autonomy, control
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        wire_retained_executor(tmp_path, monkeypatch, daemon, boundary)
+        daemon.finish(handle.identifier, outcome="interrupted")
+        child = daemon.child_session(handle.identifier, record.sandbox)
+        if condition in {"shell", "pending-resume"}:
+            shell = daemon.start_shell(child, record.sandbox)
+            if condition == "pending-resume":
+                daemon.shells[shell]["status"] = "exited"
+                daemon.enqueue_synthetic(child, shell)
+        elif condition in {"question", "form"}:
+            form = daemon.question(child)
+            if condition == "form":
+                form["metadata"]["kind"] = "other"
+        elif condition == "leaf":
+            boundary.controller._persist(kind="leaf")
+        calls = []
+        def run(argv):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0,
+                json.dumps({"locks": [{"issue_id": 2125}] if condition == "active-claim" else []}), "")
+        monkeypatch.setattr(control, "_runner", lambda home: run)
+        monkeypatch.setattr(control, "_claim_mutex", lambda home: nullcontext())
+        monkeypatch.setattr(autonomy, "chainlink_bin", lambda: "fixture-chainlink")
+        args = argparse.Namespace(home=tmp_path, issue_id=2126 if condition == "wrong-issue" else 2125,
+            attempt=2 if condition == "wrong-attempt" else 1, confirm_quiescent=condition != "unconfirmed",
+            worklink_action=action)
+        result = await asyncio.to_thread(commands.dispatch, args, argparse.ArgumentParser())
+        assert result == (0 if condition == "success" else 1)
+        prompts = [body for method, route, _, body in daemon.requests if method == "POST" and route.endswith("/prompt")]
+        assert len(prompts) == (1 if condition == "success" and action == "resume-session" else 0)
+        assert boundary.controller.path.exists() == (condition != "success" or action != "release-session")
+        assert len([1 for method, route, _, _ in daemon.requests if method == "POST" and route == "/api/session"]) == 1
+        assert any(argv[-1] == "worklink:ready" for argv in calls) == (condition == "success" and action == "resume-session")
+        assert load_factory_record(tmp_path, record.run_id) == record
+
+
+@pytest.mark.parametrize("live", [False, True])
+async def test_conflict_admission_freshens_only_dead_owned_epic(tmp_path, monkeypatch, live):
+    from mimir_cultivate.worklink import daemon_gate
+    from mimir_cultivate.worklink.backends.base import SessionAdmissionError
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        spec, boundary, _, old, record = await admit(tmp_path, daemon, client)
+        peer = wire_retained_executor(tmp_path, monkeypatch, daemon, boundary)
+        retained_path = boundary.controller.path
+        retired_path = retained_path.with_name(f"{retained_path.stem}.{old.identifier}.retired.json")
+        assert json.loads(retained_path.read_text())["opencode_session_id"] == old.identifier
+        assert not retired_path.exists()
+        monkeypatch.setattr(daemon_gate, "prepare_daemon_health",
+                            lambda env: {"ok": True, "launch_generation": "epic-generation"})
+        if not live:
+            daemon.finish(old.identifier, outcome="interrupted")
+        if live:
+            with pytest.raises(SessionAdmissionError) as error:
+                await peer.session_create(spec.session_request, timeout_s=30)
+            assert error.value.handle.identifier == old.identifier
+            assert json.loads(retained_path.read_text())["opencode_session_id"] == old.identifier
+            assert not retired_path.exists()
+        else:
+            # Exercise session_create's retained-record conflict branch, not the
+            # orchestrator's separate session_rearm -> session_create sequence.
+            fresh = await peer.session_create(spec.session_request, timeout_s=30)
+            assert fresh.identifier == fresh.opencode_session_id != old.identifier
+            assert json.loads(retained_path.read_text())["opencode_session_id"] == fresh.identifier
+            retired = json.loads(retired_path.read_text())
+            assert retired["opencode_session_id"] == old.identifier
+            assert retired["cancellation_state"] == "verified"
+            assert retired["issue_id"] == record.issue_id
+            assert retired["attempt"] == record.attempt
+        assert len([1 for method, route, _, _ in daemon.requests if method == "POST" and route == "/api/session"]) == (1 if live else 2)
+        assert load_factory_record(tmp_path, record.run_id) == record
 
 
 def specialist_shells(daemon, handle, record):
@@ -1004,6 +1119,83 @@ async def test_running_factory_reattaches_same_host_without_input(tmp_path, monk
             test_cmd="pytest", runner=lambda *a, **kw: None, work_item_json="{}")
         assert result.status == "review_ready" and boundary.create_calls == 1
         assert len([route for _, route, _, _ in daemon.requests if route.endswith("/command")]) == 1
+
+
+@pytest.mark.parametrize("recovery", ["fresh", "live", "shell", "pending-resume", "release", "resume",
+                                    "parked-resume", "unavailable", "form"])
+async def test_rearmed_retained_epic_recovers_through_real_orchestrator(tmp_path, monkeypatch, recovery):
+    from mimir_cultivate.worklink import orchestrator
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        spec, boundary, compute, old, record = await admit(tmp_path, daemon, client)
+        if recovery != "live":
+            daemon.finish(old.identifier, outcome="interrupted")
+        boundary.finish = False
+        if recovery == "shell":
+            child = daemon.child_session(old.identifier, record.sandbox)
+            daemon.start_shell(child, record.sandbox)
+        elif recovery == "pending-resume":
+            child = daemon.child_session(old.identifier, record.sandbox)
+            shell = daemon.start_shell(child, record.sandbox)
+            daemon.shells[shell]["status"] = "exited"
+            daemon.enqueue_synthetic(child, shell)
+        elif recovery in {"release", "resume", "parked-resume"}:
+            await boundary.controller.recover_epic(issue=2125, attempt=1,
+                action="session_release_quiescent" if recovery == "release" else "session_resume")
+            if recovery == "parked-resume":
+                record = replace(record, status=replace(record.status, status="needs-human",
+                                                       park_snapshot=str(tmp_path / "park")))
+        elif recovery == "unavailable":
+            daemon.faults[("GET", f"/api/session/{old.identifier}")].append(SyntheticFault(status=500))
+        elif recovery == "form":
+            child = daemon.child_session(old.identifier, record.sandbox)
+            daemon.question(child)
+        sentinel = Path(record.sandbox) / "retained-work"
+        sentinel.write_text("saved run work")
+        monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: Path(record.sandbox))
+        monkeypatch.setattr(orchestrator, "_git_credential_settings", lambda *a: ())
+        def order(self, **kwargs):
+            return WorkOrder(2125, Path(record.session_checkout), "", None, 30,
+                {**spec.env, "MIMIR_MODEL_SPEC": "codex-plus:gpt-test#high", "FACTORY_PUBLISHING_IDENTITY": "fixture-bot",
+                 "GIT_AUTHOR_NAME": "Fixture Bot", "GIT_AUTHOR_EMAIL": "fixture@example.invalid"}), "fixture-bot"
+        monkeypatch.setattr(WorklinkRunner, "_factory_launch_order", order)
+        current = record.status
+        class Factory(FeatureFactoryBackend):
+            def status(self, *args, **kw):
+                return current
+            def lock(self, run_id, action, **kw):
+                nonlocal current
+                assert run_id == record.run_id and action == "release"
+                assert kw["session"] == old.identifier
+                current = replace(current, lock="absent", lock_session=None)
+        async def supervise(self, **kwargs):
+            saved = kwargs["factory_record"]
+            assert saved.run_id == record.run_id and saved.sandbox == record.sandbox
+            assert saved.branch == record.branch and sentinel.read_text() == "saved run work"
+            assert (saved.opencode_session_id != old.identifier) == (recovery in {"fresh", "release"})
+            return WorklinkRunResult(2125, 2, "supervising")
+        monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._recover_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 2, "fixture", datetime.now(UTC)),
+            claims=SimpleNamespace(_issue_comments=lambda *a, **kw: []),
+            backend=Factory(), compute=compute, retained=record, launcher=Path(record.launcher),
+            repo_slug=record.repository, base="main", test_cmd="pytest", work_item_json=spec.env["MIMIR_WORK_ITEM_JSON"],
+            runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "https://github.com/owner/repo.git\n", ""))
+        if recovery in {"unavailable", "form"}:
+            with pytest.raises(DaemonClientError, match="HTTP failure" if recovery == "unavailable" else "retained_pending_form"):
+                await invocation
+            assert boundary.create_calls == 1 and boundary.controller.path.exists()
+            assert load_factory_record(tmp_path, record.run_id) == record
+            return
+        result = await invocation
+        assert result.status == "supervising"
+        assert boundary.create_calls == (2 if recovery in {"fresh", "release"} else 1)
+        prompts = [body for method, route, _, body in daemon.requests if method == "POST" and route.endswith("/prompt")]
+        assert len(prompts) == (1 if recovery in {"resume", "parked-resume"} else 0)
+        if prompts:
+            assert prompts[0] == {"text": "Continue the persisted factory run chainlink-2125 using factory resume semantics. "
+                                  "Resume its saved state and next step; do not create a new run or story.", "resume": True}
 
 
 @pytest.mark.parametrize("verified,release_fault", [(True, None), (False, None),

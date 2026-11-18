@@ -3905,17 +3905,28 @@ class WorklinkRunner:
             return await self._finish_factory_070(issue=issue, claim_record=claim_record, claims=claims,
                 backend=backend, compute=compute, factory_record=retained, test_cmd=test_cmd,
                 runner=runner, started_at=datetime.now(UTC))
-        if daemon_host and pre.status == "running":
+        fresh_running = False
+        recovery = None
+        if daemon_host and (pre.status == "running" or pre.is_parked):
+            recovery = await compute.rearm_session(handle)
+            fresh_running = pre.status == "running" and recovery == "fresh"
+        if recovery == "continued" and pre.is_parked:
+            return await self._supervise_factory_070(issue=issue, claim_record=claim_record, claims=claims,
+                backend=backend, compute=compute, factory_record=retained, test_cmd=test_cmd,
+                runner=runner, started_at=datetime.now(UTC), recovery_session=handle.opencode_session_id,
+                autonomous=autonomous)
+        if daemon_host and pre.status == "running" and not fresh_running:
             return await self._supervise_factory_070(issue=issue, claim_record=claim_record, claims=claims,
                 backend=backend, compute=compute, factory_record=retained, test_cmd=test_cmd,
                 runner=runner, started_at=datetime.now(UTC), initial_status=pre, autonomous=autonomous)
-        if not pre.is_parked:
+        if not pre.is_parked and not fresh_running:
             raise WorklinkError("factory recovery status is not resumable")
         if retained.run_id != epic_run_id(retained.issue_id):
             raise WorklinkError("fresh daemon recovery requires a canonical factory run id")
-        if pre.park_snapshot is None:
+        if pre.park_snapshot is None and not fresh_running:
             raise WorklinkError("factory recovery requires a published park snapshot")
-        pre.require_recovery_next()
+        if not fresh_running:
+            pre.require_recovery_next()
         prior_park_time = (retained.observed_at if retained.status is not None and retained.status.is_parked
                            and retained.status.park_snapshot == pre.park_snapshot else None)
         epic_environment = dict(os.environ)
@@ -3947,14 +3958,15 @@ class WorklinkRunner:
                 retained = replace(retained, controller_phase="parked")
                 save_factory_record(self.home, retained)
                 self._archive_factory_park(next(iter(prior.values())), retained)
-        if daemon_host:
+        if daemon_host and not fresh_running:
             await _cancel_and_cleanup_factory_handle(compute, handle)
         if pre.lock_session is not None:
             await _await_factory_control(backend.lock, retained.run_id, "release", session=retained.session,
                                    sandbox=sandbox, launcher=retained.launcher)
         released = await asyncio.to_thread(backend.status, retained.run_id, sandbox=sandbox, launcher=retained.launcher)
         _require_factory_status(released, retained)
-        if (not released.is_parked or released.lock != "absent" or released.lock_session is not None
+        if ((not released.is_parked and not (fresh_running and released.status == "running"))
+                or released.lock != "absent" or released.lock_session is not None
                 or released.next != pre.next
                 or _opaque_json_bytes(released.terminal_result) != _opaque_json_bytes(pre.terminal_result)):
             raise WorklinkError("factory recovery could not verify the old host lock was released")
