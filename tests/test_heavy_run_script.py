@@ -18,6 +18,8 @@ import time
 
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "heavy_run.sh"
 TIMEOUT_HELPER = Path(__file__).with_name("heavy_timeout.py")
 
@@ -99,7 +101,7 @@ def test_release_on_exit_and_owner_metadata(tmp_path: Path, start, status: int) 
     assert owner["host"] and owner["pid"] > 0 and owner["start_time"] > 0
     assert owner["timeout"] == "60"
     release.touch()
-    assert child.wait(timeout=15) == status
+    assert child.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == status
     assert not _lease(tmp_path).exists()
     assert not list(tmp_path.glob("*.retired-*"))
 
@@ -114,7 +116,10 @@ def test_two_wrappers_serialize(tmp_path: Path, start) -> None:
     _wait(lambda: int(heartbeat.read_text()) >= 8)
     assert second.poll() is None and not (tmp_path / "second").exists()
     release.touch()
-    assert first.wait(timeout=15) == second.wait(timeout=15) == 0
+    assert (
+        first.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS)
+        == second.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+    )
     assert (tmp_path / "second").exists()
 
 
@@ -223,7 +228,7 @@ def test_heartbeat_stops_when_child_exits(tmp_path: Path, start) -> None:
     fd = os.open(_lease(tmp_path), os.O_RDONLY | os.O_DIRECTORY)
     try:
         release.touch()
-        assert holder.wait(timeout=15) == 0
+        assert holder.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
         assert os.listdir(fd) == []
         time.sleep(0.12)
         assert os.listdir(fd) == []
@@ -253,7 +258,7 @@ def test_stale_lease_has_single_winner_among_process_waiters(tmp_path: Path, sta
     payload = ("from pathlib import Path; import time; "
                f"p=Path({str(tmp_path / 'active')!r}); p.mkdir(); time.sleep(.05); p.rmdir()")
     waiters = [start(sys.executable, "-c", payload, MIMIR_HEAVY_STALE_SECONDS="1.2") for _ in range(8)]
-    outputs = [p.communicate(timeout=30) for p in waiters]
+    outputs = [p.communicate(timeout=SUBPROCESS_HANG_GUARD_SECONDS) for p in waiters]
     assert all(p.returncode == 0 for p in waiters), outputs
     assert sum(err.count("retired stale lease") for _, err in outputs) == 1
     assert not _lease(tmp_path).exists()
@@ -523,7 +528,7 @@ def test_displaced_holder_never_updates_or_releases_replacement(tmp_path: Path, 
     _wait(lambda: int((displaced / "heartbeat").read_text()) > initial)
     assert (lease / "heartbeat").read_text() == "7\n"
     release.touch()
-    assert holder.wait(timeout=15) == 0
+    assert holder.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
     assert (lease / "heartbeat").read_text() == "7\n"
 
 

@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 from mimir.acp import confinement
 from mimir.acp.execution_scope import ScopeApproval
 
@@ -253,7 +255,7 @@ def run_confined(argv, cwd, approved=()):
     prepared = confinement.prepare_command(argv, cwd=cwd, approved_paths=approved)
     return subprocess.run(
         prepared.argv, cwd=cwd, env=prepared.env, text=True,
-        capture_output=True, timeout=15,
+        capture_output=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
 
 
@@ -427,7 +429,7 @@ for line in sys.stdin:
     result = subprocess.run(
         prepared.argv, env=prepared.env, cwd=cwd,
         input="".join(json.dumps(str(path)) + "\n" for path in paths),
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert result.returncode == 0, result.stderr
     assert [json.loads(line) for line in result.stdout.splitlines()] == [
@@ -451,7 +453,10 @@ def test_module_runtime_and_private_scratch(fixture_scope, tmp_path):
          f"Path({str(scratch / 'out')!r}).write_text('fixture')"],
         cwd=cwd, scratch_paths=[scratch],
     )
-    result = subprocess.run(prepared.argv, env=prepared.env, cwd=cwd, capture_output=True, text=True, timeout=15)
+    result = subprocess.run(
+        prepared.argv, env=prepared.env, cwd=cwd, capture_output=True, text=True,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
+    )
     assert result.returncode == 0, result.stderr
     assert (scratch / "out").read_text() == "fixture"
     # A runtime scratch grant must not imply access to another sibling directory.
@@ -519,7 +524,10 @@ def test_scratch_root_cannot_be_removed_by_child(fixture_scope, tmp_path):
         [sys.executable, "-c", f"import os; os.rmdir({str(scratch)!r})"],
         cwd=cwd, scratch_paths=[scratch],
     )
-    result = subprocess.run(prepared.argv, env=prepared.env, cwd=cwd, capture_output=True, timeout=15)
+    result = subprocess.run(
+        prepared.argv, env=prepared.env, cwd=cwd, capture_output=True,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
+    )
     assert result.returncode != 0
     assert scratch.is_dir()
 
@@ -613,7 +621,7 @@ else:
         argv = [interpreter, "-I", "-S", "-c", script]
         control = subprocess.run(
             argv, cwd=cwd, env=confinement._environment(), capture_output=True,
-            text=True, timeout=15, close_fds=True,
+            text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS, close_fds=True,
         )
         assert control.returncode == 0, control.stderr
         assert control.stdout.strip() == "connected", control.stdout
@@ -626,7 +634,7 @@ else:
         assert prepared.execution_mode == "confined"
         result = subprocess.run(
             prepared.argv, cwd=cwd, env=prepared.env, capture_output=True,
-            text=True, timeout=15, close_fds=True,
+            text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS, close_fds=True,
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() in {str(errno.EACCES), str(errno.EPERM)}, result.stdout
@@ -880,6 +888,9 @@ builtins.open = lambda path, *a, **kw: io.StringIO({label!r}) if path == '/proc/
 sys.argv = ['launcher', 'intended', sys.executable, '-c', {f'from pathlib import Path; Path({str(marker)!r}).touch(); raise SystemExit(37)'!r}]
 exec({confinement._APPARMOR_LAUNCH!r})
 """
-    result = subprocess.run([sys.executable, "-I", "-S", "-c", script], capture_output=True, timeout=15)
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", script], capture_output=True,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
+    )
     assert marker.exists() is (label == "intended (enforce)")
     assert result.returncode == (37 if label == "intended (enforce)" else 1)

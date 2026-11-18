@@ -13,6 +13,8 @@ from unittest.mock import Mock, call
 
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 from mimir.saga import embeddings
 
 
@@ -335,6 +337,6 @@ from mimir.saga import embeddings
 for name, value in expected.items():
     assert os.environ[name] == value
 """],
-        env=env, capture_output=True, text=True, timeout=30,
+        env=env, capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert result.returncode == 0, result.stderr

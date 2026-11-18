@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from tests.nested_pytest import pytest_command
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
 
 
 def _kill_child_group(process):
@@ -52,11 +53,12 @@ def test_kill_child_group_cleanup_races(monkeypatch, returncode, error_type):
     assert calls == [(process.pid, signal.SIGKILL)]
 
 
-def _wait_for_child(process, *, timeout=30, drain_timeout=1):
+def _wait_for_child(process, *, timeout=SUBPROCESS_HANG_GUARD_SECONDS, drain_timeout=1):
     """Collect output without requiring inherited writers to reach EOF.
 
     The caller starts a new session; this helper also cleans up that owned
     process group, including descendants left behind by an exited controller.
+    The default timeout is a hang guard, not a child-startup latency bound.
     """
     output = {process.stdout: bytearray(), process.stderr: bytearray()}
     deadline = time.monotonic() + timeout
@@ -134,7 +136,8 @@ def test_wait_for_child_does_not_require_descendant_pipe_eof(capfd):
             ) as process:
                 try:
                     if legacy:
-                        assert process.wait(timeout=5) == 0
+                        # Hang guard; only communicate's short timeout is tested.
+                        assert process.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
                         with pytest.raises(subprocess.TimeoutExpired):
                             process.communicate(timeout=1)
                     else:
