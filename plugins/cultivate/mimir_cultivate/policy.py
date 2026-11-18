@@ -105,6 +105,21 @@ class RepoPRActionScope:
 
 
 @dataclass(frozen=True)
+class InterruptedPROperation:
+    """Turn-local evidence, never reconstructed from a stranded checkout."""
+
+    scope_id: str
+    lease_identity: tuple[str, str]
+    turn_nonce: str
+    observed_head: str
+    observed_base: str
+    base_ref: str
+    target: str
+    original_head: str
+    kind: str
+
+
+@dataclass(frozen=True)
 class RepoReviewState:
     """Immutable PR authority plus typed checkout-lease and execution evidence."""
 
@@ -117,6 +132,9 @@ class RepoReviewState:
     git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)
     full_tested_head: str | None = field(default=None, init=False, repr=False, compare=False)
     conflict_evidence_head: str | None = field(default=None, init=False, repr=False, compare=False)
+    interrupted_operation: InterruptedPROperation | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
     _author_attestation_verdicts: dict[tuple[str, str], tuple[bool, str]] = field(
         default_factory=dict, init=False, repr=False, compare=False,
     )
@@ -153,6 +171,7 @@ class RepoReviewState:
         object.__setattr__(self, "checkout_lease", lease)
         object.__setattr__(self, "checked_out", True)
         object.__setattr__(self, "git_expected_head", self.action_scope.observed_head_sha.lower())
+        object.__setattr__(self, "interrupted_operation", None)
 
     def record_git_head(self, scope_id: str, head: str) -> None:
         lease = self.checkout_lease
@@ -208,6 +227,7 @@ class RepoReviewState:
             object.__setattr__(self, "git_expected_head", None)
             object.__setattr__(self, "full_tested_head", None)
             object.__setattr__(self, "conflict_evidence_head", None)
+            object.__setattr__(self, "interrupted_operation", None)
 
 
 @dataclass(frozen=True)
@@ -526,6 +546,7 @@ def register_action_protocol(
 
 def _live_scoped_pr_lease(
     scope: object, review_state: object, *, diagnostics: list[str] | None = None,
+    tool_name: str | None = None, turn_nonce: str | None = None,
 ) -> object | None:
     def refuse(reason: str) -> None:
         if diagnostics is not None:
@@ -575,6 +596,16 @@ def _live_scoped_pr_lease(
             or attached.destination_ref != scope.destination_ref
             or getattr(review_state, "action_scope", None) is not scope):
         return refuse("lease identity or bound review state differs from scope")
+    # Even a merge whose HEAD has not moved is an interrupted operation. Do not
+    # let the ordinary branch/head match authorize publication or file writes.
+    git_dir = path / ".git"
+    interrupted = any((git_dir / marker).exists() for marker in (
+        "rebase-merge", "rebase-apply", "MERGE_HEAD",
+    ))
+    if interrupted:
+        if not _valid_interrupted_operation(scope, review_state, tool_name, turn_nonce):
+            return refuse("interrupted operation lacks matching turn-local recovery evidence")
+        return attached
     observed = _observed_checkout_state(path)
     if isinstance(observed, str):
         return refuse(f"checkout Git state differs from scope: {observed}")
@@ -596,6 +627,67 @@ def _live_scoped_pr_lease(
                 )):
             return refuse("checkout head ancestry or clean lineage differs from scope")
     return attached
+
+
+def _valid_interrupted_operation(scope, state, tool_name, turn_nonce) -> bool:
+    """Validate Git's recovery identity as well as the host's own start receipt."""
+    from .repository import hardened_git_command, _PROTECTED_BRANCH_REFS
+
+    evidence = state.interrupted_operation
+    lease = state.checkout_lease
+    if not isinstance(evidence, InterruptedPROperation) or not turn_nonce:
+        return False
+    if (evidence.scope_id != scope.scope_id
+            or evidence.lease_identity != (str(lease.path), lease.recovery_id)
+            or evidence.turn_nonce != turn_nonce
+            or evidence.observed_head != scope.observed_head_sha.lower()
+            or evidence.observed_base != scope.observed_base_sha.lower()
+            or evidence.base_ref != scope.base_ref
+            or f"refs/heads/{scope.base_ref}" not in _PROTECTED_BRANCH_REFS
+            or evidence.original_head != state.git_expected_head):
+        return False
+    allowed = {"repo_status", "repo_unmerged"}
+    if evidence.kind == "rebase":
+        allowed.add("repo_rebase_abort")
+        if scope.event_type == "pr_mergeability_conflicting":
+            allowed.add("repo_rebase")
+    elif evidence.kind == "merge":
+        allowed.add("repo_merge_abort")
+    else:
+        return False
+    if tool_name not in allowed:
+        return False
+    git_dir = Path(lease.path) / ".git"
+    try:
+        if evidence.kind == "rebase":
+            # Our typed rebase uses the merge backend; do not adopt an unrelated
+            # apply-backend operation or a merge nested inside the rebase.
+            recovery = git_dir / "rebase-merge"
+            if (git_dir / "rebase-apply").exists() or (git_dir / "MERGE_HEAD").exists():
+                return False
+            expected = {
+                "head-name": scope.destination_ref,
+                "orig-head": evidence.original_head,
+                "onto": evidence.target,
+            }
+            if any((recovery / name).read_text().strip() != value for name, value in expected.items()):
+                return False
+            ancestor = hardened_git_command(
+                lease.path, ("merge-base", "--is-ancestor", evidence.observed_base, evidence.target),
+                timeout=10,
+            )
+            return ancestor.returncode == 0 and not ancestor.timed_out and not ancestor.output_limited
+        if evidence.target != lease.base_sha.lower():
+            return False
+        if any((git_dir / marker).exists() for marker in ("rebase-merge", "rebase-apply")):
+            return False
+        return (
+            (git_dir / "MERGE_HEAD").read_text().strip() == evidence.target
+            and (git_dir / "ORIG_HEAD").read_text().strip() == evidence.original_head
+            and _observed_checkout_state(Path(lease.path)) == (scope.head_ref, evidence.original_head)
+        )
+    except (OSError, ValueError):
+        return False
 
 
 def _observed_checkout_state(path: Path) -> tuple[str, str] | str:

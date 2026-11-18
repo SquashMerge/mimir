@@ -3568,6 +3568,24 @@ class RepoGitTools:
             for marker in ("rebase-merge", "rebase-apply", "MERGE_HEAD")
         )
 
+    def _interruption_receipt(self, kind: str, target: str):
+        """Prepare recovery authority only before our own attested operation."""
+        from mimir.access_control import ScopedPRGrants, pr_checkout_lease_attestation
+        from .policy import InterruptedPROperation
+
+        context = self._auth_context
+        grants = getattr(context, "scoped_pr_grants", None)
+        if (not isinstance(grants, ScopedPRGrants)
+                or not pr_checkout_lease_attestation(context, self._scope, self._state.checkout_lease).ok
+                or self._has_in_progress_merge_or_rebase()):
+            return None
+        lease = self._state.checkout_lease
+        return InterruptedPROperation(
+            self._scope.scope_id, (str(lease.path), lease.recovery_id), grants.nonce,
+            self._scope.observed_head_sha.lower(), self._scope.observed_base_sha.lower(),
+            self._scope.base_ref, target.lower(), self._expected_head, kind,
+        )
+
     def _assert_checkout_identity(self, *, allow_in_progress: bool = False) -> None:
         top = self._command(("rev-parse", "--show-toplevel")).stdout.strip()
         if Path(top).resolve(strict=False) != self._root:
@@ -3947,6 +3965,7 @@ class RepoGitTools:
         elif isinstance(operation, GitMerge):
             self._require("repo_merge", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             previous = self._expected_head
+            receipt = self._interruption_receipt("merge", self._state.checkout_lease.base_sha)
             try:
                 result = self._command(
                     ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha),
@@ -3958,6 +3977,9 @@ class RepoGitTools:
                 self._refresh_expected_head()
                 self._record_local_head(previous)
                 previous = self._expected_head
+                # This second merge is not onto the scoped base; it cannot
+                # receive interrupted-base recovery authority.
+                receipt = None
                 publication_merge = self._command(
                     ("merge", "--no-edit", "--", self._scope.observed_head_sha),
                     identity=True,
@@ -3967,6 +3989,8 @@ class RepoGitTools:
                     result.stderr + publication_merge.stderr,
                 )
             except GitRefusal as exc:
+                if receipt is not None and self._has_in_progress_merge_or_rebase():
+                    object.__setattr__(self._state, "interrupted_operation", receipt)
                 if exc.code != "git_failed":
                     raise
                 unmerged = self._unmerged_paths()
@@ -3984,6 +4008,7 @@ class RepoGitTools:
         elif isinstance(operation, GitMergeAbort):
             self._require("repo_merge_abort", RepoPRAction.WRITE)
             result = self._command(("merge", "--abort"))
+            object.__setattr__(self._state, "interrupted_operation", None)
         elif isinstance(operation, GitRebase):
             self._require("repo_rebase", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             previous = self._expected_head
@@ -4033,12 +4058,22 @@ class RepoGitTools:
                     f"Head verification: {head_verification}"
                 )
                 self._command(("commit", "--amend", "-m", evidence), identity=True)
+                receipt = self._state.interrupted_operation
+                if receipt is not None:
+                    verified_base = receipt.target
             else:
-                result = self._command(
-                    ("rebase", "--", verified_base), identity=True,
-                )
+                receipt = self._interruption_receipt("rebase", verified_base)
+                try:
+                    result = self._command(
+                        ("rebase", "--", verified_base), identity=True,
+                    )
+                except GitRefusal:
+                    if receipt is not None and self._has_in_progress_merge_or_rebase():
+                        object.__setattr__(self._state, "interrupted_operation", receipt)
+                    raise
             self._refresh_expected_head()
             self._record_local_head(previous, verified_base=verified_base, rewrite=True)
+            object.__setattr__(self._state, "interrupted_operation", None)
             if continuing:
                 self._state.record_conflict_evidence(
                     self._scope.scope_id, self._expected_head,
@@ -4046,6 +4081,7 @@ class RepoGitTools:
         elif isinstance(operation, GitRebaseAbort):
             self._require("repo_rebase_abort", RepoPRAction.WRITE)
             result = self._command(("rebase", "--abort"))
+            object.__setattr__(self._state, "interrupted_operation", None)
         elif isinstance(operation, GitRevert):
             self._require("repo_revert", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             previous = self._expected_head
@@ -5479,6 +5515,7 @@ def _retained_refusal(operation: str) -> ToolPolicyRefusal:
 def _publish_attested_lease_result(
     runtime: ToolRuntime[AuthContext] | None,
     state: RepoReviewState,
+    *, tool_name: str | None = None,
 ) -> None:
     """Publish exact-scope provenance when the checkout remains author-attested."""
     from mimir.access_control import (
@@ -5504,6 +5541,16 @@ def _publish_attested_lease_result(
         or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
     ):
         return
+    if tool_name in {"repo_status", "repo_unmerged"} and state.interrupted_operation is not None:
+        from .policy import _live_scoped_pr_lease
+
+        grants = getattr(context, "scoped_pr_grants", None)
+        if (getattr(context.ifc_state, "pr_checkout_author_trust", {}).get(scope.scope_id) is True
+                and _live_scoped_pr_lease(
+                    scope, state, tool_name=tool_name, turn_nonce=getattr(grants, "nonce", None),
+                ) is state.checkout_lease):
+            _publish_attested_scope_result(runtime, scope, scope.observed_head_sha)
+            return
     attestation = pr_checkout_lease_attestation(context, scope, state.checkout_lease)
     if not attestation.ok:
         log_pr_checkout_lease_attestation_refused(context, scope, attestation.reason)
@@ -5632,7 +5679,12 @@ def _execute(
                     state.action_scope.canonical_repo, state.action_scope.pr_number,
                     previous_head,
                 )
-        _publish_attested_lease_result(runtime, state)
+        _publish_attested_lease_result(
+            runtime, state, tool_name=(
+                "repo_status" if isinstance(operation, GitStatus) else
+                "repo_unmerged" if isinstance(operation, GitUnmerged) else None
+            ),
+        )
         return result
     except (GitRefusal, ToolException, RuntimeError, ValueError) as exc:
         cause_code = getattr(exc, "code", None)

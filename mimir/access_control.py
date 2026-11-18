@@ -9216,6 +9216,9 @@ class ToolAuthorization:
     result_integrity: str = "untrusted"
     argument_egress: str = "taint_gated"
     repo_pr_action_scope: Any = field(default=None, repr=False)
+    # Pre-execution attestation: failed Git operations may detach/move HEAD or
+    # remove recovery metadata before their diagnostics are classified.
+    repo_pr_diagnostics_bound: bool = False
     forge_scope_mismatch: dict[str, Any] | None = None
     policy: Any = field(default=None, repr=False, compare=False)
 
@@ -9242,6 +9245,9 @@ class ToolAuthorization:
 
 
 _SCOPED_PR_ISSUER = object()
+_PR_OPERATION_DIAGNOSTICS = frozenset({
+    "repo_rebase", "repo_merge", "repo_rebase_abort", "repo_merge_abort",
+})
 
 
 @dataclass(frozen=True)
@@ -9447,7 +9453,13 @@ def _valid_scoped_pr_grant(
         if grant.lease_identity is not None:
             return False
     else:
-        live = protocol.live_lease(scope, review_state) if protocol.live_lease is not None else None
+        live_lease = protocol.live_lease
+        # Owners may bind a narrowly allowed recovery operation to this turn.
+        # Older protocols keep their two-argument contract and gain no bypass.
+        recovery_args = {}
+        if live_lease is not None and "tool_name" in inspect.signature(live_lease).parameters:
+            recovery_args = {"tool_name": tool_name, "turn_nonce": grants.nonce}
+        live = live_lease(scope, review_state, **recovery_args) if live_lease is not None else None
         if live is None or grant.lease_identity != (str(live.path), live.recovery_id):
             return False
     try:
@@ -9643,6 +9655,17 @@ def authorize_repo_pr_tool(
         and bool(getattr(scope, "principal", None))
         and getattr(scope, "pull_request_author", None) == scope.principal
     )
+    diagnostics_bound = False
+    if (in_scope and registered_plugin and owner == "cultivate"
+            and tool_name in _PR_OPERATION_DIAGNOSTICS
+            and getattr(auth_context.ifc_state, "pr_checkout_author_trust", {}).get(scope.scope_id) is True
+            and scope.head_remote == "origin" and scope.head_repo == scope.canonical_repo):
+        hooks = selected_policy_registry().policy_consumer_hooks
+        diagnostics_bound = (
+            hooks is not None and f"refs/heads/{scope.base_ref}" in hooks.protected_refs
+            and (getattr(review_state, "interrupted_operation", None) is not None
+                 or _attested_pr_checkout_lease(auth_context, scope, review_state.checkout_lease))
+        )
     return ToolAuthorization(
         tool_name=tool_name,
         decision=OperationDecision.RESOURCE_SCOPED,
@@ -9668,6 +9691,7 @@ def authorize_repo_pr_tool(
         ),
         flow_direction=flow_direction,
         repo_pr_action_scope=scope,
+        repo_pr_diagnostics_bound=diagnostics_bound,
     )
 
 
@@ -12112,7 +12136,16 @@ def _provider_pr_lease_result_is_bound(
         )
     return (
         state is not None and getattr(state, "action_scope", None) is scope
-        and (_forge_pr_result_labels_itself(registered) or _attested_pr_checkout_lease(
+        and (_forge_pr_result_labels_itself(registered) or (
+            registered.owner == "cultivate"
+            and tool_name in {"repo_status", "repo_unmerged"}
+            and getattr(state, "interrupted_operation", None) is not None
+            and _valid_scoped_pr_grant(
+                auth_context, registered.owner, registered.typed_action,
+                selected_policy_registry().scoped_actions.get(registered.owner),
+                scope, state, tool_name=tool_name,
+            )
+        ) or _attested_pr_checkout_lease(
             auth_context, scope, getattr(state, "checkout_lease", None),
         ))
     )
@@ -12352,14 +12385,19 @@ def _bound_repository_checkout_failure(
     tool_name: str, arguments: dict[str, Any],
     authorization: ToolAuthorization, registered: Any, failed: bool,
 ) -> bool:
-    """Bind configured-repo failure diagnostics without requiring a checkout lease.
+    """Bind checkout failures or pre-attested Git-operation diagnostics.
 
     A refused checkout may never acquire a lease. Success still requires the
     ordinary lease binding; the caller must retain any published content labels.
     """
     scope = authorization.repo_pr_action_scope
     return (
-        registered.owner == "cultivate" and tool_name == "repo_checkout"
+        registered.owner == "cultivate"
+        and (tool_name == "repo_checkout" or (
+            tool_name in _PR_OPERATION_DIAGNOSTICS
+            and authorization.tool_name == tool_name
+            and authorization.repo_pr_diagnostics_bound
+        ))
         and registered.resource_scope == "repo_pr"
         and "repo_actions" in registered.memberships
         and authorization.allowed and not authorization.would_block
@@ -12570,6 +12608,20 @@ def classify_protected_result(
             labels = InformationFlowLabels()
             for source in sources:
                 labels = labels.with_source(source)
+            if tool_name in _PR_OPERATION_DIAGNOSTICS and sources:
+                scope = authorization.repo_pr_action_scope
+                if all(
+                    source.integrity == "trusted" and source.domain == "repository"
+                    and source.resource_id == (
+                        f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}"
+                    ) for source in sources
+                ):
+                    # Preserve the existing bounded failure-provenance audit;
+                    # the early diagnostic binding must not skip this status.
+                    _log_retained_repository_failure(
+                        tool_name, result, scope.canonical_repo, scope.pr_number,
+                        scope.observed_head_sha,
+                    )
             return labels if sources else None
         if tool_name == "repo_cleanup":
             if _bound_repository_cleanup_result(
