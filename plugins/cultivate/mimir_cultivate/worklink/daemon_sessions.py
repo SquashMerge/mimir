@@ -156,7 +156,10 @@ class ControllerRecord:
 
 
 def session_permissions(request: SessionRequest) -> list[dict[str, str]]:
-    rules = [{"action": "external_directory", "resource": "*", "effect": "deny"}]
+    # Native subagents inherit this ruleset (Session.create), after agent rules.
+    # Headless sessions must report decisions to their caller, never open a form.
+    rules = [{"action": "external_directory", "resource": "*", "effect": "deny"},
+             {"action": "question", "resource": "*", "effect": "deny"}]
     if request.kind == "leaf":
         if not request.shell_allowlist or any(not rule.strip() or rule.strip() == "*" for rule in request.shell_allowlist):
             raise ValueError("leaf requires a bounded shell allowlist")
@@ -492,8 +495,45 @@ class SessionController:
             return SessionOutcome(self.record.opencode_session_id, "incomplete", self.record.cancellation_state,
                                    SessionError("timeout", "Worklink session deadline exceeded"))
 
+    async def _pending_question(self) -> SessionError | None:
+        """Read-only backstop for old sessions or a daemon permission regression.
+
+        Forms belong to sessions, not just the observed driver. Walk every depth,
+        including archived children; never grant, cancel, or answer a form here.
+        """
+        pending = [self.record.opencode_session_id]
+        seen = set(pending)
+        while pending:
+            sid = pending.pop()
+            forms = await self._bounded(self.client.forms(sid))
+            for form in forms:
+                if form.get("metadata", {}).get("kind") == "question":
+                    # Reserve space for both title and text in the operator-facing
+                    # message (backend summaries omit error.body).
+                    text = "\n".join(field.get("description", "") for field in form["fields"])
+                    return SessionError(
+                        "pending_question",
+                        self._redacted(f"OpenCode session {sid} has a pending question ({form['id']}): "
+                                       + self._redacted(form["title"], 512) + "\n"
+                                       + self._redacted(text, 1024), 2048),
+                        self._redacted(text, 8192),
+                    )
+            for child in await self._bounded(self.client.children(sid)):
+                if child["id"] in seen or len(seen) >= 4096:
+                    raise DaemonClientError("invalid session descendant tree")
+                seen.add(child["id"])
+                pending.append(child["id"])
+        return None
+
     async def _observe(self, *, stdout_limit: int) -> SessionOutcome:
         async with self._lock:
+            question = await self._pending_question()
+            if question is not None:
+                # Incomplete is already operator-visible through the supervisor's
+                # error path. Do not persist a terminal state: the tool is waiting,
+                # not quiescent, and cleanup still needs its normal witnesses.
+                return SessionOutcome(self.record.opencode_session_id, "incomplete",
+                                      self.record.cancellation_state, question)
             messages, _ = await self._refresh()
             state = self.record.execution_state
             error = None

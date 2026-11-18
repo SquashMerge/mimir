@@ -4134,6 +4134,7 @@ class RepoGitTools:
             self._finish_recovery(recovery)
         elif isinstance(operation, GitRebase):
             self._require("repo_rebase", RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            object.__setattr__(self._state, "_scoped_rebase", None)
             previous = self._expected_head
             if not _history_rewrite_push_permitted(self._scope):
                 raise GitRefusal(
@@ -4187,6 +4188,16 @@ class RepoGitTools:
                 )
             self._refresh_expected_head()
             self._record_local_head(previous, verified_base=verified_base, rewrite=True)
+            # Only this successful typed operation can establish continuity.
+            # Keep the remote observation/grant head untouched: force-with-lease
+            # must still compare against the PR's original published head.
+            if verified_base == self._scope.observed_base_sha.lower():
+                from .policy import _scoped_rebase_binding
+
+                object.__setattr__(self._state, "_scoped_rebase", (
+                    _scoped_rebase_binding(self._scope, self._state.checkout_lease),
+                    self._expected_head,
+                ))
             if continuing:
                 self._state.record_conflict_evidence(
                     self._scope.scope_id, self._expected_head,

@@ -117,6 +117,12 @@ class RepoReviewState:
     git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)
     full_tested_head: str | None = field(default=None, init=False, repr=False, compare=False)
     conflict_evidence_head: str | None = field(default=None, init=False, repr=False, compare=False)
+    # Host-only evidence, never reconstructed from checkout metadata. The last
+    # element anchors subsequent clean commits; the prefix binds the exact lease
+    # and the original forge observations (not the rewritten local head).
+    _scoped_rebase: tuple[tuple[object, ...], str] | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
     _author_attestation_verdicts: dict[tuple[str, str], tuple[bool, str]] = field(
         default_factory=dict, init=False, repr=False, compare=False,
     )
@@ -153,6 +159,7 @@ class RepoReviewState:
         object.__setattr__(self, "checkout_lease", lease)
         object.__setattr__(self, "checked_out", True)
         object.__setattr__(self, "git_expected_head", self.action_scope.observed_head_sha.lower())
+        object.__setattr__(self, "_scoped_rebase", None)
 
     def record_git_head(self, scope_id: str, head: str) -> None:
         lease = self.checkout_lease
@@ -208,6 +215,7 @@ class RepoReviewState:
             object.__setattr__(self, "git_expected_head", None)
             object.__setattr__(self, "full_tested_head", None)
             object.__setattr__(self, "conflict_evidence_head", None)
+            object.__setattr__(self, "_scoped_rebase", None)
 
 
 @dataclass(frozen=True)
@@ -524,12 +532,23 @@ def register_action_protocol(
     )
 
 
+def _scoped_rebase_binding(scope: object, lease: object) -> tuple[object, ...]:
+    return (
+        scope.scope_id, scope.canonical_repo, scope.pr_number,
+        str(lease.path), lease.recovery_id, scope.observed_head_sha.lower(),
+        scope.observed_base_sha.lower(),
+    )
+
+
 def _live_scoped_pr_lease(
     scope: object, review_state: object, *, diagnostics: list[str] | None = None,
+    refusal_codes: list[str] | None = None,
 ) -> object | None:
-    def refuse(reason: str) -> None:
+    def refuse(reason: str, code: str = "lease_invalid") -> None:
         if diagnostics is not None:
             diagnostics.append(reason)
+        if refusal_codes is not None:
+            refusal_codes.append(code)
         return None
 
     attached = getattr(review_state, "checkout_lease", None)
@@ -584,7 +603,7 @@ def _live_scoped_pr_lease(
     if observed != (
         scope.head_ref, getattr(review_state, "git_expected_head", None)
     ):
-        return refuse(f"checkout Git state differs from scope: {observed!r}")
+        return refuse(f"checkout Git state differs from scope: {observed!r}", "lease_head_mismatch")
     if attached.head_sha.lower() != scope.observed_head_sha.lower():
         from mimir.access_control import _lease_has_clean_lineage
         from .repository import hardened_git_command
@@ -593,11 +612,21 @@ def _live_scoped_pr_lease(
             path, ("merge-base", "--is-ancestor", scope.observed_head_sha, attached.head_sha),
             timeout=10,
         )
-        if (ancestry.returncode != 0 or ancestry.timed_out or ancestry.output_limited
-                or not _lease_has_clean_lineage(
+        head_bound = ancestry.returncode == 0 and not ancestry.timed_out and not ancestry.output_limited
+        if not head_bound:
+            proof = getattr(review_state, "_scoped_rebase", None)
+            if (proof is not None and proof[0] == _scoped_rebase_binding(scope, attached)
+                    and attached.base_sha.lower() == scope.observed_base_sha.lower()
+                    and attached.verified_base_sha == attached.base_sha):
+                descendant = hardened_git_command(
+                    path, ("merge-base", "--is-ancestor", proof[1], attached.head_sha), timeout=10,
+                )
+                head_bound = (descendant.returncode == 0 and not descendant.timed_out
+                              and not descendant.output_limited)
+        if (not head_bound or not _lease_has_clean_lineage(
                     path, attached, scope, scope.observed_head_sha.lower(), attached.head_sha.lower(),
                 )):
-            return refuse("checkout head ancestry or clean lineage differs from scope")
+            return refuse("checkout head ancestry or clean lineage differs from scope", "lease_head_mismatch")
     return attached
 
 

@@ -14,6 +14,12 @@ MARKERS = {
     "permission_agent_then_session": (b'let x=yield*a.resolve(C??P.agent)', 225),
     "permission_final_deny": (b'let H=u(function*(Y){let C=yield*O(Y.sessionID,Y.agent)', 220),
     "agent_editor_replacement": (b'update:(g,A)=>{let y=T.agents.get(g)??gS.default(g)', 145),
+    "question_permission_and_form": (b'execute:(d,y)=>o.assert({action:"question"', 405),
+    "question_field_text": (b'function i_(e,T){return{key:`q${T}`', 242),
+    "session_parent_lookup": (b'let pe=H.parentID?yield*C.get(H.parentID)', 292),
+    "session_permission_inheritance": (b'title:H.title,agent:H.agent,metadata:H.metadata??pe?.metadata', 131),
+    "subagent_session_create": (b'de=ee??(yield*a.create({parentID:O.sessionID', 207),
+    "command_subagent_session_create": (b'_e=yield*x.create({parentID:he.id', 133),
 }
 
 

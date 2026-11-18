@@ -508,6 +508,7 @@ async def test_epic_operator_checkout_lifecycle_refuses_unrecorded_locations(ses
     assert create["location"] == {"directory": str(outer)}
     assert create["model"] == {"providerID": "openai", "id": "gpt-test", "variant": "high"}
     assert create["permissions"] == [{"action": "external_directory", "resource": "*", "effect": "deny"},
+        {"action": "question", "resource": "*", "effect": "deny"},
         *[{"action": "read", "resource": name, "effect": "deny"} for name in (".env", "**/.env", "**/.env.*")]]
     environment = boundary.daemon.sessions[handle.identifier].environment
     assert environment["GH_TOKEN"] == environment["GITHUB_TOKEN"] == "generation-bot-token"

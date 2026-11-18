@@ -1771,6 +1771,9 @@ async def test_source_repo_hook_uses_pushed_from_repo_not_running_source(
 ) -> None:
     if selected_plugins:
         pytest.importorskip("mimir_cultivate")
+    # This hook test owns no daemon. Do not consult the builder image's
+    # installation bit and wait for an unrelated live readiness service.
+    monkeypatch.setattr("mimir.worklink_daemon_activation.read_installed_marker", lambda *_: False)
     monkeypatch.setenv("MIMIR_PLUGINS", selected_plugins)
     pushed_from = tmp_path / "pushed-from"
     running_source = tmp_path / "running-source"
@@ -2030,6 +2033,8 @@ async def test_startup_logs_effective_lease_read_scope(tmp_path, monkeypatch, en
     root.mkdir()
     if enabled:
         pytest.importorskip("mimir_cultivate")
+    # Read-root logging must not depend on an ambient installed daemon.
+    monkeypatch.setattr("mimir.worklink_daemon_activation.read_installed_marker", lambda *_: False)
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if enabled else "")
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
