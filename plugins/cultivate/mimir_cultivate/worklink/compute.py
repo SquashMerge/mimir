@@ -206,6 +206,9 @@ class OpenCodeDaemonComputeBackend:
     async def recover_admission(self, generation: str) -> LaunchHandle | None:
         return await self._client.session_recover_admission(generation)
 
+    async def rearm_session(self, handle: LaunchHandle) -> str:
+        return await self._client.session_rearm(handle)
+
     def bind_retained_checkout(self, checkout: Path, *, issue_id: int, attempt: int) -> None:
         """Bind a new controller to retained correlation without admitting input."""
         from .worker_client import WorkerClient

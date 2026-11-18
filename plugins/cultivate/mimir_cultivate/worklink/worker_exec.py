@@ -1586,7 +1586,8 @@ def handle_connection(connection: socket.socket) -> None:
             raise RuntimeError("unsupported worker request")
         raw_identifier = request.get("id")
         identifier = raw_identifier if isinstance(raw_identifier, str) else None
-        if request.get("op") in {"session_create", "session_observe", "session_cancel", "session_release", "session_tree_activity"}:
+        if request.get("op") in {"session_create", "session_observe", "session_cancel", "session_release", "session_tree_activity",
+                                 "session_rearm", "session_release_quiescent", "session_resume"}:
             _handle_session(connection, request, fds)
         elif request.get("op") in {"launch", "launch_path"}:
             _handle_launch(connection, request, fds)

@@ -258,7 +258,8 @@ class WorkerProcess:
 
 class WorkerClient:
     async def _session_rpc(self, operation: str, payload: Mapping[str, object]) -> dict[str, Any]:
-        if operation not in {"session_create", "session_observe", "session_cancel", "session_release", "session_tree_activity"}:
+        if operation not in {"session_create", "session_observe", "session_cancel", "session_release", "session_tree_activity",
+                             "session_rearm", "session_release_quiescent", "session_resume"}:
             raise ValueError("invalid session operation")
         if self.checkout is None and self.path_checkout is None:
             raise ValueError("session operation requires an issued checkout capability")
@@ -353,6 +354,10 @@ class WorkerClient:
             if recovered is None:
                 raise SessionAdmissionError(uncertain=False, generation=str(generation)) from None
             return recovered
+        if response.get("admission_state") == "refused":
+            error = SessionAdmissionError(uncertain=True, generation=str(generation))
+            error.args = ("retained session admission refused: " + str(response.get("reason", "unverified"))[:128],)
+            raise error
         if response.get("admission_state") == "conflict":
             raise SessionAdmissionError(uncertain=True, generation=str(generation),
                                         handle=self._admission_handle(response, str(generation)))
@@ -446,6 +451,20 @@ class WorkerClient:
         response = await self._session_handle_rpc("session_release", handle)
         if response != {"released": True}:
             raise RuntimeError("session release unverified; retain checkout")
+
+    async def session_rearm(self, handle: LaunchHandle) -> str:
+        response = await self._session_handle_rpc("session_rearm", handle)
+        if response not in ({"recovery": "fresh"}, {"recovery": "reattach"}, {"recovery": "continued"}):
+            raise RuntimeError("retained_recovery_unverified")
+        return response["recovery"]
+
+    async def session_release_quiescent(self, handle: LaunchHandle) -> None:
+        if await self._session_handle_rpc("session_release_quiescent", handle) != {"released": True}:
+            raise RuntimeError("retained_release_unverified")
+
+    async def session_resume(self, handle: LaunchHandle) -> None:
+        if await self._session_handle_rpc("session_resume", handle) != {"resumed": True}:
+            raise RuntimeError("retained_resume_unverified")
 
     def __init__(
         self,

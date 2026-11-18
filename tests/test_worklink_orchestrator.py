@@ -12545,6 +12545,10 @@ def test_factory_recovery_launch_start(
             events.append("released")
 
     class Compute:
+        async def rearm_session(self, selected: LaunchHandle) -> str:
+            assert selected == retained.handle
+            return "reattach"
+
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             events.append("launch")
             assert spec.attempt == retained.attempt
@@ -12807,6 +12811,10 @@ def test_factory_recovery_binds_work_item_to_retained_run_id(
             events.append("released")
 
     class Compute:
+        async def rearm_session(self, handle: LaunchHandle) -> str:
+            assert handle == retained.handle
+            return "reattach"
+
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             launched.append(spec)
             return LaunchHandle("opencode_daemon", "ses_test2", opencode_session_id="ses_test2", launch_generation="test-generation")
