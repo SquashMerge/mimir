@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.plugin_selection import cultivate_selected
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
 
 from mimir import access_control
 from mimir._context import reset_current_turn, set_current_turn
@@ -130,7 +131,7 @@ assert not any(name.startswith('mimir_cultivate') for name in sys.modules)
     environment.pop("MIMIR_PLUGINS", None)
     child = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path)], env=environment,
-        capture_output=True, text=True, timeout=20,
+        capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert child.returncode == 0, child.stderr
 

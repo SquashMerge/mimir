@@ -15,6 +15,8 @@ from typing import Any, get_args, get_origin
 
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 from mimir import runtime
 
 
@@ -619,7 +621,7 @@ def test_runtime_import_does_not_load_saga() -> None:
         check=False,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert result.returncode == 0, result.stderr
 
