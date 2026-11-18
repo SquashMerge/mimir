@@ -580,6 +580,22 @@ def reconcile_run_states(
             alive.append(state)
             continue
         with _claim_mutex(home):
+            if state.shim_pid is not None:
+                from .worker_client import WorkerClient
+
+                try:
+                    # A missing supervisor does not prove that its descendants
+                    # exited. Only the executor can retire this exact worker.
+                    asyncio.run(WorkerClient(None).cancel(state.handle_identifier))
+                except (RuntimeError, OSError, ValueError) as exc:
+                    alive.append(state)
+                    _emit_reconcile_event(
+                        event_logger,
+                        "worklink_run_state_reconcile_failed",
+                        issue_id=state.issue_id,
+                        reason=f"contained worker retirement is unverified: {exc}",
+                    )
+                    continue
             publication_outcome, publication_reason = _checkout_has_unpublished_commits(
                 state, run_git
             )
