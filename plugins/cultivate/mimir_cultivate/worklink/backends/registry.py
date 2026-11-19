@@ -866,19 +866,25 @@ class BackendRegistry:
                 f"{', '.join(repr(key) for key in retired)}; configure one "
                 "absolute 'entrypoint' ending in feature-factory/bin/factory.js"
             )
-        unknown = sorted(set(settings) - {"entrypoint"})
+        unknown = sorted(set(settings) - {"entrypoint", "host", "model"})
         if unknown:
             raise ValueError(
                 f"unknown worklink feature_factory setting: {unknown[0]}"
             )
+        host = settings.get("host", "opencode")
+        if not isinstance(host, str) or host not in {"opencode", "claude_code"}:
+            raise ValueError("worklink feature_factory host must be opencode or claude_code")
+        if settings.get("model") is not None and host != "claude_code":
+            raise ValueError("worklink feature_factory model requires claude_code host")
+        from ..claude_factory_host import DEFAULT_ENTRYPOINT
         entrypoint = str(
             settings.get("entrypoint")
             or os.environ.get("MIMIR_FACTORY_ENTRYPOINT")
-            or DEFAULT_FACTORY_ENTRYPOINT
+            or (DEFAULT_ENTRYPOINT if host == "claude_code" else DEFAULT_FACTORY_ENTRYPOINT)
         )
         if not Path(entrypoint).is_absolute():
             raise ValueError("worklink feature_factory entrypoint must be an absolute path")
-        return FeatureFactoryBackend(entrypoint=entrypoint)
+        return FeatureFactoryBackend(entrypoint=entrypoint, host=host, model=settings.get("model"))
 
 
 def _derive_bash_allowlist(test_command: str) -> tuple[str, ...]:

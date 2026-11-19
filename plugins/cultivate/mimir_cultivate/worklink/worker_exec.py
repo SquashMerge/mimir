@@ -103,6 +103,7 @@ class _FactoryProcess:
     returncode: int | None = None
     stop_deadline: float | None = None
     control_output: tuple[_ControlOutput, ...] = ()
+    admission_pending: bool = False
 
     @property
     def pid(self) -> int:
@@ -1057,6 +1058,14 @@ def _handle_cancel_factory_handle(
         raise RuntimeError("factory handle does not match an active executor job")
     if process_start_ticks(pid) != ticks:
         raise RuntimeError("refusing to cancel: recorded process identity no longer matches")
+    if request["op"] == "admit_factory_handle":
+        with _jobs_lock:
+            if not proc.admission_pending or proc.done.is_set() or proc.stop_deadline is not None:
+                raise RuntimeError("factory admission is no longer pending")
+            proc.channel.send(b"admit", socket.MSG_DONTWAIT)
+            proc.admission_pending = False
+        _send(connection, {"id": identifier, "status": "admitted"})
+        return
     proc.stop()
     if not proc.done.is_set() or proc.error is not None:
         raise RuntimeError("factory exit could not be verified")
@@ -1263,6 +1272,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     _validate_identifier(identifier)
     factory = request.get("op") in {"launch_factory", "launch_factory_control"}
     supervised = factory or request["home_projection_profile"] != "none"
+    held = request.get("op") == "launch_factory" and request["home_projection_profile"] == "claude_factory"
     checkout_root = None if path_addressed else _validate_checkout(fds[0], request)
     for fd in fds[0 if path_addressed else 1:]:
         metadata = os.fstat(fd)
@@ -1335,7 +1345,9 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             # not the writable checkout. -I excludes PYTHONPATH and user sites.
             launch_command = [
                 sys.executable, "-I", str(Path(__file__).with_name("factory_supervisor.py")),
-                str(supervisor_child.fileno()), *command,
+                str(supervisor_child.fileno()),
+                *(["--await-admission"] if held else []),
+                *command,
             ]
         control = request.get("op") == "launch_factory_control" or initializing_control
         proc = subprocess.Popen(
@@ -1364,7 +1376,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
                     "run_id": identifier, "issue_id": request["issue"], "attempt": request["attempt"],
                 }).encode(), socket.MSG_DONTWAIT)
 
-            proc = _FactoryProcess(proc, supervisor_parent, emit, control_output=captures)
+            proc = _FactoryProcess(proc, supervisor_parent, emit, control_output=captures,
+                admission_pending=held)
         with _jobs_lock:
             _jobs[identifier] = proc
             _launching.remove(identifier)
@@ -1569,7 +1582,7 @@ def handle_connection(connection: socket.socket) -> None:
             _handle_launch_factory(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)
-        elif request.get("op") == "cancel_factory_handle":
+        elif request.get("op") in {"cancel_factory_handle", "admit_factory_handle"}:
             _handle_cancel_factory_handle(connection, request, fds)
         elif request.get("op") == "identity":
             _handle_identity(connection, request, fds)

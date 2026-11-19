@@ -58,10 +58,14 @@ if [ "${1:-}" = --isolated-tests ]; then
     isolated=1
     shift
 fi
-if [ "$#" -ne 2 ] || [ "$1" != leaf ]; then
-    echo "usage: sh scripts/verify_claude_subscription.sh leaf <inspected-plugin-package>" >&2
+if [ "$#" -ne 2 ]; then
+    echo "usage: sh scripts/verify_claude_subscription.sh <leaf|factory> <inspected-plugin-package>" >&2
     exit 64
 fi
+case "$1" in
+    leaf|factory) ;;
+    *) echo "unknown subscription verification phase: $1" >&2; exit 64 ;;
+esac
 case "$2" in
     /*) ;;
     *) echo "inspected package root must be absolute" >&2; exit 64 ;;
@@ -106,6 +110,23 @@ do
     sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
         uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"
 done
+
+if [ "$1" = factory ]; then
+    for module in \
+        tests/test_worklink_claude_factory_host.py \
+        tests/test_worklink_factory_supervisor.py \
+        tests/test_worklink_stop.py \
+        tests/test_worklink_cli.py \
+        tests/test_worklink_continuation.py \
+        tests/test_web_ui.py \
+        tests/test_spawn_opencode.py
+    do
+        sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
+            uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"
+    done
+    sh scripts/heavy_run.sh env -u MIMIR_ACCESS_CONTROL_ENFORCED MIMIR_PLUGINS=cultivate \
+        uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 tests/test_worklink_autonomy.py
+fi
 
 sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 tests
 sh scripts/heavy_run.sh env -u MIMIR_PLUGINS MIMIR_ACCESS_CONTROL_ENFORCED=1 uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 tests

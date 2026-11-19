@@ -12833,6 +12833,8 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
     events: list[str] = []
 
     class Backend:
+        host = "opencode"
+
         def status(self, *args: object, **kwargs: object) -> Any:
             events.append("status")
             return terminal
@@ -14661,7 +14663,7 @@ def test_claude_quota_result_uses_common_hold_and_claim_forgiveness(tmp_path, mo
 @pytest.mark.parametrize("phase", ["initial", "repair"])
 @pytest.mark.parametrize("failure", ["cancel", "lost", "refused", "success"])
 async def test_contained_leaf_and_ci_repair_retirement_boundaries(tmp_path, monkeypatch, phase, failure):
-    from mimir_cultivate.worklink import compute, orchestrator as orch
+    from mimir_cultivate.worklink import compute, control, orchestrator as orch, worker_client
     from mimir_cultivate.worklink.execution_policy import CLAUDE_LEAF
 
     repo, checkout = tmp_path / "repo", tmp_path / "checkout"
@@ -14752,6 +14754,8 @@ async def test_contained_leaf_and_ci_repair_retirement_boundaries(tmp_path, monk
         assert not task.done(), task.result()
         assert entered.is_set()
         handle = bound._handles[launches[-1]]
+        startup_state = load_run_state(tmp_path, 441)
+        assert startup_state is not None
         if failure == "cancel":
             task.cancel()
             await asyncio.wait_for(cancelled.wait(), 5)
@@ -14773,6 +14777,23 @@ async def test_contained_leaf_and_ci_repair_retirement_boundaries(tmp_path, monk
             assert ["chainlink", "locks", "release", "441"] not in calls
             # A dead shim does not prove retirement of its separately sessioned payload.
             monkeypatch.setattr(orch, "process_is_alive", lambda state: False)
+            monkeypatch.setattr(control, "process_is_alive", lambda state: False)
+
+            async def unverified_retirement(self, identifier):
+                assert identifier == handle.identifier
+                raise RuntimeError("unknown worker id" if failure == "lost" else "reap refused")
+
+            monkeypatch.setattr(worker_client.WorkerClient, "cancel", unverified_retirement)
+            prior_calls = list(calls)
+            stopped = await asyncio.to_thread(control.stop_worklink, tmp_path, 441, runner=runner)
+            assert not stopped.stopped and not stopped.state_cleared and not stopped.claim_released
+            assert "retirement is unverified" in stopped.reason
+            assert load_run_state(tmp_path, 441) == state
+            assert calls == prior_calls
+            remaining = await asyncio.to_thread(control.reconcile_run_states, tmp_path, runner=runner)
+            assert remaining == [state]
+            assert load_run_state(tmp_path, 441) == state
+            assert calls == prior_calls
             refused = await controller.run(441, backend_name=backend.name)
             assert refused.status == "refused"
             assert "retirement is unverified" in refused.reason
@@ -14782,6 +14803,27 @@ async def test_contained_leaf_and_ci_repair_retirement_boundaries(tmp_path, monk
             assert state is None
             assert not bound._jobs
             assert ["chainlink", "locks", "release", "441"] in calls
+            # Simulate startup with the old correlation pointer but an executor
+            # that can prove that exact worker's descendants have been reaped.
+            save_run_state(tmp_path, startup_state)
+            monkeypatch.setattr(control, "process_is_alive", lambda state: False)
+            monkeypatch.setattr(control, "_checkout_has_unpublished_commits",
+                                lambda *args: ("determined-clean", "published"))
+            retired = []
+
+            async def verified_retirement(self, identifier):
+                retired.append(identifier)
+
+            monkeypatch.setattr(worker_client.WorkerClient, "cancel", verified_retirement)
+            stopped = await asyncio.to_thread(control.stop_worklink, tmp_path, 441, runner=runner)
+            assert stopped.stopped and stopped.state_cleared and stopped.claim_released
+            assert retired == [startup_state.handle_identifier]
+            assert load_run_state(tmp_path, 441) is None
+            save_run_state(tmp_path, startup_state)
+            remaining = await asyncio.to_thread(control.reconcile_run_states, tmp_path, runner=runner)
+            assert remaining == []
+            assert retired == [startup_state.handle_identifier] * 2
+            assert load_run_state(tmp_path, 441) is None
             # Verified retirement and terminal release permit a new admission.
             monkeypatch.setattr(ChainlinkClaims, "review_ready_evidence", lambda *args, **kwargs: None)
             checkout.mkdir()

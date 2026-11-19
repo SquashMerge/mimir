@@ -465,7 +465,17 @@ def _read_manifest(path: Path, expected_name: str) -> dict[str, Any]:
     return data
 
 
-def resolve_factory_entrypoint(configured: str | Path) -> Path:
+def resolve_factory_entrypoint(configured: str | Path, *, host: str = "opencode") -> Path:
+    if host == "claude_code":
+        from ..claude_factory_host import plugin_root
+
+        try:
+            plugin_root(configured)
+        except (OSError, ValueError) as exc:
+            raise FactoryContractError(str(exc)) from exc
+        return Path(configured)
+    if host != "opencode":
+        raise FactoryContractError("invalid factory host")
     raw = Path(configured)
     if not raw.is_absolute():
         raise FactoryContractError("feature_factory.entrypoint must be an absolute path")
@@ -705,20 +715,31 @@ class FeatureFactoryBackend:
     checkout_shape: CheckoutShape = CheckoutShape.ISOLATED_CLONE
     poll_interval_s: int = 10
     runner: Runner = field(default=subprocess.run, compare=False, repr=False)
+    host: str = "opencode"
+    model: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.host, str) or self.host not in {"opencode", "claude_code"}:
+            raise FactoryContractError("invalid factory host")
+        if self.model is not None:
+            from ...claude_code import resolve_model
+            if self.host != "claude_code":
+                raise FactoryContractError("factory model requires claude_code host")
+            resolve_model(None, self.model)
 
     def capabilities(self) -> Caps:
-        from ..execution_policy import OPENCODE_FACTORY
+        from ..execution_policy import CLAUDE_FACTORY, OPENCODE_FACTORY
         return Caps(
             tool_category="feature-factory",
             persistent_sessions=True,
             json_output=True,
             native_pr_creation=True,
-            quota_pool=None,
-            execution=OPENCODE_FACTORY,
+            quota_pool="claude_code" if self.host == "claude_code" else None,
+            execution=CLAUDE_FACTORY if self.host == "claude_code" else OPENCODE_FACTORY,
         )
 
     def admit(self) -> Path:
-        resolved = resolve_factory_entrypoint(self.entrypoint)
+        resolved = resolve_factory_entrypoint(self.entrypoint, host=self.host)
         probe_factory_capabilities(resolved, runner=self.runner)
         return resolved
 
@@ -735,6 +756,10 @@ class FeatureFactoryBackend:
         run_id: str | None = None,
         max_retries: int | None = None,
     ) -> WorkSpec:
+        if self.host == "claude_code":
+            return self._claude_work_spec(order, attempt=attempt, repo_url=repo_url,
+                base_ref=base_ref, branch=branch, test_command=test_command,
+                session=session, run_id=run_id, max_retries=max_retries)
         from mimir.config import model_spec_at_call_time
         from mimir_cultivate.opencode import OpenCodeConfigError, resolve_daemon_model
 
@@ -785,6 +810,60 @@ class FeatureFactoryBackend:
             session_request=SessionRequest("epic", model, self.feature_text(run_id, max_retries=max_retries)),
             output_root=order.transcript_root,
             execution=self.capabilities().execution,
+        )
+
+    def _claude_work_spec(self, order: WorkOrder, *, attempt: int, repo_url: str,
+                         base_ref: str, branch: str, test_command: str,
+                         session: str | None, run_id: str | None,
+                         max_retries: int | None) -> WorkSpec:
+        import uuid
+        from mimir.config import model_spec_at_call_time
+        from ...claude_code import leaf_environment, resolve_model, secret_scrubber
+        from ...opencode import remember_execution_secrets
+        from ..daemon_config import resolve_epic_credentials
+
+        resolve_factory_entrypoint(self.entrypoint, host=self.host)
+        if session is not None:
+            raise FactoryContractError("Claude factory recovery requires a fresh contained host")
+        values = {**os.environ, **order.env}
+        remember_execution_secrets(values)
+        credentials = resolve_epic_credentials({
+            **values, "MIMIR_FACTORY_PUBLISHING_IDENTITY": order.env.get(FACTORY_PUBLISHING_IDENTITY_ENV),
+        }, repository_config={}).environment()
+        environment = {**leaf_environment(values), **credentials}
+        for name in ("MIMIR_WORK_ITEM_JSON", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                     "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+            if name in order.env:
+                environment[name] = order.env[name]
+        remember_execution_secrets(environment)
+        run_id = run_id or epic_run_id(order.issue_id)
+        request = self.feature_text(run_id, max_retries=max_retries)
+        if "MIMIR_WORK_ITEM_JSON" in environment:
+            item = json.loads(environment["MIMIR_WORK_ITEM_JSON"])
+            if not isinstance(item, dict) or item.get("run_id") != run_id:
+                raise FactoryContractError("factory work item run_id does not match the launch run_id")
+        configured = values.get("MIMIR_MODEL_SPEC")
+        if configured is None:
+            home = values.get("MIMIR_HOME")
+            configured = model_spec_at_call_time(Path(home) if home else None)
+        model = resolve_model(configured, self.model)
+        identifier = str(uuid.uuid4())
+        payload = {"entrypoint": str(self.entrypoint), "session": identifier,
+                   "request": request, "model": model}
+        wrapper = Path(__file__).resolve().parent.parent / "claude_factory_host.py"
+        return WorkSpec(
+            issue_id=order.issue_id, attempt=attempt, repo_url=repo_url, base_ref=base_ref,
+            branch=branch, prompt=secret_scrubber(values).scrub_text(order.prompt),
+            rules=None, test_command=test_command, backend=self.name, timeout_s=order.timeout_s,
+            env=environment, backend_config={
+                "entrypoint": str(self.entrypoint), "host": self.host, "run_id": run_id,
+                "model": model, "lock_session": f"claude-code:{identifier}",
+                "launch_generation": identifier, "worker_identifier": identifier,
+                "pass_env": tuple(environment),
+                "publishing_identity": credentials[FACTORY_PUBLISHING_IDENTITY_ENV],
+            }, local_checkout=order.checkout,
+            local_argv=(sys.executable, "-I", str(wrapper), json.dumps(payload)),
+            output_root=order.transcript_root, execution=self.capabilities().execution,
         )
 
     @staticmethod
@@ -844,8 +923,18 @@ class FeatureFactoryBackend:
         timeout_s: float = 30,
         credentials: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[Any]:
-        entrypoint = resolve_factory_entrypoint(launcher)
+        entrypoint = resolve_factory_entrypoint(launcher, host=self.host)
         environment = _control_environment()
+        if self.host == "claude_code":
+            from ..daemon_config import resolve_daemon_credentials
+            from ...opencode import remember_execution_secrets
+
+            source = {**os.environ, **(credentials or {})}
+            if credentials is not None and FACTORY_PUBLISHING_IDENTITY_ENV in credentials:
+                source["MIMIR_FACTORY_PUBLISHING_IDENTITY"] = credentials[FACTORY_PUBLISHING_IDENTITY_ENV]
+            publishing = resolve_daemon_credentials(source).environment()
+            remember_execution_secrets(publishing)
+            environment.update(publishing)
         if credentials is not None:
             if set(credentials) - {"GH_TOKEN", "GITHUB_TOKEN", FACTORY_PUBLISHING_IDENTITY_ENV}:
                 raise FactoryContractError("factory control credential projection is invalid")
@@ -869,6 +958,7 @@ class FeatureFactoryBackend:
                     env=environment, timeout=timeout_s,
                     output_limit=_MAX_STATUS_BYTES,
                     **({"initialize": True} if args[0] == "init" else {}),
+                    **({"host": self.host} if self.host == "claude_code" else {}),
                 )
             else:
                 result = _invoke_bounded_or_injected(
@@ -984,6 +1074,15 @@ class FeatureFactoryBackend:
         if not isinstance(result, ComputeResult):
             raise TypeError("FeatureFactoryBackend.interpret expects ComputeResult")
         from mimir_cultivate.opencode import redact_daemon_output
+        if self.host == "claude_code":
+            from ...claude_code import parse_stream, secret_scrubber
+            if result.launch_error or result.timed_out or result.output_overflow or result.output_truncated:
+                return RawResult(-1, None, "failed", "Claude factory host output is incomplete")
+            parsed = parse_stream(result.stdout, result.exit_code)
+            detail = secret_scrubber({**os.environ, **order.env}).scrub_text(parsed.error or "")
+            return RawResult(result.exit_code, None,
+                "interrupted" if parsed.status == "success" else parsed.status,
+                redact_daemon_output(detail) or None, retry_after_ms=parsed.retry_after_ms)
 
         sid = result.handle.opencode_session_id if result.handle else (
             result.session_outcome.opencode_session_id if result.session_outcome else None)

@@ -36,3 +36,11 @@ field is omitted: `stop_reason`, `total_cost_usd`, `usage`, `modelUsage`,
 `unifiedWindows`; no claim is made that these window details describe a live
 quota incident. The unchanged result text deliberately proves classification
 does not rely on error prose.
+
+`lock_refused.jsonl` is **derived**, not observed Claude output. It decodes the
+four success events, replaces only the final result's `result` string with
+the unmodified locally captured `feature_factory_0_14_1/lock-refusal.stderr.txt`,
+and serializes all four events as compact UTF-8 JSONL. All other fields and
+values, including raw camelCase rate metadata, are preserved. The original
+`success.jsonl` bytes and hash above remain unchanged. The factory fixture's
+provenance documents its isolated local capture.

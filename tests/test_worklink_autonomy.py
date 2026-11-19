@@ -64,6 +64,27 @@ def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.Co
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def test_claude_factory_pruning_requires_descendant_proof_without_daemon_store(tmp_path, monkeypatch):
+    import uuid
+    from mimir_cultivate.worklink import factory_store
+
+    identifier = str(uuid.uuid4())
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    record = FactoryRunRecord(
+        run_id="chainlink-700", issue_id=700, attempt=1, repository="owner/repo",
+        base_ref="main", branch="feature/chainlink-700", launcher="/opt/fixture/bin/factory.js",
+        sandbox=str(attempt / "checkout/.factory-sandboxes/chainlink-700"),
+        host="claude_code", session="claude-code:" + identifier, lock_session="claude-code:" + identifier,
+        launch_generation=identifier, handle=LaunchHandle("local_subprocess", identifier, 42, 999999999),
+        status=None, observed_at=None, controller_phase="failed")
+    monkeypatch.setattr(factory_store, "clear_prunable_runtime",
+                        lambda *args: pytest.fail("Claude without a daemon store must not request store cleanup"))
+    assert not autonomy._prepare_factory_runtime_prune(attempt, [record])
+    assert autonomy._prepare_factory_runtime_prune(attempt, [replace(record, children_reaped=True)])
+    assert not (attempt / ".factory-runtime").exists()
+
+
 def test_incident_occurrence_is_stable_until_guarded_resolution(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     first = record_failure(

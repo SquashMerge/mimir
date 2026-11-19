@@ -71,6 +71,80 @@ def test_process_gate_stop_retains_distinct_build_session_correlation(tmp_path, 
     assert not any(args[1:3] == ["locks", "release"] for args in calls)
 
 
+@pytest.mark.parametrize("retirement", ["unknown", "refused", "verified"])
+def test_startup_reconciliation_requires_contained_retirement(tmp_path, monkeypatch, retirement):
+    state = WorklinkRunState(
+        issue_id=700, attempt=3, backend="claude_code", compute_name="local_subprocess",
+        handle_substrate="local_subprocess", handle_identifier=str(uuid.uuid4()),
+        process_start_ticks=42, shim_pid=12345,
+        branch="issue/700-a3", base_ref="main", local_base="main", repo=str(tmp_path),
+        repo_url="", test_command="pytest", started_at=datetime.now(UTC).isoformat(),
+    )
+    save_run_state(tmp_path, state)
+    monkeypatch.setattr(control, "process_is_alive", lambda current: False)
+    retired = []
+    calls = []
+
+    async def cancel(self, identifier):
+        retired.append(identifier)
+        if retirement != "verified":
+            raise RuntimeError("unknown worker id" if retirement == "unknown" else "reap refused")
+
+    def run(args):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, json.dumps({"labels": []}), "")
+
+    monkeypatch.setattr(worker_client.WorkerClient, "cancel", cancel)
+    remaining = control.reconcile_run_states(tmp_path, runner=run)
+
+    if retirement == "verified":
+        assert remaining == []
+        assert load_run_state(tmp_path, 700) is None
+        assert ["chainlink", "issue", "label", "700", "worklink:ready"] in calls
+    else:
+        assert remaining == [state]
+        assert load_run_state(tmp_path, 700) == state
+        assert calls == []
+    assert retired == [state.handle_identifier]
+
+
+@pytest.mark.parametrize("verified", [False, True])
+def test_claude_factory_stop_requires_executor_retirement_not_daemon_cancel(tmp_path, monkeypatch, verified):
+    identifier = str(uuid.uuid4())
+    record = FactoryRunRecord(
+        run_id="chainlink-700", issue_id=700, attempt=1, repository="owner/repo",
+        base_ref="main", branch="feature/chainlink-700",
+        launcher="/opt/mimir-claude/lib/node_modules/claude-code-feature-factory/vendor/feature-factory/bin/factory.js",
+        sandbox=str(tmp_path / "operator/.factory-sandboxes/chainlink-700"),
+        host="claude_code", session="claude-code:" + identifier, lock_session="claude-code:" + identifier,
+        launch_generation=identifier, handle=LaunchHandle("local_subprocess", identifier, 42, 999999999),
+        status=None, observed_at=None, controller_phase="running")
+    save_factory_record(tmp_path, record)
+    retired, calls = [], []
+
+    async def cancel(self, selected):
+        retired.append(selected)
+        if not verified:
+            raise RuntimeError("worker retirement unknown")
+
+    monkeypatch.setattr(worker_client.WorkerClient, "cancel", cancel)
+    result = stop_worklink(tmp_path, 700,
+        runner=lambda args: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""))
+    assert retired == [identifier]
+    assert result.stopped == result.claim_released == verified
+    current = load_factory_record(tmp_path, record.run_id)
+    assert current.children_reaped == verified
+    assert current.opencode_session_id is None
+    marker = json.loads(control._operator_stop_path(tmp_path, 700).read_text())
+    assert marker["lock_session"] == record.lock_session
+    assert "opencode_session_id" not in marker
+    assert control.operator_stop_requested(tmp_path, 700, 1, lock_session=record.lock_session)
+    assert not control.operator_stop_requested(tmp_path, 700, 1, lock_session="claude-code:" + str(uuid.uuid4()))
+    if not verified:
+        assert current == record
+        assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_operator_stop_records_terminal_evidence_without_incident(tmp_path, monkeypatch):
     from mimir_cultivate.worklink import orchestrator

@@ -1,0 +1,40 @@
+{
+  "run_id": "chainlink-2126",
+  "issue_key": null,
+  "valid": true,
+  "sandbox_path": "/tmp/claude-factory-fixture-iu7qxtpm/repo/.factory-sandboxes/chainlink-2126",
+  "status": "running",
+  "mode": "autonomous",
+  "branch": "feature/chainlink-2126",
+  "pr_base": "main",
+  "max_retries": 7,
+  "publishing_identity": "fixture-bot",
+  "park_snapshot": null,
+  "restore": null,
+  "pr_draft": true,
+  "mcp_servers": [
+    "fixture-mcp"
+  ],
+  "lock": "fresh",
+  "dead_lock": false,
+  "lock_session": "claude-code:11111111-1111-4111-8111-111111111111",
+  "gates": {},
+  "steps": [],
+  "slices": [],
+  "retry_extensions": [],
+  "remediations": {
+    "opened": 0,
+    "limit": 2,
+    "granted": 0
+  },
+  "handoffs": [],
+  "validator": null,
+  "pr_url": null,
+  "terminal_result": null,
+  "operator_decision": null,
+  "next_action": {
+    "kind": "gate",
+    "subject": "story"
+  },
+  "next": "gate:story"
+}
