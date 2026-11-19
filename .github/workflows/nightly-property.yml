@@ -1,0 +1,64 @@
+name: nightly-property
+
+# Hypothesis property suite (property_tests/). These campaigns are too slow for
+# every PR, so they are outside ``testpaths`` and run here on a schedule, or by
+# hand from the Actions tab. A failure prints a reproduction blob
+# (HYPOTHESIS_PROFILE=nightly) and uploads the example database; GitHub's
+# standard failed-workflow notification is the alert.
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-property
+  cancel-in-progress: false
+
+jobs:
+  property:
+    # Linux: the Worklink properties exercise Cultivate's Linux-only claims and
+    # lifecycle code paths.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      UV_PYTHON: "3.12"
+      HYPOTHESIS_PROFILE: nightly
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies (all packages, dev and bench extras)
+        run: uv sync --locked --all-packages --extra dev --extra bench
+
+      - name: Run property suite
+        run: >-
+          env -u MIMIR_PLUGINS uv run --locked --all-packages --extra dev --extra bench
+          pytest -q --tb=short -n auto -p no:cacheprovider property_tests
+          --hypothesis-show-statistics 2>&1 | tee property-tests.log;
+          exit "${PIPESTATUS[0]}"
+        shell: bash
+
+      - name: Upload Hypothesis database and log
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: nightly-property-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            property-tests.log
+            .hypothesis/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
