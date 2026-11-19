@@ -579,12 +579,16 @@ class IngestAcknowledgement:
     @staticmethod
     def source_identity(source: SourceLabel) -> str:
         # Stable fixed-size identity; do not retain source content, ACLs or IDs.
+        # Version the payload so older/unknown hashes cannot cover this identity,
+        # even for sources without attestations. Never fall back to a legacy hash.
         attestation = source.owner_attestation
-        record = [source.principal, source.domain, source.domain_qualifier,
+        record = ["mimir.ingest-source.v2",
+                  source.principal, source.domain, source.domain_qualifier,
                   source.resource_id, source.bridge_instance, str(source.sensitivity),
                   sorted(source.authorized_principals), str(source.source_kind),
                   str(source.integrity), str(source.integrity_effect),
-                  [attestation.canonical_principal, attestation.raw_author]
+                  [attestation.canonical_principal, attestation.raw_author,
+                   attestation.source_channel]
                   if attestation is not None else None]
         return hashlib.sha256(json.dumps(record, ensure_ascii=True).encode()).hexdigest()
 
