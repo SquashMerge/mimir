@@ -2922,6 +2922,14 @@ class Agent:
             if ctx_token is not None:
                 reset_current_turn(ctx_token)
             if ctx is not None:
+                if ctx.auth_context is not None:
+                    for cleanup in _selected_turn_hooks(
+                        self._config.plugin_manager.policy, "pr_checkout_cleanup",
+                    ):
+                        try:
+                            await asyncio.to_thread(cleanup, ctx.auth_with_plugin_state())
+                        except Exception:  # noqa: BLE001 — cleanup must not mask turn failure
+                            log.exception("pr_checkout_cleanup_failed")
                 from .turn_stores import close_turn_stores, wipe_ci_logs, wipe_research_drafts, wipe_turn_stores
                 try:
                     await asyncio.to_thread(close_turn_stores, ctx)

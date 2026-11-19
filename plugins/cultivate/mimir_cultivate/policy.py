@@ -129,6 +129,7 @@ class RepoReviewState:
     )
     checked_out: bool = field(default=False, init=False, compare=False)
     checkout_lease: object = field(default=None, init=False, repr=False, compare=False)
+    checkout_cleanup_deferred: bool = field(default=False, init=False, repr=False, compare=False)
     git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)
     full_tested_head: str | None = field(default=None, init=False, repr=False, compare=False)
     conflict_evidence_head: str | None = field(default=None, init=False, repr=False, compare=False)
@@ -229,6 +230,7 @@ class RepoReviewState:
 
     def revoke_checkout_lease(self, lease: object) -> None:
         if self.checkout_lease is lease:
+            object.__setattr__(self, "checkout_cleanup_deferred", False)
             object.__setattr__(self, "checkout_lease", None)
             object.__setattr__(self, "checked_out", False)
             object.__setattr__(self, "git_expected_head", None)
@@ -236,6 +238,10 @@ class RepoReviewState:
             object.__setattr__(self, "conflict_evidence_head", None)
             object.__setattr__(self, "interrupted_operation", None)
             object.__setattr__(self, "_scoped_rebase", None)
+
+    def defer_checkout_cleanup(self) -> None:
+        """Keep the parent's lease live until host turn-end cleanup."""
+        object.__setattr__(self, "checkout_cleanup_deferred", True)
 
 
 @dataclass(frozen=True)
