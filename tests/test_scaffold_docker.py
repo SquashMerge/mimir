@@ -43,6 +43,34 @@ from mimir.plugin_dockerfile import cultivate_scripts, render_stage, select_plug
 from mimir.plugins.discovery import PluginDiscoveryError
 
 
+def test_claude_scaffold_route_propagates_and_rejects_switches(tmp_path, monkeypatch):
+    import yaml
+    selected = select_plugins(enable="cultivate")
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kw: selected)
+    scaffold(tmp_path, worklink_host="claude_code")
+    docker = (tmp_path / "Dockerfile").read_text()
+    assert "ARG MIMIR_WORKLINK_HOST=claude_code" in docker
+    assert "ARG MIMIR_ENABLE_CLAUDE_CODE=1" in docker
+    assert "/opt/mimir-claude/bin:" in docker
+    assert "/claude-code-feature-factory/vendor/feature-factory/bin/factory.js" in docker
+    assert "ARG MIMIR_EXTRAS=claude-code,discord,slack,mcp" in docker
+    assert "/opt/mimir-opencode/" not in docker
+    assert not (tmp_path / ".config/opencode").exists()
+    text = (tmp_path / "compose.yml").read_text()
+    compose = yaml.safe_load(text[text.index("services:"):])
+    agent = next(iter(compose["services"].values()))
+    assert agent["build"]["args"]["MIMIR_WORKLINK_HOST"] == "claude_code"
+    assert agent["build"]["args"]["MIMIR_ENABLE_CLAUDE_CODE"] == "1"
+    assert agent["build"]["args"]["MIMIR_ENABLE_OPENCODE"] == "0"
+    assert agent["environment"]["MIMIR_ENABLE_CLAUDE_CODE"] == "1"
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    scaffold(tmp_path)  # Omission preserves the recorded generated route.
+    assert before == {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    with pytest.raises(ValueError, match="fresh deployment"):
+        scaffold(tmp_path, worklink_host="opencode")
+    assert before == {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+
+
 def _scaffold_install_text(home: Path) -> str:
     dockerfile = (home / "Dockerfile").read_text()
     fragment = home / ".mimir-scaffold/cultivate-docker/base.sh"

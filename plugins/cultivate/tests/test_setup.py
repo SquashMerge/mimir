@@ -29,6 +29,178 @@ VERSION = "1.0.0rc2"
 REAL_SECRET = installer._secret
 
 
+@pytest.mark.parametrize("provider", ["codex-plus", "openai", "anthropic"])
+def test_legacy_setup_renderer_bytes_and_modes(setup_environment, monkeypatch, provider):
+    """The oracle was captured before the subscription-route renderer changes."""
+    from mimir.scaffold_docker import render_dockerfile
+    from mimir.plugin_dockerfile import select_plugins
+
+    deploy, args, state, calls, invoke = setup_environment
+    args.model_spec = provider + ":model"
+    args.saga_model_spec = provider + ":model"
+    args.no_start = True
+    args.platform = "linux/amd64"
+    monkeypatch.setattr(installer.sys, "executable", "/usr/bin/python3")
+    secret = "-".join(("runtime", "legacy", "credential"))
+    monkeypatch.setattr(installer, "_secret", lambda *a, **kw: secret)
+    monkeypatch.setattr(installer.secrets, "token_urlsafe", lambda size: secret)
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert "worklink_toolchain" not in manifest
+    actual = {}
+    for path in sorted(deploy.rglob("*")):
+        if path.is_file():
+            actual[path.relative_to(deploy).as_posix()] = {
+                "text": path.read_text().replace(secret, "<runtime-secret>"),
+                "mode": path.stat().st_mode & 0o777,
+            }
+    actual["scaffold-workspace"] = {
+        "text": render_dockerfile([], plugins=select_plugins(enable="cultivate")), "mode": 0o644,
+    }
+    actual["scaffold-pypi"] = {"text": render_dockerfile([], mode="pypi"), "mode": 0o644}
+    fixture = Path(__file__).resolve().parents[3] / "tests/fixtures/cultivate_setup_legacy" / provider / "files.json"
+    assert actual == json.loads(fixture.read_text())
+
+
+@pytest.mark.parametrize("source", ["file", "stdin", "prompt"])
+def test_claude_oauth_inputs_are_private_and_explicit(tmp_path, monkeypatch, capsys, source):
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest="command"))
+    secret = "-".join(("subscription", "runtime", "credential"))
+    argv = ["cultivate", "setup"]
+    if source == "file":
+        path = tmp_path / "oauth"
+        path.write_text(secret)
+        path.chmod(0o600)
+        argv += ["--claude-token-file", str(path)]
+    elif source == "stdin":
+        argv += ["--claude-token-stdin"]
+        monkeypatch.setattr(installer.sys, "stdin", io.StringIO(secret + "\n"))
+    else:
+        monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(installer.getpass, "getpass", lambda prompt: secret)
+    args = parser.parse_args(argv)
+    assert installer._claude_token(args) == secret
+    assert secret not in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        parser.parse_args(["cultivate", "setup", "--claude-token-file", "unused", "--claude-token-stdin"])
+
+
+def test_claude_oauth_never_falls_back_to_api_keys_or_login(monkeypatch):
+    monkeypatch.setattr(installer.sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "-".join(("runtime", "paid", "key")))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "-".join(("runtime", "ambient", "token")))
+    monkeypatch.setenv("MIMIR_CULTIVATE_CLAUDE_TOKEN", "-".join(("runtime", "installer", "token")))
+    with pytest.raises(installer.SetupError, match="claude setup-token.*--claude-token-file"):
+        installer._claude_token(argparse.Namespace())
+
+
+def test_claude_token_private_file_required(tmp_path):
+    path = tmp_path / "oauth"
+    path.write_text("-".join(("runtime", "credential")))
+    path.chmod(0o644)
+    with pytest.raises(installer.SetupError, match="mode 600"):
+        installer._claude_token(argparse.Namespace(claude_token_file=str(path)))
+
+
+@pytest.mark.parametrize("existing,requested", [
+    ("opencode", "claude-code:sonnet"), ("claude_code", "openai:model"),
+])
+def test_route_switch_refused_before_secrets_license_or_effects(tmp_path, monkeypatch, existing, requested):
+    deploy = tmp_path / "deployment"
+    deploy.mkdir()
+    manifest = {"mimir_install_mode": "pypi"}
+    if existing == "claude_code":
+        manifest["worklink_toolchain"] = installer._worklink_toolchain()
+    (deploy / "manifest.json").write_text(json.dumps(manifest))
+    before = (deploy / "manifest.json").read_bytes()
+    for name in ("_license_gate", "_secret", "resolve_release", "_env"):
+        monkeypatch.setattr(installer, name, lambda *a, **kw: pytest.fail("effect before route refusal"))
+    args = argparse.Namespace(deploy=str(deploy), model_spec=requested, force=True)
+    with pytest.raises(installer.SetupError, match="fresh --deploy"):
+        installer.setup(args, request=lambda *a: pytest.fail("network"),
+                        run=lambda *a, **kw: pytest.fail("command"))
+    assert list(deploy.iterdir()) == [deploy / "manifest.json"]
+    assert (deploy / "manifest.json").read_bytes() == before
+
+
+def test_claude_setup_selects_subscription_toolchain_and_no_daemon(
+        setup_environment, tmp_path, monkeypatch, capsys, caplog):
+    deploy, args, state, calls, invoke = setup_environment
+    args.deploy = str(deploy)
+    args.model_spec = "claude-code:sonnet"
+    args.saga_model_spec = "claude-code:sonnet:low"
+    args.embedding = "local"
+    args.platform = "linux/amd64"
+    secret = "-".join(("runtime", "subscription", "oauth"))
+    path = tmp_path / "oauth"
+    path.write_text(secret)
+    path.chmod(0o600)
+    args.claude_token_file = str(path)
+    monkeypatch.setattr(installer, "_secret", lambda a, name, *rest, **kw:
+                        REAL_SECRET(a, name, *rest, **kw) if name == "claude_token" else "secret")
+    monkeypatch.setattr(installer, "_require_codex_login", lambda *a: pytest.fail("Codex gate"))
+    monkeypatch.setattr(installer, "_verify_opencode_daemon", lambda *a, **kw: pytest.fail("daemon gate"))
+    invoke()
+    env = (deploy / "compose.env").read_text()
+    assert "CLAUDE_CODE_OAUTH_TOKEN=" + secret + "\n" in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert (deploy / "compose.env").stat().st_mode & 0o777 == 0o600
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["worklink_toolchain"] == installer._worklink_toolchain()
+    compose = yaml.safe_load((deploy / "compose.yml").read_text())
+    environment = compose["services"]["agent"]["environment"]
+    assert environment["MIMIR_ENABLE_CLAUDE_CODE"] == "1"
+    assert environment["MIMIR_WORKLINK_HOST"] == "claude_code"
+    assert "/claude-code-feature-factory/vendor/" in environment["MIMIR_FACTORY_ENTRYPOINT"]
+    build = (deploy / "build.sh").read_text()
+    for flag in ("MIMIR_WORKLINK_HOST=claude_code", "MIMIR_ENABLE_CLAUDE_CODE=1", "MIMIR_ENABLE_OPENCODE=0"):
+        assert flag in build
+    assert "MIMIR_ENABLE_OPENCODE=1" not in build
+    assert "MIMIR_EXTRAS=claude-code,local-embeddings,mcp" in build
+    assert (deploy / "build_context.py").read_text() == installer._build_context_helper("claude_code")
+    assert "model_spec=os.environ['MIMIR_MODEL_SPEC']" in (deploy / "provision.py").read_text()
+    # A same-route model update also strips duplicated, obsolete paid credentials.
+    with (deploy / "compose.env").open("a") as out:
+        out.write("ANTHROPIC_API_KEY=obsolete\nANTHROPIC_API_KEY=duplicate\n")
+    args.model_spec = "claude-code:opus"
+    invoke()
+    assert "MIMIR_MODEL_SPEC=claude-code:opus" in (deploy / "compose.env").read_text()
+    assert "ANTHROPIC_API_KEY" not in (deploy / "compose.env").read_text()
+    for file in deploy.rglob("*"):
+        if file.is_file() and file.name != "compose.env":
+            assert secret not in file.read_text(errors="replace")
+    output = capsys.readouterr()
+    assert secret not in output.out + output.err + caplog.text + repr(calls)
+
+
+def test_claude_saga_default_uses_official_adapter():
+    spec = "claude-code:" + installer.DEFAULT_SAGA_MODELS["claude-code"] + ":" + installer.DEFAULT_SAGA_EFFORT
+    llm = installer._saga_settings(spec, "local")["llm"]
+    assert llm == {"provider": "claude_code", "model": "sonnet",
+                   "sampling": "default", "reasoning_effort": "low"}
+
+
+@pytest.mark.parametrize("model", ["", "-sonnet", "sonnet\n", "sonnet\0", "x" * 257])
+def test_claude_setup_rejects_invalid_models(model):
+    with pytest.raises(installer.SetupError, match="Invalid"):
+        installer.validate("model_spec", "claude-code:" + model)
+
+
+def test_claude_toolchain_probe_matches_declared_leaf_environment_without_credentials(monkeypatch):
+    monkeypatch.setenv("RUSTUP_HOME", "/opt/rustup")
+    monkeypatch.setenv("CARGO_HOME", "/var/cache/mimir-cargo")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "-".join(("runtime", "private", "oauth")))
+    config = SimpleNamespace(backend_settings={'claude_code': {
+        'pass_env': ['RUSTUP_HOME', 'CARGO_HOME', 'CLAUDE_CODE_OAUTH_TOKEN'],
+    }})
+    env = installer.toolchain_probe_environment(config)
+    assert env['RUSTUP_HOME'] == '/opt/rustup'
+    assert env['CARGO_HOME'] == '/var/cache/mimir-cargo'
+    assert 'CLAUDE_CODE_OAUTH_TOKEN' not in env
+    assert not any(key.startswith('OPENCODE_') for key in env)
+
+
 @pytest.mark.parametrize("endpoint", ["ftp://collector.example", "https://user:pass@collector.example",
                                           "https://collector.example/v1/traces", "https://collector.example/v1/traces/"])
 def test_tracing_rejects_unsafe_or_trace_path_endpoint(endpoint):
@@ -2991,9 +3163,12 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
 
 
 @pytest.mark.parametrize('toolchain', ['rust', 'python', 'node'])
-def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch, toolchain):
+@pytest.mark.parametrize('host', ['opencode', 'claude_code'])
+def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch, toolchain, host):
     from functools import partial
-    monkeypatch.setattr(installer, '_provision_worklink', partial(installer._provision_worklink, toolchain=toolchain))
+    monkeypatch.setattr(installer, '_provision_worklink', partial(
+        installer._provision_worklink, toolchain=toolchain,
+        model_spec="claude-code:sonnet" if host == "claude_code" else None))
     original_run = subprocess.run
     origin = tmp_path / 'remote.git'
     seed = tmp_path / 'seed'
@@ -3010,7 +3185,7 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch,
     base = tmp_path / 'worklink/base/repo'
     checkout = tmp_path / 'repo'
     entry = {'slug': 'org/repo', 'origin': str(origin), 'base_branch': 'integration',
-             'test_command': './tools/verify'}
+             'test_command': 'npm test' if host == 'claude_code' else './tools/verify'}
 
     def run(argv, **kw):
         if argv[0] == 'chainlink':
@@ -3037,10 +3212,18 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch,
     assert config.repository == entry['slug']
     assert config.defaults.base_branch == entry['base_branch']
     assert config.defaults.test_command == entry['test_command']
-    assert config.defaults.backend == 'opencode'
+    assert config.defaults.backend == host
     expected_env = {'rust': {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'},
                     'python': {'UV_PYTHON_INSTALL_DIR': '/opt/uv-python'}, 'node': {}}[toolchain]
-    assert config.backend_settings['opencode']['test_env'] == expected_env
+    if host == 'opencode':
+        assert config.backend_settings['opencode']['test_env'] == expected_env
+    else:
+        from mimir_cultivate.worklink.claude_factory_host import DEFAULT_ENTRYPOINT
+        assert config.backend_settings == {
+            'claude_code': {'model': 'sonnet', 'bash_allowlist': ['git *', 'npm *'],
+                            'pass_env': ['CLAUDE_CODE_OAUTH_TOKEN', *expected_env]},
+            'feature_factory': {'host': 'claude_code', 'model': 'sonnet', 'entrypoint': DEFAULT_ENTRYPOINT},
+        }
     assert config.defaults.timeout_s == 5400
     assert config.defaults.allow_autonomous_local_subprocess
     assert original_run(['git', '-C', str(base), 'status', '--porcelain'], capture_output=True,

@@ -34,6 +34,7 @@ ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-trixie
 # Rust builder unreachable unless the caller explicitly selects its artifact.
 ARG CHAINLINK_ARTIFACT_STAGE=chainlink-none
 ARG MIMIR_INSTALL_MODE=invalid
+ARG MIMIR_WORKLINK_HOST=opencode
 FROM ${BASE_IMAGE} AS provenance-validation
 
 # Every canonical image must identify one remote ref and the exact commit it is
@@ -144,11 +145,14 @@ RUN set -eu; if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
 #     removes that ambiguity.
 #   - libjemalloc2: allocator preloaded below (see the jemalloc block).
 ENV NODE_VERSION=22
-ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
-ENV PATH="/opt/mimir-opencode/bin:${PATH}"
+ARG MIMIR_WORKLINK_HOST=opencode
+ARG MIMIR_ENABLE_CLAUDE_CODE=0
 ARG MIMIR_ENABLE_OPENCODE=0
 ARG FACTORY_VERSION=0.14.1
-RUN NODE_VERSION="$NODE_VERSION" MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" FACTORY_VERSION="$FACTORY_VERSION" \
+ENV MIMIR_WORKLINK_HOST=${MIMIR_WORKLINK_HOST}
+ENV MIMIR_ENABLE_CLAUDE_CODE=${MIMIR_ENABLE_CLAUDE_CODE}
+RUN NODE_VERSION="$NODE_VERSION" MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" \
+    MIMIR_WORKLINK_HOST="$MIMIR_WORKLINK_HOST" MIMIR_ENABLE_CLAUDE_CODE="$MIMIR_ENABLE_CLAUDE_CODE" FACTORY_VERSION="$FACTORY_VERSION" \
     sh /opt/cultivate-docker/base.sh
 
 # jemalloc: under glibc malloc the long-running agent's RSS crept to ~2 GB, and
@@ -326,6 +330,7 @@ LABEL org.opencontainers.image.revision="${MIMIR_EXECUTOR_COMMIT}"
 # A runtime dependency newer than the published wheel must be installed
 # explicitly in executor.sh. Core-only images have no worker venv.
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        if [ "$MIMIR_WORKLINK_HOST" = claude_code ]; then MIMIR_EXTRAS="$MIMIR_EXTRAS,claude-code"; fi; \
         MIMIR_INSTALL_MODE="$MIMIR_INSTALL_MODE" MIMIR_VERSION="$MIMIR_VERSION" \
         MIMIR_AGENT_WHEEL="$MIMIR_AGENT_WHEEL" MIMIR_AGENT_SHA256="$MIMIR_AGENT_SHA256" \
         MIMIR_CULTIVATE_WHEEL="$MIMIR_CULTIVATE_WHEEL" MIMIR_CULTIVATE_SHA256="$MIMIR_CULTIVATE_SHA256" \
@@ -337,6 +342,7 @@ USER mimir
 # PyPI installs the verified wheel pair; upgrade it only by rebuilding both
 # runtimes together, never through the core-only pending-update flow.
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        if [ "$MIMIR_WORKLINK_HOST" = claude_code ]; then MIMIR_EXTRAS="$MIMIR_EXTRAS,claude-code"; fi; \
         MIMIR_INSTALL_MODE="$MIMIR_INSTALL_MODE" MIMIR_VERSION="$MIMIR_VERSION" \
         MIMIR_AGENT_WHEEL="$MIMIR_AGENT_WHEEL" MIMIR_AGENT_SHA256="$MIMIR_AGENT_SHA256" \
         MIMIR_CULTIVATE_WHEEL="$MIMIR_CULTIVATE_WHEEL" MIMIR_CULTIVATE_SHA256="$MIMIR_CULTIVATE_SHA256" \
@@ -344,9 +350,8 @@ RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         MIMIR_GIT_URL="${MIMIR_GIT_URL:-https://github.com/SquashMerge/mimir.git}" MIMIR_EXTRAS="$MIMIR_EXTRAS" sh /opt/cultivate-docker/controller.sh; \
     fi
 
-# Optional: install the Claude Code model-provider adapter. The CLI remains an
-# operator-provided runtime dependency and is not bundled in this image.
-ARG MIMIR_ENABLE_CLAUDE_CODE=0
+# The selected subscription route installs the adapter in addition to its
+# managed official CLI. Legacy images do not install this extra.
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
         if [ "$MIMIR_INSTALL_MODE" = pypi ]; then \
             pip install --no-cache-dir --no-compile "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[claude-code]" \
@@ -506,3 +511,15 @@ RUN if [ -d /etc/s6-overlay/s6-rc.d/worklink-execd ]; then \
         chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/watchdog/run; \
     fi
 ENTRYPOINT ["/init"]
+
+# Keep each route's runtime defaults bound to its installed toolchain, including
+# direct root-image builds that do not use the setup Compose renderer.
+FROM runtime AS opencode-runtime
+ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
+ENV PATH="/opt/mimir-opencode/bin:${PATH}"
+
+FROM runtime AS claude_code-runtime
+ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-claude/lib/node_modules/claude-code-feature-factory/vendor/feature-factory/bin/factory.js
+ENV PATH="/opt/mimir-claude/bin:${PATH}"
+
+FROM ${MIMIR_WORKLINK_HOST}-runtime AS image

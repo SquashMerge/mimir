@@ -115,6 +115,26 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
         install="root/scaffold Dockerfiles only when MIMIR_ENABLE_OPENCODE=1; daemon inline telemetry policy",
         risk="High: Telemetry content and credential isolation depend on exact plugin gates and options.",
     ),
+    ToolPin(
+        name="claude-code",
+        category="coding-cli",
+        pin="2.1.326",
+        smoke="/opt/mimir-claude/bin/claude --version",
+        source="npm",
+        package="@anthropic-ai/claude-code",
+        install="Cultivate docker/base.sh only for MIMIR_WORKLINK_HOST=claude_code",
+        risk="High: official subscription CLI; OAuth, permission grammar and stream events must remain compatible.",
+    ),
+    ToolPin(
+        name="claude-code-feature-factory",
+        category="coding-plugin",
+        pin="0.14.1",
+        smoke="test -r /opt/mimir-claude/lib/node_modules/claude-code-feature-factory/vendor/feature-factory/bin/factory.js",
+        source="npm",
+        package="claude-code-feature-factory",
+        install="Cultivate docker/base.sh only for MIMIR_WORKLINK_HOST=claude_code; owns vendored factory CLI",
+        risk="High: factory launcher exports and vendored state-machine version must stay in lockstep.",
+    ),
 )
 
 

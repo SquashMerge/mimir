@@ -59,11 +59,11 @@ if [ "${1:-}" = --isolated-tests ]; then
     shift
 fi
 if [ "$#" -ne 2 ]; then
-    echo "usage: sh scripts/verify_claude_subscription.sh <leaf|factory> <inspected-plugin-package>" >&2
+    echo "usage: sh scripts/verify_claude_subscription.sh <leaf|factory|setup> <inspected-plugin-package>" >&2
     exit 64
 fi
 case "$1" in
-    leaf|factory) ;;
+    leaf|factory|setup) ;;
     *) echo "unknown subscription verification phase: $1" >&2; exit 64 ;;
 esac
 case "$2" in
@@ -111,7 +111,7 @@ do
         uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"
 done
 
-if [ "$1" = factory ]; then
+if [ "$1" = factory ] || [ "$1" = setup ]; then
     for module in \
         tests/test_worklink_claude_factory_host.py \
         tests/test_worklink_factory_supervisor.py \
@@ -126,6 +126,27 @@ if [ "$1" = factory ]; then
     done
     sh scripts/heavy_run.sh env -u MIMIR_ACCESS_CONTROL_ENFORCED MIMIR_PLUGINS=cultivate \
         uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 tests/test_worklink_autonomy.py
+fi
+
+if [ "$1" = setup ]; then
+    uv run --locked --extra dev --extra bench --extra claude-code python -m compileall -q \
+        mimir/scaffold_docker.py mimir/plugin_dockerfile.py plugins/cultivate/mimir_cultivate/setup.py
+    sh -n plugins/cultivate/mimir_cultivate/docker/base.sh
+    sh -n plugins/cultivate/mimir_cultivate/docker/service.sh
+    for module in \
+        tests/test_root_dockerfile.py \
+        tests/test_scaffold_docker.py \
+        tests/test_saga_llm.py \
+        tests/test_langchain_claude_code_patches.py \
+        tests/test_worklink_tool_pins.py \
+        tests/test_tool_pin_drift_skill.py \
+        plugins/cultivate/tests/test_setup.py \
+        plugins/cultivate/tests/test_docker_resources.py \
+        plugins/cultivate/mimir_cultivate/defaults/skills/worklink-tool-pins/tests/test_worklink_tool_pins_poller.py
+    do
+        sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
+            uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"
+    done
 fi
 
 sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 tests

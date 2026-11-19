@@ -152,8 +152,15 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
         script = (source / name).read_text()
         if name == "base.sh":
             script = "apt-get update" + script.split("apt-get update", 1)[1]
+            # Project only the legacy branch when comparing the historical oracle.
+            before, claude = script.split('if [ "${MIMIR_WORKLINK_HOST:-opencode}" = claude_code ]; then', 1)
+            script = before + claude.split("\nfi\n", 1)[1]
         if name == "executor.sh":
             script = "git check-ref-format" + script.split("git check-ref-format", 1)[1]
+        if name == "service.sh":
+            before, selected = script.split('if [ "$(cat /opt/cultivate-docker/worklink-host)" = claude_code ]; then', 1)
+            legacy = selected.split("\nelse\n", 1)[1]
+            script = before + legacy.replace("\nfi\n", "\n", 1)
         actual_steps = steps(script)
         if name == "base.sh":
             # Common developer tools were added after the historical extraction.
@@ -187,11 +194,12 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
                 "/etc/s6-overlay/s6-rc.d/watchdog/run /etc/s6-overlay/s6-rc.d/worklink-execd/run"
             )
             expected_steps += [
+                "test -f /opt/cultivate-docker/opencode-enabled",
                 "install -o root -g root -m 0755 /opt/cultivate-docker/worklink-opencode-service /usr/local/libexec/worklink-opencode-service",
                 "install -o root -g root -m 0755 /opt/cultivate-docker/worklink-daemon-gate /usr/local/libexec/worklink-daemon-gate",
                 "install -o root -g root -m 0755 /opt/cultivate-docker/worklink-opencode-login /usr/local/bin/worklink-opencode-login",
-                "test -f /opt/cultivate-docker/opencode-enabled",
-                "chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/worklink-execd/run /etc/s6-overlay/s6-rc.d/worklink-opencode/run",
+                "chmod +x /etc/s6-overlay/s6-rc.d/worklink-opencode/run",
+                "chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/worklink-execd/run",
                 "chmod +x /etc/s6-overlay/s6-rc.d/watchdog/run",
             ]
         assert actual_steps == expected_steps, name
@@ -1003,12 +1011,83 @@ def test_s6_release_downloads_retry_transient_http_errors() -> None:
     assert body.count("curl ${curl_args}") == 2
 
 
-def test_claude_code_build_arg_installs_only_adapter_extra() -> None:
+def test_claude_code_build_arg_installs_managed_official_cli_and_adapter() -> None:
     text = _text()
     assert "ARG MIMIR_ENABLE_CLAUDE_CODE=0" in text
     assert "npm install -g @anthropic-ai/claude-code" not in text
     assert 'pip install --no-cache-dir "mimir-agent[claude-code]"' in text
+    assert "ARG MIMIR_WORKLINK_HOST=opencode" in text
+    assert "npm install --global --prefix /opt/mimir-claude" in text
+    assert "@anthropic-ai/claude-code@2.1.326" in text
+    assert '"claude-code-feature-factory@${FACTORY_VERSION}"' in text
+    assert "claude-code-feature-factory/vendor/feature-factory" in text
     assert "git+https://github.com/jasoncarreira/langchain-claude-code" not in text
+
+
+def _run_toolchain_script(tmp_path, host, opencode, claude):
+    """Execute the actual installer with fixture-owned, offline command boundaries."""
+    import json
+
+    bin_dir = tmp_path / "commands"
+    bin_dir.mkdir()
+    log = tmp_path / "commands.jsonl"
+    stub = ("#!/usr/bin/env python3\nimport json, os, sys\n"
+            "with open(os.environ['COMMAND_LOG'], 'a') as out:\n"
+            " out.write(json.dumps([os.path.basename(sys.argv[0]), *sys.argv[1:]]) + '\\n')\n"
+            "if os.path.basename(sys.argv[0]) == 'curl': print(':')\n")
+    for name in ("apt-get", "curl", "npm", "node"):
+        path = bin_dir / name
+        path.write_text(stub)
+        path.chmod(0o755)
+    prefix = tmp_path / "opt"
+    cli = prefix / "mimir-claude/bin/claude"
+    cli.parent.mkdir(parents=True)
+    cli.write_text("#!/bin/sh\nprintf '2.1.326 (Claude Code)\\n'\n")
+    cli.chmod(0o755)
+    source = (ROOT / "plugins/cultivate/mimir_cultivate/docker/base.sh").read_text()
+    source = source.replace("/opt/", str(prefix) + "/").replace(
+        "/var/lib/apt/lists/*", str(tmp_path / "apt-lists") + "/*").replace("-o root -g root ", "")
+    result = subprocess.run(["sh", "-c", source], capture_output=True, text=True,
+                            env={**os.environ, "PATH": str(bin_dir) + ":" + os.environ["PATH"],
+                                 "COMMAND_LOG": str(log), "MIMIR_WORKLINK_HOST": host,
+                                 "MIMIR_ENABLE_OPENCODE": opencode, "MIMIR_ENABLE_CLAUDE_CODE": claude,
+                                 "FACTORY_VERSION": "0.14.1", "NODE_VERSION": "22"})
+    commands = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    return result, commands
+
+
+def test_claude_route_does_not_install_opencode(tmp_path):
+    result, commands = _run_toolchain_script(tmp_path, "claude_code", "0", "1")
+    assert result.returncode == 0, result.stderr
+    installs = [argv for argv in commands if argv[0] == "npm"]
+    assert installs == [["npm", "install", "--global", "--prefix", str(tmp_path / "opt/mimir-claude"),
+                         "@anthropic-ai/claude-code@2.1.326", "claude-code-feature-factory@0.14.1"]]
+    assert any(argv[0] == "node" and "vendor/feature-factory" in argv[-1] for argv in commands)
+    assert not any("opencode" in " ".join(argv) for argv in commands)
+
+
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_legacy_routes_do_not_install_claude(tmp_path, enabled):
+    result, commands = _run_toolchain_script(tmp_path, "opencode", enabled, "0")
+    assert result.returncode == 0, result.stderr
+    installs = [argv for argv in commands if argv[0] == "npm"]
+    assert len(installs) == int(enabled)
+    assert not any("claude" in " ".join(argv) for argv in commands)
+    if enabled == "1":
+        assert installs[0][4:] == [str(tmp_path / "opt/mimir-opencode"), "@opencode/cli@2.2.7",
+                                  "@openai/codex@0.139.0", "feature-factory@0.14.1",
+                                  "opencode2-feature-factory@0.14.1", "@devtheops/opencode-plugin-otel@2.1.0"]
+
+
+@pytest.mark.parametrize("host,opencode,claude", [
+    ("claude_code", "1", "1"), ("claude_code", "0", "0"),
+    ("opencode", "0", "1"), ("unknown", "0", "0"),
+])
+def test_toolchain_switches_refuse_inconsistency_before_installs(tmp_path, host, opencode, claude):
+    result, commands = _run_toolchain_script(tmp_path, host, opencode, claude)
+    assert result.returncode != 0
+    assert "inconsistent Worklink host" in result.stderr
+    assert commands == []
 
 
 def test_opencode_build_arg_installs_pinned_runtime() -> None:
@@ -1063,6 +1142,20 @@ def test_mode_selection_and_source_assembler_have_real_stage_dependencies():
     reachable = _runtime_stage_dependencies(text)
     assert "provenance-validation" in reachable
     assert "source-assembly" not in reachable
+
+
+@pytest.mark.parametrize("host", ["opencode", "claude_code"])
+def test_root_runtime_defaults_select_exactly_one_toolchain(host):
+    text = DOCKERFILE.read_text()
+    reachable = _runtime_stage_dependencies(text, MIMIR_WORKLINK_HOST=host)
+    assert f"{host}-runtime" in reachable
+    other = "opencode" if host == "claude_code" else "claude_code"
+    assert f"{other}-runtime" not in reachable
+    _assert_provenance_stage_ancestry(text, MIMIR_WORKLINK_HOST=host, MIMIR_INSTALL_MODE="pypi")
+    stage = text.split(f"FROM runtime AS {host}-runtime\n", 1)[1].split("\nFROM ", 1)[0]
+    prefix = "/opt/mimir-claude" if host == "claude_code" else "/opt/mimir-opencode"
+    assert f'ENV PATH="{prefix}/bin:${{PATH}}"' in stage
+    assert f"ENV MIMIR_FACTORY_ENTRYPOINT={prefix}/lib/node_modules/" in stage
 
 
 def test_pypi_install_scripts_keep_dependency_cache_and_no_bytecode_policy():

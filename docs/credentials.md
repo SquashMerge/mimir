@@ -71,6 +71,24 @@ traffic windows when possible.
 
 ### Type C — OAuth refresh dance
 
+Cultivate's `claude-code:*` subscription route is separate from the legacy
+refresh and OpenCode-daemon mechanisms below. Use only the OAuth token produced
+by the official `claude setup-token`: `--claude-token-file PATH` (0600),
+`--claude-token-stdin`, or the hidden setup prompt. Setup saves it only as
+`CLAUDE_CODE_OAUTH_TOKEN` in private `compose.env`, never in YAML, manifests,
+build arguments or logs, and strips stale `ANTHROPIC_API_KEY`. Stored Claude
+login files, API keys and OpenCode authentication are not fallback credentials
+for Claude Worklink.
+
+Claude leaves and coding spawns receive OAuth explicitly and refuse
+`GH_TOKEN`, `GITHUB_TOKEN` and `FACTORY_PUBLISHING_IDENTITY`, even if requested
+through `pass_env`. Factory epics separately admit the OAuth token plus the
+explicit publishing token/identity, preserving alias and conflict checks.
+Private worker HOME/config projections contain no host login state. These are
+contained subprocesses, not daemon sessions; the default network-isolation
+policy is unchanged. Rotating a saved token requires explicitly reconciling
+the private deployment env. Switching routes requires a fresh deployment.
+
 | Env var / storage | Used by | Upstream regen | Verification probe |
 |---|---|---|---|
 | `$MIMIR_HOME/.claude/.credentials.json` (path resolved by `MIMIR_CLAUDE_OAUTH_CREDENTIALS`; falls back to `$HOME/.claude/.credentials.json` only if MIMIR_HOME is unset) | Claude Max OAuth subprocess for `ANTHROPIC_BASE_URL`-routed deployments | `claude /login` from a terminal with access to the host browser | `mimir oauth-usage-check` (already exists); a non-failing `oauth_usage_polled` event in `events.jsonl` |
@@ -103,7 +121,7 @@ The daemon API password has a controller-only mode-0600 copy at
 `/run/mimir-worklink/agent/api.json` inside a mimir-owned 0700 directory; it never
 appears in argv. Preserve the `worklink-daemon` volume across
 container recreation. Daemon directories are worklink-owned 0700 and sensitive
-files 0600. Builds share that uid: they **can read** the daemon API password,
+files 0600. On the OpenCode route, builds share that uid: they **can read** the daemon API password,
 native Codex login and bot publishing token, intentionally including leaf/spawn.
 This is not a same-uid secret boundary. Other agent secrets, compose.env,
 MIMIR_HOME, `/home/mimir`, the agent Codex file and OTLP headers remain mimir-private.

@@ -503,6 +503,7 @@ def render_dockerfile(
     mimir_extras: list[str] | None = None,
     install_opencode: bool = False,
     plugins: tuple = (),
+    worklink_host: str = "opencode",
 ) -> str:
     """Stitch fragments into the base template via sentinel split, so
     a fragment that happens to contain the literal sentinel-string
@@ -518,6 +519,10 @@ def render_dockerfile(
     ``install_opencode`` retains the existing config-baking option. The
     runtime installation belongs to the selected Cultivate Docker fragment.
     """
+    if worklink_host not in {"opencode", "claude_code"}:
+        raise ValueError("Worklink host must be opencode or claude_code")
+    if worklink_host == "claude_code" and (install_opencode or not has_trusted_cultivate(plugins)):
+        raise ValueError("Claude Worklink requires Cultivate and cannot install OpenCode config")
     if mode == "pypi" and has_trusted_cultivate(plugins):
         raise ValueError(_CULTIVATE_PYPI_ERROR)
     if mode == "pypi":
@@ -592,6 +597,28 @@ def render_dockerfile(
         # The workspace template is still root here; the following
         # ``COPY start.sh`` + ``chmod`` must keep running as root.
         base = base.replace("EXPOSE 8080", executor + "\nEXPOSE 8080")
+        if worklink_host == "claude_code":
+            base = base.replace(
+                "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js",
+                "/opt/mimir-claude/lib/node_modules/claude-code-feature-factory/vendor/feature-factory/bin/factory.js",
+            ).replace("/opt/mimir-opencode/bin:", "/opt/mimir-claude/bin:")
+            base = base.replace("ARG MIMIR_ENABLE_OPENCODE=0",
+                                "ARG MIMIR_WORKLINK_HOST=claude_code\nARG MIMIR_ENABLE_CLAUDE_CODE=1\n"
+                                "ARG MIMIR_ENABLE_OPENCODE=0")
+            base = base.replace('FACTORY_VERSION="$FACTORY_VERSION" sh',
+                                'MIMIR_WORKLINK_HOST="$MIMIR_WORKLINK_HOST" '
+                                'MIMIR_ENABLE_CLAUDE_CODE="$MIMIR_ENABLE_CLAUDE_CODE" '
+                                'FACTORY_VERSION="$FACTORY_VERSION" sh')
+            base = base.replace("ARG MIMIR_EXTRAS=anthropic,discord,slack,mcp",
+                                "ARG MIMIR_EXTRAS=claude-code,discord,slack,mcp")
+            # Package/context resources stay identical to root images. Only the
+            # workspace image's launch command needs its clone/sync bootstrap.
+            launch = ("from pathlib import Path; "
+                      "Path('/etc/s6-overlay/s6-rc.d/mimir/run').write_text("
+                      + repr(_mimir_service_run(cultivate=True)) + ")")
+            base = base.replace("RUN sh /opt/cultivate-docker/service.sh",
+                                "RUN " + json.dumps(["python3", "-c", launch]) + "\n"
+                                "RUN sh /opt/cultivate-docker/service.sh")
     if plugins:
         base = base.replace("# ===== BEGIN mimir-scaffold-docker: skill fragments =====",
                             render_stage(plugins, "base") + "\n\n# ===== BEGIN mimir-scaffold-docker: skill fragments =====")
@@ -784,6 +811,7 @@ def render_compose_yml(
     service_name: str,
     web_port: int,
     mode: ScaffoldMode = _DEFAULT_MODE,
+    worklink_host: str = "opencode",
 ) -> str:
     """``mode='workspace'`` (default) emits the clone-on-boot shape;
     ``mode='pypi'`` drops the ``workspace`` named volume so the
@@ -795,6 +823,15 @@ def render_compose_yml(
         tmpl = _COMPOSE_YML_TEMPLATE
     else:
         raise ValueError(f"unknown scaffold mode {mode!r}; expected one of {_MODES}")
+    if worklink_host not in {"opencode", "claude_code"}:
+        raise ValueError("Worklink host must be opencode or claude_code")
+    if worklink_host == "claude_code":
+        tmpl = tmpl.replace("${MIMIR_ENABLE_CLAUDE_CODE:-0}", '"1"').replace(
+            '"${MIMIR_ENABLE_OPENCODE:-0}"', '"0"')
+        tmpl = tmpl.replace('        MIMIR_ENABLE_CLAUDE_CODE:', '        MIMIR_WORKLINK_HOST: claude_code\n'
+                            '        MIMIR_ENABLE_CLAUDE_CODE:')
+        tmpl = tmpl.replace('\n      MIMIR_ENABLE_CLAUDE_CODE:', '\n      MIMIR_WORKLINK_HOST: claude_code\n'
+                            '      MIMIR_ENABLE_CLAUDE_CODE:')
     return (
         tmpl
         .replace("{SERVICE_NAME}", service_name)
@@ -1323,6 +1360,7 @@ def scaffold(
     mimir_extras: list[str] | None = None,
     install_opencode: bool | None = None,
     all_installed: bool = False,
+    worklink_host: str | None = None,
 ) -> ScaffoldResult:
     """Generate / refresh Docker scaffolding for an agent home.
 
@@ -1348,6 +1386,14 @@ def scaffold(
     home = home.resolve()
     if not home.is_dir():
         raise FileNotFoundError(f"home not a directory: {home}")
+    old_dockerfile = home / "Dockerfile"
+    old_host = ("claude_code" if old_dockerfile.is_file() and
+                "ARG MIMIR_WORKLINK_HOST=claude_code" in old_dockerfile.read_text() else "opencode")
+    worklink_host = worklink_host or old_host
+    if worklink_host not in {"opencode", "claude_code"}:
+        raise ValueError("Worklink host must be opencode or claude_code")
+    if old_dockerfile.exists() and worklink_host != old_host:
+        raise ValueError("Cannot switch the Worklink route; use a fresh deployment directory")
 
     old_mode, old_port, old_service_name, old_install_opencode = (
         _existing_scaffold_settings(home)
@@ -1384,6 +1430,8 @@ def scaffold(
     result = ScaffoldResult()
     plugins = select_plugins(all_installed=all_installed)
     trusted_cultivate = has_trusted_cultivate(plugins)
+    if worklink_host == "claude_code" and (not trusted_cultivate or install_opencode):
+        raise ValueError("Claude Worklink requires Cultivate and cannot install OpenCode config")
     if mode == "pypi" and trusted_cultivate:
         raise ValueError(_CULTIVATE_PYPI_ERROR)
     selected_services = services(plugins)
@@ -1396,8 +1444,11 @@ def scaffold(
         target = context / "cultivate-docker"
         target.mkdir(parents=True)
         candidate = next(p for p in plugins if has_trusted_cultivate((p,)))
-        for name, content in cultivate_scripts(candidate).items():
+        for name, content in cultivate_scripts(
+                candidate, **({"worklink_host": worklink_host} if worklink_host == "claude_code" else {})).items():
             (target / name).write_text(content)
+            if worklink_host == "claude_code":
+                (target / name).chmod(0o644)
         service = context / "s6-rc.d" / "worklink-execd"
         service.mkdir(parents=True)
         (service / "type").write_text("longrun\n")
@@ -1415,6 +1466,8 @@ def scaffold(
             resources = Path(__file__).resolve().parent.parent / "deploy/s6-overlay/s6-rc.d"
         for name in ("worklink-opencode/type", "worklink-opencode/run",
                      "worklink-opencode/dependencies.d/base", "user/contents.d/worklink-opencode"):
+            if worklink_host == "claude_code":
+                continue
             output = context / "s6-rc.d" / name
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes((resources / name).read_bytes())
@@ -1425,6 +1478,14 @@ def scaffold(
             _mimir_service_run(cultivate=True)
         )
         (bundle / "mimir").touch()
+        if worklink_host == "claude_code":
+            from .plugin_dockerfile import worklink_resources
+            _, selected_s6 = worklink_resources(worklink_host)
+            for name in selected_s6:
+                output = context / "s6-rc.d" / name
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes((resources / name).read_bytes())
+                output.chmod(0o755 if name.endswith("/run") else 0o644)
     if selected_services:
         assemble_services(plugins, context / "s6-rc.d", context / "plugin-services")
         if mode == "workspace":
@@ -1474,17 +1535,19 @@ def scaffold(
         fragments, mode=mode, mimir_extras=mimir_extras,
         install_opencode=install_opencode,
         plugins=plugins,
+        worklink_host=worklink_host,
     )
     _write_if_changed(home / "Dockerfile", df_text, "Dockerfile")
 
     # compose.yml — full regen.
     cy_text = render_compose_yml(
-        service_name=service_name, web_port=web_port, mode=mode,
+        service_name=service_name, web_port=web_port, mode=mode, worklink_host=worklink_host,
     )
     if trusted_cultivate:
-        cy_text = cy_text.replace("      - workspace:/workspace", "      - workspace:/workspace\n"
-                                  "      - worklink-daemon:/var/lib/mimir-worklink/daemon")
-        cy_text += "  worklink-daemon:\n"
+        if worklink_host == "opencode":
+            cy_text = cy_text.replace("      - workspace:/workspace", "      - workspace:/workspace\n"
+                                      "      - worklink-daemon:/var/lib/mimir-worklink/daemon")
+            cy_text += "  worklink-daemon:\n"
         cy_text = cy_text.replace(
             "        MIMIR_ENABLE_OPENCODE:",
             "        MIMIR_GIT_REF: ${MIMIR_GIT_REF:?set an immutable source ref}\n"
@@ -1555,6 +1618,8 @@ def scaffold(
 
 def add_argparse(parser) -> None:
     """Wire ``mimir scaffold-docker``."""
+    parser.add_argument("--worklink-host", choices=("opencode", "claude_code"),
+                        help="Cultivate coding toolchain; omission preserves an existing route.")
     parser.add_argument(
         "--all-installed", action="store_true",
         help="Include all installed plugin Docker contributions, even disabled providers.",
@@ -1659,6 +1724,7 @@ def cmd(args) -> int:
             mimir_extras=mimir_extras,
             install_opencode=getattr(args, "opencode", None),
             all_installed=getattr(args, "all_installed", False),
+            worklink_host=getattr(args, "worklink_host", None),
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc))
