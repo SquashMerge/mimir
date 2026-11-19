@@ -974,9 +974,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
     from mimir.plugins.registry import PolicyConsumerHooks
     from . import forge, opencode, repository, review_guard
     from .worklink.retained_scope import derive_retained_factory_scope
-    from mimir.config import model_spec_at_call_time
-
-    claude_route = model_spec_at_call_time().startswith("claude-code:")
+    claude_route = os.environ.get("MIMIR_MODEL_SPEC", "").startswith("claude-code:")
 
     def retained_checkout_root() -> Path:
         from .worklink.worker_client import worklink_checkout_root

@@ -49,8 +49,7 @@ def opencode_available() -> bool:
 
 
 def startup_prerequisites() -> tuple[str, ...]:
-    from mimir.config import model_spec_at_call_time
-    if model_spec_at_call_time().startswith("claude-code:"):
+    if os.environ.get("MIMIR_MODEL_SPEC", "").startswith("claude-code:"):
         from .claude_code import CLAUDE_EXECUTABLE
         return () if os.access(CLAUDE_EXECUTABLE, os.X_OK) else (
             "the managed Claude CLI is not installed",

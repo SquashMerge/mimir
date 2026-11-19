@@ -79,7 +79,8 @@ cd "$(dirname "$0")/.."
 # Secure output readers open ancestors for reading, not merely traversal. The
 # daemon's private TMPDIR has execute-only ancestors for the worker identity.
 export TMPDIR=/tmp
-uv sync --locked --all-packages --extra dev --extra bench --extra claude-code
+uv sync --locked --all-packages --extra dev --extra bench --extra claude-code \
+    --reinstall-package mimir-cultivate
 uv run --locked --extra dev --extra bench --extra claude-code python -m compileall -q \
     plugins/cultivate/mimir_cultivate/claude_code.py \
     plugins/cultivate/mimir_cultivate/contained_execution.py \
