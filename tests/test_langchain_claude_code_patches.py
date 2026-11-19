@@ -30,7 +30,8 @@ from mimir import _langchain_claude_code_patches as patches
 
 def test_locked_adapter_uses_official_sdk_bundled_cli(monkeypatch):
     from pathlib import Path
-    import claude_agent_sdk
+    claude_agent_sdk = pytest.importorskip("claude_agent_sdk")
+    pytest.importorskip("langchain_claude_code")
     from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
     from langchain_claude_code import ChatClaudeCode
 

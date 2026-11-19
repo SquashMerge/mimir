@@ -14,7 +14,7 @@ from mimir.saga import _llm
 @pytest.mark.asyncio
 async def test_saga_claude_preserves_official_sdk_cli_resolution(monkeypatch):
     from pathlib import Path
-    import claude_agent_sdk
+    claude_agent_sdk = pytest.importorskip("claude_agent_sdk")
     from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
     captured = []

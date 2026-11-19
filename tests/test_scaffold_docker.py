@@ -44,6 +44,8 @@ from mimir.plugins.discovery import PluginDiscoveryError
 
 
 def test_claude_scaffold_route_propagates_and_rejects_switches(tmp_path, monkeypatch):
+    if not _cultivate_installed():
+        pytest.skip("requires the optional mimir-cultivate distribution")
     import yaml
     selected = select_plugins(enable="cultivate")
     monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kw: selected)

@@ -27,6 +27,7 @@ from mimir_cultivate import setup as installer
 SHA = "a" * 40
 VERSION = "1.0.0rc2"
 REAL_SECRET = installer._secret
+REAL_FIELD = installer._field
 
 
 @pytest.mark.parametrize("provider", ["codex-plus", "openai", "anthropic"])
@@ -106,7 +107,8 @@ def test_claude_token_private_file_required(tmp_path):
 @pytest.mark.parametrize("existing,requested", [
     ("opencode", "claude-code:sonnet"), ("claude_code", "openai:model"),
 ])
-def test_route_switch_refused_before_secrets_license_or_effects(tmp_path, monkeypatch, existing, requested):
+@pytest.mark.parametrize("source", ["flag", "env"])
+def test_route_switch_refused_before_secrets_license_or_effects(tmp_path, monkeypatch, existing, requested, source):
     deploy = tmp_path / "deployment"
     deploy.mkdir()
     manifest = {"mimir_install_mode": "pypi"}
@@ -116,12 +118,80 @@ def test_route_switch_refused_before_secrets_license_or_effects(tmp_path, monkey
     before = (deploy / "manifest.json").read_bytes()
     for name in ("_license_gate", "_secret", "resolve_release", "_env"):
         monkeypatch.setattr(installer, name, lambda *a, **kw: pytest.fail("effect before route refusal"))
-    args = argparse.Namespace(deploy=str(deploy), model_spec=requested, force=True)
+    monkeypatch.delenv("MIMIR_CULTIVATE_DEPLOY", raising=False)
+    args = argparse.Namespace(model_spec=requested, force=True)
+    if source == "flag":
+        args.deploy = str(deploy)
+    else:
+        monkeypatch.setenv("MIMIR_CULTIVATE_DEPLOY", str(deploy))
     with pytest.raises(installer.SetupError, match="fresh --deploy"):
         installer.setup(args, request=lambda *a: pytest.fail("network"),
                         run=lambda *a, **kw: pytest.fail("command"))
     assert list(deploy.iterdir()) == [deploy / "manifest.json"]
     assert (deploy / "manifest.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("existing,requested", [
+    ("opencode", "claude-code:sonnet"), ("claude_code", "openai:model"),
+])
+def test_interactive_route_switch_refused_before_license_receipt(tmp_path, monkeypatch, existing, requested):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MIMIR_CULTIVATE_DEPLOY", raising=False)
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+    deploy = tmp_path / "selected"
+    deploy.mkdir()
+    manifest = {"mimir_install_mode": "pypi"}
+    if existing == "claude_code":
+        manifest["worklink_toolchain"] = installer._worklink_toolchain()
+    (deploy / "manifest.json").write_text(json.dumps(manifest))
+    prompts = []
+
+    def prompt(text):
+        prompts.append(text)
+        assert text.startswith("Deploy ")
+        return str(deploy / ".." / "selected")
+
+    monkeypatch.setattr("builtins.input", prompt)
+    monkeypatch.setattr(installer, "_installed_license", lambda: (b"offline license", "1.2.3"))
+    for name in ("_write", "_secret", "resolve_release", "_env"):
+        monkeypatch.setattr(installer, name, lambda *a, **kw: pytest.fail("effect before route refusal"))
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    with pytest.raises(installer.SetupError, match="fresh --deploy"):
+        installer.setup(argparse.Namespace(model_spec=requested, accept_license=True),
+                        request=lambda *a: pytest.fail("network"),
+                        run=lambda *a, **kw: pytest.fail("command"))
+    assert len(prompts) == 1
+    assert before == {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+
+
+def test_interactive_fresh_target_ignores_unselected_default_manifest(setup_environment, tmp_path, monkeypatch):
+    deploy, args, state, calls, invoke = setup_environment
+    args.otlp_endpoint = "none"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MIMIR_CULTIVATE_DEPLOY", raising=False)
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+    default = tmp_path / "cultivate-agent"
+    default.mkdir()
+    manifest = default / "manifest.json"
+    manifest.write_text(json.dumps({"worklink_toolchain": installer._worklink_toolchain()}))
+    before = manifest.read_bytes()
+    fixture_field = installer._field
+    monkeypatch.setattr(installer, "_field", lambda args, name, *a, **kw:
+                        (REAL_FIELD if name == "deploy" else fixture_field)(args, name, *a, **kw))
+    prompts = []
+
+    def prompt(text):
+        prompts.append(text)
+        assert text.startswith("Deploy ")
+        return str(tmp_path / "unused" / ".." / deploy.name)
+
+    monkeypatch.setattr("builtins.input", prompt)
+    invoke()
+    assert len(prompts) == 1
+    assert (deploy / "manifest.json").is_file()
+    assert "worklink_toolchain" not in json.loads((deploy / "manifest.json").read_text())
+    assert manifest.read_bytes() == before
+    assert list(default.iterdir()) == [manifest]
 
 
 def test_claude_setup_selects_subscription_toolchain_and_no_daemon(
@@ -347,7 +417,10 @@ def test_license_decline_or_eof_writes_nothing_before_other_work(tmp_path, monke
             raise EOFError
         return answer
     monkeypatch.setattr("builtins.input", prompt)
-    monkeypatch.setattr(installer, "_field", lambda *a, **kw: pytest.fail("other prompt before license"))
+    def field(args, name, *a, **kw):
+        assert name == "deploy", "only target selection may precede the license"
+        return str(tmp_path / "deploy")
+    monkeypatch.setattr(installer, "_field", field)
     assert installer.dispatch(argparse.Namespace(cultivate_action="setup")) == 1
     assert not list(tmp_path.iterdir())
 

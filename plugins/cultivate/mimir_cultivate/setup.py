@@ -493,13 +493,15 @@ def _check_route(previous: dict, spec: str) -> None:
                          "use a fresh --deploy directory.")
 
 
-def _route_preflight(args: argparse.Namespace) -> str | None:
-    """Refuse a route switch before the license receipt or any secret/effect."""
-    path = (getattr(args, "deploy", None) or os.environ.get("MIMIR_CULTIVATE_DEPLOY")
-            or str(Path.cwd() / "cultivate-agent"))
-    manifest = Path(path).expanduser() / "manifest.json"
-    if not manifest.is_file():
-        return
+def _route_preflight(args: argparse.Namespace) -> tuple[Path, dict, str | None]:
+    """Resolve the selected target and refuse switches before any persistence."""
+    deploy = Path(_field(
+        args, "deploy", "Deployment directory: choose a private local directory for Docker files and web key.",
+        default=str(Path.cwd() / "cultivate-agent"),
+    )).expanduser().resolve()
+    manifest = deploy / "manifest.json"
+    if not manifest.exists():
+        return deploy, {}, None
     try:
         previous = json.loads(manifest.read_text())
     except (OSError, ValueError):
@@ -508,7 +510,7 @@ def _route_preflight(args: argparse.Namespace) -> str | None:
         raise SetupError("Invalid manifest.json; reconcile it before retrying.")
     spec = _field(args, "model_spec", "Model spec: claude-code:model, codex-plus:model, openai:model or anthropic:model.")
     _check_route(previous, spec)
-    return spec
+    return deploy, previous, spec
 
 
 def _tracing_settings(args: argparse.Namespace, previous: dict, prior: dict[str, str], slug: str
@@ -1753,7 +1755,7 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verify) -> None:
-    preflight_spec = _route_preflight(args)
+    deploy, previous, preflight_spec = _route_preflight(args)
     requested_platform = getattr(args, "platform", None)
     if requested_platform is not None and requested_platform not in _DOCKER_ARCHITECTURES:
         raise SetupError("Unsupported Docker platform; choose linux/amd64 or linux/arm64.")
@@ -1778,14 +1780,6 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     display = _field(args, "display_name", "Owner display name: choose the name shown in chat.")
     owner_email = _field(args, "owner_email", "Owner email: your email address, used for identity reconciliation.")
     print(PAT_HELP)
-    deploy = Path(_field(args, "deploy", "Deployment directory: choose a private local directory for Docker files and web key.", default=str(Path.cwd() / "cultivate-agent"))).expanduser().resolve()
-    manifest_path = deploy / "manifest.json"
-    try:
-        previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    except (OSError, ValueError):
-        raise SetupError("Cannot read previous settings from manifest.json; reconcile it before retrying.") from None
-    if not isinstance(previous, dict):
-        raise SetupError("Invalid manifest.json; reconcile it before retrying.")
     if previous and previous.get("mimir_install_mode") != "pypi":
         raise SetupError("Source-era Cultivate deployments cannot be upgraded, even with --force; create a new --deploy directory and migrate operator data explicitly.")
     saved_platform = previous.get("docker_platform")
