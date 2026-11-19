@@ -145,13 +145,13 @@ class OpenCodeBackend:
         branch: str,
         test_command: str,
     ) -> WorkSpec:
-        prompt = _prompt_for_order(order)
+        allowlist = tuple(self.bash_allowlist)
+        prompt = _prompt_for_order(order, allowlist)
         model_home = order.env.get("MIMIR_HOME") or os.environ.get("MIMIR_HOME")
         configured = model_spec_at_call_time(Path(model_home) if model_home else None)
         values = {**os.environ, **order.env}
         values.setdefault("MIMIR_MODEL_SPEC", configured)
         reference = resolve_daemon_model(values)
-        allowlist = tuple(self.bash_allowlist)
         model = f"{reference['providerID']}/{reference['id']}"
         if self.extra_args:
             raise ValueError("daemon leaf sessions do not accept CLI arguments")
@@ -344,8 +344,23 @@ def validate_extra_args(args: Sequence[str]) -> None:
             )
 
 
-def _prompt_for_order(order: WorkOrder) -> str:
-    return order.prompt if order.rules is None else f"{order.rules.rstrip()}\n\n{order.prompt}"
+def _prompt_for_order(order: WorkOrder, bash_allowlist: Sequence[str]) -> str:
+    prompt = order.prompt if order.rules is None else f"{order.rules.rstrip()}\n\n{order.prompt}"
+    patterns = "\n".join(f"- `{pattern}`" for pattern in bash_allowlist)
+    return (
+        "## Shell permissions for this leaf session\n\n"
+        "Effective shell allowlist (only these configured patterns are allowed):\n"
+        f"{patterns}\n\n"
+        "Each shell command must itself start with an allowed prefix. Compound commands "
+        "are judged by their whole text: do not prefix an allowed command with `pwd;`, "
+        "`cd …;` or similar. Use the read, grep, glob and list tools for inspection "
+        "instead of `cat`, `find`, `ls` or `pwd`.\n\n"
+        "A single `permission.rejected` shell result means \"use an allowed form\", "
+        "not \"shell is unavailable\". Retry using an allowed command. "
+        "`WORKLINK_BLOCKED` for shell access is only appropriate when an allowed command "
+        "(for example, `git status` when `git *` is listed above) is itself refused.\n\n"
+        f"{prompt}"
+    )
 
 
 def _permission_refusal_reason(
