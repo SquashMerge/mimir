@@ -91,6 +91,7 @@ def run_factory_control(
     timeout: float = 30, output_limit: int = 1024 * 1024,
     initialize: bool = False,
     allow_output_truncation: bool = False,
+    host: str = "opencode",
 ) -> FactoryControlResult:
     """Run retained-tree operations as its owner, without refreshing runtime auth.
 
@@ -121,7 +122,7 @@ def run_factory_control(
                 or Path(argv[2]).resolve() != Path(__file__).with_name("factory_control_output.py").resolve()
                 or argv[3] != "other"):
             raise ValueError("initial factory control requires the trusted output projector")
-        resolve_factory_entrypoint(entrypoint)
+        resolve_factory_entrypoint(entrypoint, host=host)
 
     async def run() -> FactoryControlResult:
         client = WorkerClient.for_factory_checkout(root, issue_id=issue, attempt=attempt)
@@ -769,6 +770,13 @@ class WorkerClient:
 
     async def cancel_factory_handle(self, handle: LaunchHandle) -> None:
         """Cancel only a recorded factory identity; the executor checks its live job."""
+        await self._factory_handle_operation(handle, "cancel_factory_handle")
+
+    async def admit_factory_handle(self, handle: LaunchHandle) -> None:
+        """Release a held host only after its caller has durably bound the handle."""
+        await self._factory_handle_operation(handle, "admit_factory_handle")
+
+    async def _factory_handle_operation(self, handle: LaunchHandle, operation: str) -> None:
         _validate_identifier(handle.identifier)
         if (
             handle.substrate != "local_subprocess"
@@ -777,7 +785,7 @@ class WorkerClient:
         ):
             raise ValueError("factory cancel requires a verified executor handle")
         request = {
-            "version": 1, "op": "cancel_factory_handle",
+            "version": 1, "op": operation,
             "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
             "handle": {
                 "substrate": handle.substrate, "identifier": handle.identifier,
@@ -796,7 +804,8 @@ class WorkerClient:
                 if "exact contract" in error or "stale root executor image" in error or "unsupported worker operation" in error:
                     raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
                 raise RuntimeError(error)
-            if response != {"id": handle.identifier, "status": "exited"}:
+            expected = "admitted" if operation == "admit_factory_handle" else "exited"
+            if response != {"id": handle.identifier, "status": expected}:
                 raise RuntimeError("worker executor returned an invalid factory cancel result")
         finally:
             sock.close()

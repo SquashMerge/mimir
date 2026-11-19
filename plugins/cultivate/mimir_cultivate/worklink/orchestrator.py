@@ -916,12 +916,21 @@ def _require_factory_launch_binding(
     spec: WorkSpec, run_id: str, publishing_identity: str
 ) -> None:
     request = spec.session_request
+    if spec.execution.home_projection_profile == "claude_factory":
+        try:
+            payload = json.loads(spec.local_argv[-1])
+            bound = (request is None and payload["request"].split()[-1] == run_id
+                     and spec.backend_config["lock_session"] == "claude-code:" + payload["session"]
+                     and spec.backend_config["entrypoint"] == payload["entrypoint"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            bound = False
+    else:
+        bound = (request is not None and request.kind == "epic"
+                 and bool(request.text.split()) and request.text.split()[-1] == run_id
+                 and spec.local_argv is None)
     if (
         spec.backend_config.get("run_id") != run_id
-        or request is None or request.kind != "epic"
-        or not request.text.split()
-        or request.text.split()[-1] != run_id
-        or spec.local_argv is not None
+        or not bound
     ):
         raise WorklinkError("factory launch request run_id does not match the supervised run_id")
     # Fail closed on a launch that would publish as some other account. Losing the
@@ -3168,12 +3177,19 @@ class WorklinkRunner:
         selected = registry.get("feature_factory")
         if not isinstance(selected, FeatureFactoryBackend):
             raise WorklinkError("feature_factory backend has an invalid implementation")
+        recorded_hosts = load_factory_records_for_issue(self.home, issue_id)
+        if len(recorded_hosts) == 1:
+            recorded = recorded_hosts[0]
+            selected = replace(selected, entrypoint=recorded.launcher, host=recorded.host,
+                model=selected.model if recorded.host == selected.host else None)
         repo_url = _repo_remote_url(self.repo, runner=runner)
         repo_slug = _repo_slug_from_url(repo_url)
         if repo_slug is None:
             raise WorklinkError("factory repository must have a canonical GitHub origin")
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         execution = selected.capabilities().execution
+        if execution.substrate == "contained_subprocess" and execution.checkout_protocol == "factory_worker":
+            runner = _factory_git_runner(runner)
         if execution.substrate == "opencode_daemon" and callable(getattr(compute, "_launch_contained", None)):
             runner = _factory_git_runner(runner)
             from .compute import OpenCodeDaemonComputeBackend
@@ -3257,7 +3273,7 @@ class WorklinkRunner:
         work_item_json = render_work_item(issue)
         run_id = _validate_epic_work_item(work_item_json, issue.issue_id)
         retained: FactoryRunRecord | None = None
-        initial_retained = load_factory_records_for_issue(self.home, issue_id)
+        initial_retained = recorded_hosts
         if autonomous and not initial_retained:
             from .dispatch_failures import (
                 autonomous_dispatch_block_reason,
@@ -3326,6 +3342,8 @@ class WorklinkRunner:
                 return
             candidate = candidates[0]
             try:
+                if candidate.host != selected.host:
+                    raise WorklinkError("retained factory host changed before claim")
                 if candidate.controller_phase == "published-with-controller-error":
                     raise WorklinkError("published factory PR requires operator review, not a new factory attempt")
                 sandbox = _verify_factory_recovery_target(
@@ -3355,7 +3373,7 @@ class WorklinkRunner:
                         raise WorklinkError("factory recovery refuses a live retained process")
                     if not daemon_host and not factory_process_is_verified_dead(candidate):
                         raise WorklinkError("factory recovery cannot verify the retained process is dead")
-                    if not daemon_host and not (live.is_parked and candidate.children_reaped
+                    if candidate.host != "claude_code" and not daemon_host and not (live.is_parked and candidate.children_reaped
                                                 and candidate.run_id == epic_run_id(candidate.issue_id)):
                         raise WorklinkError("legacy factory host requires operator parking and fresh daemon recovery")
                     if live.status == "needs-human" and live.park_snapshot is None:
@@ -3523,7 +3541,7 @@ class WorklinkRunner:
                     environ=epic_environment,
                 )
                 from .daemon_health import daemon_health
-                if daemon_health(epic_environment).get("ok") is not True:
+                if execution.substrate == "opencode_daemon" and daemon_health(epic_environment).get("ok") is not True:
                     raise WorklinkError("OpenCode daemon admission unavailable before factory initialization")
                 from .backends.feature_factory import _factory_max_retries
                 retry_budget = _factory_max_retries()
@@ -3534,12 +3552,15 @@ class WorklinkRunner:
                 spec = replace(spec, factory_credential_settings=(*_git_credential_settings(self.repo),
                     ("user.name", order.env["GIT_AUTHOR_NAME"]), ("user.email", order.env["GIT_AUTHOR_EMAIL"])))
                 from .daemon_sessions import session_environment
-                session_environment(dict(spec.env), home=Path("/var/lib/mimir-worklink/session-validation"),
+                session_environment({} if selected.host == "claude_code" else dict(spec.env), home=Path("/var/lib/mimir-worklink/session-validation"),
                     git_settings=spec.factory_credential_settings, credentials={})
                 pending = FactoryRunRecord(run_id=run_id, issue_id=issue_id, attempt=claim_record.attempt,
                     repository=repo_slug, base_ref=lease.base_ref, branch=f"feature/{run_id}",
                     launcher=str(launcher), sandbox=str(lease.path / ".factory-sandboxes" / run_id),
-                    session=None, handle=None, status=None, observed_at=None, controller_phase="running")
+                    session=spec.backend_config.get("lock_session"), handle=None, status=None,
+                    observed_at=None, controller_phase="running", host=selected.host,
+                    lock_session=spec.backend_config.get("lock_session"),
+                    launch_generation=spec.backend_config.get("launch_generation"))
                 # The driver owns init, from O. Bind the future sandbox now and
                 # accept it only after qualified status confirms that exact path.
                 factory_record = replace(pending, session_checkout=str(lease.path))
@@ -3551,7 +3572,7 @@ class WorklinkRunner:
                     factory_launch_uncertain = bool(getattr(exc, "uncertain", False) and not getattr(exc, "quiescent", False))
                     if admitted is not None:
                         factory_record = replace(factory_record, handle=admitted,
-                            session=admitted.opencode_session_id, opencode_session_id=admitted.opencode_session_id,
+                            session=factory_record.lock_session or admitted.opencode_session_id, opencode_session_id=admitted.opencode_session_id,
                             children_reaped=bool(getattr(exc, "quiescent", False)))
                         try:
                             save_factory_record(self.home, factory_record)
@@ -3566,9 +3587,11 @@ class WorklinkRunner:
                     _write_factory_host_evidence(self.home, factory_record, "backend_error", _factory_controller_error(exc))
                     raise
                 factory_record = replace(factory_record, handle=handle,
-                    session=handle.opencode_session_id, opencode_session_id=handle.opencode_session_id)
+                    session=factory_record.lock_session or handle.opencode_session_id, opencode_session_id=handle.opencode_session_id)
                 try:
                     save_factory_record(self.home, factory_record)
+                    if factory_record.host == "claude_code":
+                        await compute.admit_factory_handle(handle)
                 except BaseException as exc:
                     try:
                         await _cancel_and_cleanup_factory_handle(compute, handle)
@@ -3615,9 +3638,13 @@ class WorklinkRunner:
             except Exception:
                 current = None
             admitted = getattr(exc, "handle", None)
-            if current is not None and admitted is not None and admitted.opencode_session_id is not None:
-                current = replace(current, handle=admitted, session=admitted.opencode_session_id,
+            if current is not None and current.handle == admitted and getattr(exc, "quiescent", False):
+                current = replace(current, children_reaped=True)
+                save_factory_record(self.home, current)
+            if current is not None and admitted is not None and (current.host == "claude_code" or admitted.opencode_session_id is not None):
+                current = replace(current, handle=admitted, session=current.lock_session or admitted.opencode_session_id,
                     opencode_session_id=admitted.opencode_session_id, children_reaped=bool(getattr(exc, "quiescent", False)))
+                save_factory_record(self.home, current)
             if (current is not None and current.handle is None and current.opencode_session_id is None
                     and getattr(exc, "quiescent", False)):
                 current = replace(current, children_reaped=True)
@@ -3634,8 +3661,9 @@ class WorklinkRunner:
                 else None
             )
             published = published_url is not None
-            host_unverified = factory_launch_uncertain or bool(current is not None and current.handle is not None
-                and current.handle.substrate == "opencode_daemon" and not current.children_reaped)
+            host_unverified = factory_launch_uncertain or bool(current is not None and not current.children_reaped
+                and (current.host == "claude_code" or current.handle is not None
+                     and current.handle.substrate == "opencode_daemon"))
             preserved_ref, preservation_error = (None, None) if host_unverified else _preserve_failed_factory_run(
                 home=self.home, trusted_repo=self.repo, record=current)
             reason = original_reason
@@ -3747,9 +3775,10 @@ class WorklinkRunner:
                 records = load_factory_records_for_issue(self.home, issue_id)
                 current = records[0] if records else retained
                 admitted = getattr(exc, "handle", None)
-                if current is not None and admitted is not None and admitted.opencode_session_id is not None:
-                    current = replace(current, handle=admitted, session=admitted.opencode_session_id,
+                if current is not None and admitted is not None and (current.host == "claude_code" or admitted.opencode_session_id is not None):
+                    current = replace(current, handle=admitted, session=current.lock_session or admitted.opencode_session_id,
                         opencode_session_id=admitted.opencode_session_id, children_reaped=bool(getattr(exc, "quiescent", False)))
+                    save_factory_record(self.home, current)
                     _write_factory_host_evidence(self.home, current, "failed", _factory_controller_error(exc))
                 if (current is not None and current.handle is None and current.opencode_session_id is None
                         and getattr(exc, "quiescent", False)):
@@ -3787,8 +3816,9 @@ class WorklinkRunner:
                 retained_records = []
                 release_permitted = False
             if factory_launch_uncertain or any(
-                entry.handle is not None and entry.handle.substrate == "opencode_daemon"
-                and not entry.children_reaped for entry in retained_records
+                not entry.children_reaped and (entry.host == "claude_code"
+                or entry.handle is not None and entry.handle.substrate == "opencode_daemon")
+                for entry in retained_records
             ):
                 release_permitted = False
             released = (
@@ -3882,6 +3912,8 @@ class WorklinkRunner:
         work_item_json: str,
         autonomous: bool = False,
     ) -> WorklinkRunResult:
+        if backend.host != retained.host:
+            raise WorklinkError("factory recovery host does not match the retained record")
         sandbox = _verify_factory_recovery_binding(
             runner=self,
             issue=issue,
@@ -3902,14 +3934,16 @@ class WorklinkRunner:
         handle = retained.handle
         daemon_host = retained.opencode_session_id is not None and handle is not None and handle.substrate == "opencode_daemon" and retained.opencode_session_id == handle.opencode_session_id
         legacy_quiescent = (not daemon_host and retained.children_reaped and factory_process_is_verified_dead(retained))
-        if not daemon_host and not (legacy_quiescent and (pre.is_terminal or (
+        if retained.host == "claude_code" and not legacy_quiescent:
+            raise WorklinkError("Claude factory recovery requires verified descendant retirement")
+        if not daemon_host and not (legacy_quiescent and (retained.host == "claude_code" or pre.is_terminal or (
                 pre.is_parked and retained.run_id == epic_run_id(retained.issue_id)))):
             raise WorklinkError("legacy factory host requires operator parking and fresh daemon recovery")
         if isinstance(compute, OpenCodeDaemonComputeBackend):
             compute.bind_retained_checkout(Path(retained.session_checkout or retained.sandbox),
                 issue_id=retained.issue_id, attempt=retained.attempt)
         if pre.lock_session not in {None, retained.session}:
-            raise WorklinkError("factory recovery lock session does not match the OpenCode host")
+            raise WorklinkError("factory recovery lock session does not match the recorded host")
         if pre.lock == "absent" and pre.lock_session is not None:
             raise WorklinkError("factory recovery absent lock has an owner")
         if pre.is_terminal:
@@ -3924,11 +3958,11 @@ class WorklinkRunner:
             return await self._supervise_factory_070(issue=issue, claim_record=claim_record, claims=claims,
                 backend=backend, compute=compute, factory_record=retained, test_cmd=test_cmd,
                 runner=runner, started_at=datetime.now(UTC), initial_status=pre, autonomous=autonomous)
-        if not pre.is_parked:
+        if not pre.is_parked and not (retained.host == "claude_code" and pre.status == "running"):
             raise WorklinkError("factory recovery status is not resumable")
         if retained.run_id != epic_run_id(retained.issue_id):
-            raise WorklinkError("fresh daemon recovery requires a canonical factory run id")
-        if pre.park_snapshot is None:
+            raise WorklinkError("fresh host recovery requires a canonical factory run id")
+        if pre.is_parked and pre.park_snapshot is None:
             raise WorklinkError("factory recovery requires a published park snapshot")
         pre.require_recovery_next()
         prior_park_time = (retained.observed_at if retained.status is not None and retained.status.is_parked
@@ -3939,7 +3973,7 @@ class WorklinkRunner:
             work_item_json=_bind_work_item_run_id(work_item_json, retained.run_id), runner=runner,
             environ=epic_environment)
         from .daemon_health import daemon_health
-        if daemon_health(epic_environment).get("ok") is not True:
+        if backend.host == "opencode" and daemon_health(epic_environment).get("ok") is not True:
             raise WorklinkError("OpenCode daemon admission unavailable before fresh factory recovery")
         spec = backend.work_spec(order, attempt=retained.attempt, repo_url=_repo_remote_url(sandbox, runner=runner),
                                  base_ref=retained.base_ref, branch=retained.branch, test_command=test_cmd,
@@ -3948,7 +3982,7 @@ class WorklinkRunner:
         spec = replace(spec, factory_credential_settings=(*_git_credential_settings(self.repo),
             ("user.name", order.env["GIT_AUTHOR_NAME"]), ("user.email", order.env["GIT_AUTHOR_EMAIL"])))
         from .daemon_sessions import session_environment
-        session_environment(dict(spec.env), home=Path("/var/lib/mimir-worklink/session-validation"),
+        session_environment({} if backend.host == "claude_code" else dict(spec.env), home=Path("/var/lib/mimir-worklink/session-validation"),
                             git_settings=spec.factory_credential_settings, credentials={})
         if (retained.status is not None and retained.status.is_parked
                 and retained.status.park_snapshot == pre.park_snapshot and retained.observed_at is not None):
@@ -3969,14 +4003,16 @@ class WorklinkRunner:
                                    sandbox=sandbox, launcher=retained.launcher)
         released = await asyncio.to_thread(backend.status, retained.run_id, sandbox=sandbox, launcher=retained.launcher)
         _require_factory_status(released, retained)
-        if (not released.is_parked or released.lock != "absent" or released.lock_session is not None
+        if (released.status != pre.status or released.lock != "absent" or released.lock_session is not None
                 or released.next != pre.next
                 or _opaque_json_bytes(released.terminal_result) != _opaque_json_bytes(pre.terminal_result)):
             raise WorklinkError("factory recovery could not verify the old host lock was released")
         from .control import clear_legacy_factory_stop
         clear_legacy_factory_stop(self.home, retained.issue_id, retained.attempt)
         pending = replace(retained.observed(released, prior_park_time), handle=None,
-            session=None, opencode_session_id=None, children_reaped=False, controller_phase="running", transcript=None,
+            session=spec.backend_config.get("lock_session"), lock_session=spec.backend_config.get("lock_session"),
+            launch_generation=spec.backend_config.get("launch_generation"),
+            opencode_session_id=None, children_reaped=False, controller_phase="running", transcript=None,
             session_checkout=str(operator_checkout))
         save_factory_record(self.home, pending)
         if isinstance(compute, OpenCodeDaemonComputeBackend):
@@ -3986,7 +4022,7 @@ class WorklinkRunner:
         except BaseException as exc:
             admitted = getattr(exc, "handle", None)
             if admitted is not None:
-                pending = replace(pending, handle=admitted, session=admitted.opencode_session_id,
+                pending = replace(pending, handle=admitted, session=pending.lock_session or admitted.opencode_session_id,
                     opencode_session_id=admitted.opencode_session_id, children_reaped=bool(getattr(exc, "quiescent", False)))
                 try:
                     save_factory_record(self.home, pending)
@@ -4001,10 +4037,12 @@ class WorklinkRunner:
             _write_factory_host_evidence(self.home, pending, "backend_error", _factory_controller_error(exc))
             raise
         relaunched = replace(pending,
-            handle=handle, session=handle.opencode_session_id, opencode_session_id=handle.opencode_session_id,
+            handle=handle, session=pending.lock_session or handle.opencode_session_id, opencode_session_id=handle.opencode_session_id,
             controller_phase="running", transcript=None, children_reaped=False)
         try:
             save_factory_record(self.home, relaunched)
+            if relaunched.host == "claude_code":
+                await compute.admit_factory_handle(handle)
         except BaseException as exc:
             try:
                 await _cancel_and_cleanup_factory_handle(compute, handle)
@@ -4022,7 +4060,7 @@ class WorklinkRunner:
                                       run_id=retained.run_id, attempt=retained.attempt)
         return await self._supervise_factory_070(issue=issue, claim_record=claim_record, claims=claims,
             backend=backend, compute=compute, factory_record=relaunched, test_cmd=test_cmd,
-            runner=runner, started_at=datetime.now(UTC), recovery_session=handle.opencode_session_id,
+            runner=runner, started_at=datetime.now(UTC), recovery_session=relaunched.lock_session or handle.opencode_session_id,
             autonomous=autonomous)
 
     async def _supervise_factory_070(
@@ -4056,7 +4094,9 @@ class WorklinkRunner:
         # unusable setting twice and could disagree if the environment moved.
         startup_timeout = _factory_startup_status_timeout_s()
         startup_deadline = min(deadline, loop.time() + startup_timeout)
-        host_lock_pending = handle.opencode_session_id is not None
+        host_identity = factory_record.lock_session or handle.opencode_session_id
+        host_label = "Claude" if factory_record.host == "claude_code" else "OpenCode"
+        host_lock_pending = host_identity is not None
         stale_after = _epic_stale_heartbeat_s()
         # Silence during a model generation is not proof that the loop exited.
         # Keep the short stale diagnostic distinct from the conservative idle
@@ -4126,7 +4166,7 @@ class WorklinkRunner:
                 status=outcome,
                 stdout="" if result is None else result.stdout,
                 stderr=(
-                    "OpenCode supervision result was not drainable"
+                    f"{host_label} supervision result was not drainable"
                     if result is None
                     else result.stderr
                 ),
@@ -4153,7 +4193,7 @@ class WorklinkRunner:
                 save_factory_record(self.home, factory_record)
                 _write_factory_host_evidence(self.home, factory_record, "failed", _factory_controller_error(exc))
                 raise
-            if handle.opencode_session_id is not None:
+            if handle.opencode_session_id is not None or factory_record.host == "claude_code":
                 factory_record = replace(factory_record, children_reaped=True)
                 save_factory_record(self.home, factory_record)
 
@@ -4369,9 +4409,10 @@ class WorklinkRunner:
         error_incident = False
 
         def host_stop_requested() -> bool:
-            return handle.opencode_session_id is not None and operator_stop_requested(
+            return host_identity is not None and operator_stop_requested(
                 self.home, issue.issue_id, factory_record.attempt,
-                opencode_session_id=handle.opencode_session_id,
+                **({"lock_session": host_identity} if factory_record.host == "claude_code"
+                   else {"opencode_session_id": host_identity}),
             )
 
         async def finish_requested_stop() -> WorklinkRunResult | None:
@@ -4554,13 +4595,15 @@ class WorklinkRunner:
                         await missed_poll(exc)
                         continue
                     handoff_claimed = False
-                    if (handle.opencode_session_id is not None and status.lock_session is not None
-                            and status.lock_session != handle.opencode_session_id):
-                        raise WorklinkError("factory lock session does not match the OpenCode host session")
-                    if handle.opencode_session_id is not None and status.lock == "absent" and status.lock_session is not None:
+                    if (host_identity is not None and status.lock_session is not None
+                            and status.lock_session != host_identity):
+                        if factory_record.host == "claude_code" and wait_task.done() and not wait_task.cancelled() and wait_task.exception() is None and _factory_lock_refusal(wait_task.result()):
+                            raise WorklinkError("factory driver did not acquire the retained run lock; foreign owner left unchanged")
+                        raise WorklinkError(f"factory lock session does not match the {host_label} host session")
+                    if host_identity is not None and status.lock == "absent" and status.lock_session is not None:
                         raise WorklinkError("factory absent lock unexpectedly reports a host owner")
-                    if handle.opencode_session_id is not None:
-                        owned = status.lock == "fresh" and not status.dead_lock and status.lock_session == handle.opencode_session_id
+                    if host_identity is not None:
+                        owned = status.lock == "fresh" and not status.dead_lock and status.lock_session == host_identity
                         if status.is_terminal or status.is_parked or owned:
                             host_lock_pending = False
                         elif not host_lock_pending:
@@ -4789,7 +4832,7 @@ class WorklinkRunner:
                         wait_result = result
                     except TimeoutError as exc:
                         raise WorklinkError(
-                            "OpenCode process stopped without a drainable supervision result"
+                            f"{host_label} process stopped without a drainable supervision result"
                         ) from exc
                     retain_result(result, "failed")
                     stopped = await finish_requested_stop()
@@ -4840,7 +4883,7 @@ class WorklinkRunner:
                         )
                     suffix = f": {detail[:300]}" if detail else ""
                     raise WorklinkError(
-                        f"OpenCode host stopped while factory status was running{suffix}"
+                        f"{host_label} host stopped while factory status was running{suffix}"
                     )
                 if last_status is not None and loop.time() >= park_deadline:
                     assert last_status is not None
@@ -4922,8 +4965,8 @@ class WorklinkRunner:
             raise WorklinkError("factory terminal projection is missing")
         if not (status.is_parked or status.is_terminal):
             raise WorklinkError("factory finalization requires a parked or terminal status")
-        if (factory_record.handle is not None and factory_record.handle.substrate == "opencode_daemon"
-                and not factory_record.children_reaped):
+        if (not factory_record.children_reaped and (factory_record.host == "claude_code"
+                or factory_record.handle is not None and factory_record.handle.substrate == "opencode_daemon")):
             raise WorklinkError("factory finalization requires verified host quiescence")
         _write_factory_host_evidence(self.home, factory_record, status.status or "failed")
         if status.is_parked:
@@ -5280,7 +5323,8 @@ def _verify_factory_recovery_target(
     from .worker_client import worklink_checkout_root, factory_checkout_for_path
 
     binding = factory_checkout_for_path(sandbox)
-    if (sandbox.is_relative_to(worklink_checkout_root()) or retained.opencode_session_id is not None) and binding is None:
+    if (sandbox.is_relative_to(worklink_checkout_root()) or retained.opencode_session_id is not None
+            or retained.host == "claude_code") and binding is None:
         raise WorklinkError(
             "legacy factory checkout has no private ownership-transfer boundary; "
             "retain it for offline migration, not privileged in-place normalization"
@@ -5496,6 +5540,39 @@ def _factory_checkout_repository(checkout: Path, runner: Runner) -> str | None:
 
 
 def _factory_lock_refusal(result: ComputeResult) -> bool:
+    if not (result.timed_out or result.output_overflow or result.launch_error):
+        reports: list[str] = []
+
+        def text_blocks(content: object) -> None:
+            if isinstance(content, str):
+                reports.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                        reports.append(block["text"])
+
+        for line in result.stdout.splitlines():
+            if len(line.encode("utf-8")) > 1024 * 1024:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "result":
+                text_blocks(event.get("result"))
+            elif event.get("type") in {"assistant", "user"}:
+                message = event.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                text_blocks(content)
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            text_blocks(block.get("content"))
+        if any(re.search(r"run '[a-z0-9._-]+' is held by session [^\s]+ \(heartbeat [^)]+\)", report)
+               for report in reports):
+            return True
     if (
         result.exit_code != 0
         or result.timed_out
@@ -5560,8 +5637,9 @@ async def _verify_factory_completion(
         if status.status != "completed" or not status.is_terminal:
             raise WorklinkError("factory completion status is not authoritative")
         _require_factory_status(status, record, require_pr_base=True)
-        if record.opencode_session_id is not None and status.lock_session not in {None, record.opencode_session_id}:
-            raise WorklinkError("factory completion lock belongs to another OpenCode host")
+        identity = record.lock_session or record.opencode_session_id
+        if identity is not None and status.lock_session not in {None, identity}:
+            raise WorklinkError("factory completion lock belongs to another recorded host")
         if status.slices is None or not any(row["status"] == "merged" for row in status.slices):
             raise WorklinkError("factory completion has no merged slice")
         if status.pr_draft:

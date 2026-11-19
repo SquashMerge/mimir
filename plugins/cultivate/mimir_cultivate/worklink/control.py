@@ -51,7 +51,8 @@ def _operator_stop_path(home: Path, issue_id: int) -> Path:
 
 
 def operator_stop_requested(home: Path | None, issue_id: int, attempt: int | None, *,
-                            opencode_session_id: str | None = None) -> bool:
+                            opencode_session_id: str | None = None,
+                            lock_session: str | None = None) -> bool:
     """Only the stopped issue's exact claim attempt may use this marker."""
     if home is None or attempt is None:
         return False
@@ -59,15 +60,18 @@ def operator_stop_requested(home: Path | None, issue_id: int, attempt: int | Non
         data = json.loads(_operator_stop_path(home, issue_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
+    identity = lock_session or opencode_session_id
     return bool(isinstance(data, dict) and data.get("issue_id") == issue_id and data.get("attempt") == attempt
-                and (opencode_session_id is None or data.get("opencode_session_id") == opencode_session_id))
+                and (identity is None or data.get("lock_session", data.get("opencode_session_id")) == identity))
 
 
-def _mark_operator_stop(home: Path, issue_id: int, attempt: int, *, opencode_session_id: str | None = None) -> None:
+def _mark_operator_stop(home: Path, issue_id: int, attempt: int, *, opencode_session_id: str | None = None,
+                        lock_session: str | None = None) -> None:
     path = _operator_stop_path(home, issue_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, {"issue_id": issue_id, "attempt": attempt,
-                            **({"opencode_session_id": opencode_session_id} if opencode_session_id is not None else {})})
+                            **({"opencode_session_id": opencode_session_id} if opencode_session_id is not None else {}),
+                            **({"lock_session": lock_session} if lock_session is not None else {})})
 
 
 def clear_legacy_factory_stop(home: Path, issue_id: int, attempt: int) -> None:
@@ -79,7 +83,7 @@ def clear_legacy_factory_stop(home: Path, issue_id: int, attempt: int) -> None:
         except (OSError, ValueError):
             return
         if (isinstance(data, dict) and data.get("issue_id") == issue_id and data.get("attempt") == attempt
-                and "opencode_session_id" not in data):
+                and "opencode_session_id" not in data and "lock_session" not in data):
             path.unlink(missing_ok=True)
 
 
@@ -390,7 +394,7 @@ def stop_worklink(
 
                     client = WorkerClient.for_path_checkout(Path(factory.session_checkout or factory.sandbox), issue_id=issue_id,
                         attempt=factory.attempt, run_uid=get_identities().worklink_uid)
-                    backend = FeatureFactoryBackend(entrypoint=factory.launcher)
+                    backend = FeatureFactoryBackend(entrypoint=factory.launcher, host=factory.host)
                     try:
                         actual = factory.handle.opencode_session_id
                         before = backend.status(factory.run_id, sandbox=Path(factory.sandbox), launcher=factory.launcher)
@@ -416,6 +420,19 @@ def stop_worklink(
                     save_factory_record(home, stopped)
                     _write_factory_host_evidence(home, stopped,
                         "interrupted", "operator requested stop; factory status: " + str(after.status))
+                    continue
+                if factory.host == "claude_code" and factory.handle is not None:
+                    from .worker_client import WorkerClient
+
+                    try:
+                        _mark_operator_stop(home, issue_id, factory.attempt,
+                                            lock_session=factory.lock_session)
+                        asyncio.run(WorkerClient(None).cancel(factory.handle.identifier))
+                        save_factory_record(home, replace(factory, children_reaped=True,
+                            controller_phase="stopped", controller_error="operator requested stop"))
+                    except (RuntimeError, OSError, ValueError):
+                        uncertain = True
+                        problems.append(f"factory {factory.run_id}: contained retirement unverified; state and claim retained")
                     continue
                 if factory_process_is_alive(factory) and factory.handle is not None:
                     try:

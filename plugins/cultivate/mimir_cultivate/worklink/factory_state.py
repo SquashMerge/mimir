@@ -292,9 +292,39 @@ class FactoryRunRecord:
     mcp_servers: tuple[str, ...] = ()
     # Absent on pre-2156 records, whose host lived in the sandbox.
     session_checkout: str | None = None
+    host: str = "opencode"
+    lock_session: str | None = None
+    launch_generation: str | None = None
 
     def __post_init__(self) -> None:
         from .factory_control_output import parse_mcp_servers
+        from uuid import UUID
+
+        if not isinstance(self.host, str) or self.host not in {"opencode", "claude_code"}:
+            raise FactoryRecordError("factory record host is invalid")
+        if self.host == "opencode" and self.lock_session is None:
+            object.__setattr__(self, "lock_session", self.opencode_session_id)
+        if self.host == "claude_code":
+            if (self.opencode_session_id is not None
+                    or self.handle is not None and (
+                        self.handle.substrate != "local_subprocess"
+                        or self.handle.opencode_session_id is not None
+                        or self.handle.identifier != self.launch_generation
+                        or type(self.handle.shim_pid) is not int or self.handle.shim_pid <= 0
+                        or type(self.handle.process_start_ticks) is not int or self.handle.process_start_ticks < 0)
+                    or not isinstance(self.lock_session, str)
+                    or not self.lock_session.startswith("claude-code:")
+                    or self.session != self.lock_session):
+                raise FactoryRecordError("factory record Claude host binding is invalid")
+            try:
+                identifier = self.lock_session.removeprefix("claude-code:")
+                if str(UUID(identifier, version=4)) != identifier or self.launch_generation != identifier:
+                    raise ValueError
+            except ValueError as exc:
+                raise FactoryRecordError("factory record Claude lock identity is invalid") from exc
+        elif (self.lock_session is not None and self.lock_session != self.opencode_session_id
+                or self.launch_generation is not None):
+            raise FactoryRecordError("factory record lock identity does not match the OpenCode host")
 
         try:
             parse_mcp_servers(self.mcp_servers)
@@ -382,6 +412,9 @@ class FactoryRunRecord:
             "opencode_session_id": self.opencode_session_id,
             "mcp_servers": list(self.mcp_servers),
             "session_checkout": self.session_checkout,
+            "host": self.host,
+            "lock_session": self.lock_session or self.opencode_session_id,
+            "launch_generation": self.launch_generation,
         }
 
     @classmethod
@@ -408,6 +441,9 @@ class FactoryRunRecord:
         }
         data = dict(data)
         opencode_session_id = data.pop("opencode_session_id", None)
+        host = data.pop("host", "opencode")
+        lock_session = data.pop("lock_session", opencode_session_id)
+        launch_generation = data.pop("launch_generation", None)
         session_checkout = data.pop("session_checkout", None)
         from .factory_control_output import parse_mcp_servers
 
@@ -492,6 +528,9 @@ class FactoryRunRecord:
         return cls(
             version=FACTORY_RECORD_VERSION,
             session_checkout=session_checkout,
+            host=host,
+            lock_session=lock_session,
+            launch_generation=launch_generation,
             run_id=str(data["run_id"]),
             issue_id=int(data["issue_id"]),
             attempt=int(data["attempt"]),
@@ -513,12 +552,13 @@ class FactoryRunRecord:
         )
 
     def observed(self, status: FactoryStatus, observed_at: str | None) -> FactoryRunRecord:
-        if self.opencode_session_id is not None and status.lock_session not in {None, self.opencode_session_id}:
-            raise FactoryRecordError("factory lock session does not match the OpenCode host")
+        identity = self.lock_session or self.opencode_session_id
+        if identity is not None and status.lock_session not in {None, identity}:
+            raise FactoryRecordError("factory lock session does not match the recorded host")
         return replace(
             self,
             status=status,
-            session=self.opencode_session_id or status.lock_session or self.session,
+            session=identity or status.lock_session or self.session,
             observed_at=observed_at,
             controller_error=None,
             mcp_servers=status.mcp_servers,
@@ -989,6 +1029,8 @@ def factory_process_is_verified_dead(
     clean a missing PID or zombie without one, but cannot infer PID reuse.
     """
     handle = record.handle
+    if record.host == "claude_code" and not record.children_reaped:
+        return False
     if handle is not None and handle.substrate == "opencode_daemon":
         return bool(record.children_reaped and record.opencode_session_id == handle.opencode_session_id
                     and record.session == handle.opencode_session_id)

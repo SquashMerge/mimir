@@ -2021,7 +2021,8 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
     import mimir_cultivate.worklink.control as control
 
     monkeypatch.setattr(control, "load_run_state", lambda home, issue_id: None)
-    record = SimpleNamespace(run_id="chainlink-700", handle=LaunchHandle("local_subprocess", "4321", 99))
+    record = SimpleNamespace(run_id="chainlink-700", host="opencode",
+                             handle=LaunchHandle("local_subprocess", "4321", 99))
     monkeypatch.setattr(control, "load_factory_records_for_issue", lambda home, issue_id: [record])
     monkeypatch.setattr(control, "factory_process_is_alive", lambda record: False)
     monkeypatch.setattr(control, "factory_process_is_verified_dead", lambda record, **kwargs: False)

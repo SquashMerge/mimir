@@ -276,6 +276,17 @@ def resolve_daemon_model(env: Mapping[str, str], explicit_model: str | None = No
     return reference
 
 
+_execution_secrets = SensitiveMaterialScrubber(home="")
+
+
+def remember_execution_secrets(environ: Mapping[str, str]) -> None:
+    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "FACTORY_PUBLISHING_IDENTITY"):
+        value = environ.get(name)
+        if value:
+            _execution_secrets.add_scalar(value)
+            _execution_secrets.add_scalar(json.dumps(value)[1:-1])
+
+
 def redact_daemon_output(text: str) -> str:
     from mimir.otel_credentials import is_sensitive_otlp_env
     from mimir.redaction import redact_text
@@ -283,7 +294,7 @@ def redact_daemon_output(text: str) -> str:
     for name, value in os.environ.items():
         if value and (is_sensitive_otlp_env(name, value) or name == "CLAUDE_CODE_OAUTH_TOKEN"):
             text = text.replace(value, "<redacted>")
-    return redact_text(text)
+    return redact_text(_execution_secrets.scrub_text(text))
 
 
 def _jwt_exp(token: str) -> int:

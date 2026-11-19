@@ -900,7 +900,17 @@ class LocalSubprocessComputeBackend:
                 if factory:
                     # Factory publishing/work-item inputs are not the leaf-build
                     # environment contract. Keep the installed CLI/plugin PATH.
-                    environment = {**_local_child_env(), **spec.env}
+                    if profile == "claude_factory":
+                        from ..claude_code import EPIC_CREDENTIALS, OAUTH_ENV
+                        allowed = {OAUTH_ENV, *EPIC_CREDENTIALS, "MIMIR_WORK_ITEM_JSON",
+                                   "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                                   "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"}
+                        if set(spec.env) - allowed or not spec.env.get(OAUTH_ENV, "").strip():
+                            raise ComputeLaunchError("invalid Claude factory environment")
+                        environment = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                                       **spec.env}
+                    else:
+                        environment = {**_local_child_env(), **spec.env}
                     runtime_path = environment.get("PATH")
                     environment.update(base_worker_environment(identifier))
                     # Captured by the controller from the trusted repository, never
@@ -1098,6 +1108,10 @@ class LocalSubprocessComputeBackend:
     async def logs(self, handle: LaunchHandle) -> str:
         self._job(handle)
         return ""
+
+    async def admit_factory_handle(self, handle: LaunchHandle) -> None:
+        self._job(handle)
+        await self._worker_clients[handle.identifier].admit_factory_handle(handle)
 
     def job_alive(self, handle: LaunchHandle) -> bool:
         """Whether the launched subprocess is still running (liveness probe for

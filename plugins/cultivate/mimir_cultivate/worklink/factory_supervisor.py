@@ -27,6 +27,10 @@ class FactoryReapRefused(RuntimeError):
     """The run's children could not be reaped within the teardown bound."""
 
 
+class _AdmissionStopped(Exception):
+    pass
+
+
 class _Adoptions:
     def __init__(self) -> None:
         self.seen: set[int] = set()
@@ -139,7 +143,7 @@ def _teardown(channel: socket.socket, payload: subprocess.Popen, adoptions: _Ado
         time.sleep(INTERVAL)
 
 
-def supervise(channel: socket.socket, argv: list[str]) -> int:
+def supervise(channel: socket.socket, argv: list[str], *, await_admission: bool = False) -> int:
     """Own one run; return 0 only after delivering its successful terminal report.
 
     Payload status uses subprocess conventions (negative signal numbers).
@@ -170,6 +174,16 @@ def supervise(channel: socket.socket, argv: list[str]) -> int:
         _enable_subreaper()
         if not _send(channel, {"kind": "ready"}, report=True):
             raise RuntimeError("could not report supervisor readiness")
+        if await_admission:
+            # The controller first persists the executor-issued PID/birth and
+            # host binding. EOF, stop, or malformed admission starts no payload.
+            admitted = False
+            while not stop_requested:
+                if select.select([channel], [], [], INTERVAL)[0]:
+                    admitted = channel.recv(MAX_PACKET) == b"admit"
+                    break
+            if not admitted:
+                raise _AdmissionStopped
         payload = subprocess.Popen(argv, start_new_session=True, close_fds=True)
         while not stop_requested:
             children = _observe(channel, payload.pid, adoptions)
@@ -185,6 +199,8 @@ def supervise(channel: socket.socket, argv: list[str]) -> int:
             if select.select([channel], [], [], INTERVAL)[0]:
                 channel.recv(MAX_PACKET)
                 break
+    except _AdmissionStopped:
+        exit_code = 125
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"[:500]
     finally:
@@ -217,7 +233,8 @@ def main(argv: list[str] | None = None) -> int:
     """Run with an inherited control socket descriptor followed by payload argv."""
     args = sys.argv[1:] if argv is None else argv
     with socket.socket(fileno=int(args[0])) as channel:
-        return supervise(channel, args[1:])
+        held = len(args) > 1 and args[1] == "--await-admission"
+        return supervise(channel, args[2:] if held else args[1:], await_admission=held)
 
 
 if __name__ == "__main__":

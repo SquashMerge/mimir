@@ -348,6 +348,7 @@ async def test_running_factory_reattaches_same_host_without_input(tmp_path, monk
         monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kwargs: Path(record.sandbox))
         calls = []
         class Factory:
+            host = "opencode"
             poll_interval_s = 0.001
             def status(self, *args, **kwargs):
                 calls.append("status")

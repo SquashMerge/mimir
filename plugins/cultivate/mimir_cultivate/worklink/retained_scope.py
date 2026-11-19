@@ -145,7 +145,7 @@ def derive_retained_factory_scope(
 def _factory_session_lock_is_fresh(record: FactoryRunRecord) -> bool:
     from .backends.feature_factory import FeatureFactoryBackend
 
-    status = FeatureFactoryBackend(entrypoint=record.launcher).status(
+    status = FeatureFactoryBackend(entrypoint=record.launcher, host=record.host).status(
         record.run_id, sandbox=Path(record.sandbox), launcher=record.launcher,
     )
     if (

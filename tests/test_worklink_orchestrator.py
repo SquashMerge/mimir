@@ -12833,6 +12833,8 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
     events: list[str] = []
 
     class Backend:
+        host = "opencode"
+
         def status(self, *args: object, **kwargs: object) -> Any:
             events.append("status")
             return terminal

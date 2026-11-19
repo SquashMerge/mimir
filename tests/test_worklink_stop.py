@@ -108,6 +108,43 @@ def test_startup_reconciliation_requires_contained_retirement(tmp_path, monkeypa
     assert retired == [state.handle_identifier]
 
 
+@pytest.mark.parametrize("verified", [False, True])
+def test_claude_factory_stop_requires_executor_retirement_not_daemon_cancel(tmp_path, monkeypatch, verified):
+    identifier = str(uuid.uuid4())
+    record = FactoryRunRecord(
+        run_id="chainlink-700", issue_id=700, attempt=1, repository="owner/repo",
+        base_ref="main", branch="feature/chainlink-700",
+        launcher="/opt/mimir-claude/lib/node_modules/claude-code-feature-factory/vendor/feature-factory/bin/factory.js",
+        sandbox=str(tmp_path / "operator/.factory-sandboxes/chainlink-700"),
+        host="claude_code", session="claude-code:" + identifier, lock_session="claude-code:" + identifier,
+        launch_generation=identifier, handle=LaunchHandle("local_subprocess", identifier, 42, 999999999),
+        status=None, observed_at=None, controller_phase="running")
+    save_factory_record(tmp_path, record)
+    retired, calls = [], []
+
+    async def cancel(self, selected):
+        retired.append(selected)
+        if not verified:
+            raise RuntimeError("worker retirement unknown")
+
+    monkeypatch.setattr(worker_client.WorkerClient, "cancel", cancel)
+    result = stop_worklink(tmp_path, 700,
+        runner=lambda args: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""))
+    assert retired == [identifier]
+    assert result.stopped == result.claim_released == verified
+    current = load_factory_record(tmp_path, record.run_id)
+    assert current.children_reaped == verified
+    assert current.opencode_session_id is None
+    marker = json.loads(control._operator_stop_path(tmp_path, 700).read_text())
+    assert marker["lock_session"] == record.lock_session
+    assert "opencode_session_id" not in marker
+    assert control.operator_stop_requested(tmp_path, 700, 1, lock_session=record.lock_session)
+    assert not control.operator_stop_requested(tmp_path, 700, 1, lock_session="claude-code:" + str(uuid.uuid4()))
+    if not verified:
+        assert current == record
+        assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_operator_stop_records_terminal_evidence_without_incident(tmp_path, monkeypatch):
     from mimir_cultivate.worklink import orchestrator
