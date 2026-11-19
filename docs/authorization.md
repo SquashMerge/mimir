@@ -317,9 +317,10 @@ authorization and IFC.
 - provenance metadata.
 
 Unproven and migrated data defaults to owner/visibility `legacy_admin`.
-Derived ACLs use `intersect_acl()`: mixed owners/domains, missing provenance,
-unknown visibility, or any legacy ambiguity collapses to the fail-closed
-`legacy_admin` ACL.
+Derived ACLs use `intersect_acl()`: mixed owners/domains, empty, missing, or
+non-mapping provenance (including JSON `null`, lists, strings, numbers, and
+booleans), unknown visibility, or any legacy ambiguity collapses to the
+fail-closed `legacy_admin` ACL regardless of source order.
 
 `get_authorization_scope()` accepts only an actual `AuthContext`; a caller-made
 `AuthorizationScope` is a query value, not authority. `authorization_predicate()`
