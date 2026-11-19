@@ -98,11 +98,23 @@ finally:
 '''
 
 
+def _build_context_helper(host: str = "opencode") -> str:
+    if host == "opencode":
+        return _BUILD_CONTEXT_HELPER
+    if host != "claude_code":
+        raise ValueError("Worklink host must be opencode or claude_code")
+    return _BUILD_CONTEXT_HELPER.replace(
+        "if not version or destination.exists()", "scripts = tuple(n for n in scripts if n not in "
+        "('worklink-opencode-service', 'worklink-daemon-gate', 'worklink-opencode-login'))\n"
+        "s6 = tuple(n for n in s6 if 'worklink-opencode' not in n)\n"
+        "if not version or destination.exists()")
+
+
 # Tool defaults are explicit; repository declarations take precedence.
 DEFAULT_NEXTEST_VERSION = "0.9.148"
 DEFAULT_UV_VERSION = "0.11.0"
 DEFAULT_SAGA_MODELS = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5",
-                       "codex-plus": "gpt-5.6-luna"}
+                       "codex-plus": "gpt-5.6-luna", "claude-code": "sonnet"}
 DEFAULT_SAGA_EFFORT = "low"
 LOCAL_MODEL = "voyageai/voyage-4-nano"
 EMBEDDING_MODELS = {"local": ("local", LOCAL_MODEL, 1024, None),
@@ -286,6 +298,9 @@ def _license_gate(args: argparse.Namespace) -> None:
 
 def validate(name: str, value: str) -> str:
     """Validate fields before any side effect or command interpolation."""
+    if (name in {"model_spec", "saga_model_spec"} and value.lstrip().startswith("claude-code:")
+            and any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise SetupError("Invalid Claude model specification; control characters are not allowed.")
     value = value.strip()
     if name == "repo":
         ok = valid_repository_slug(value) and all(p not in {".", ".."} for p in value.split("/"))
@@ -296,9 +311,11 @@ def validate(name: str, value: str) -> str:
     elif name == "branch":
         ok = bool(_BRANCH.fullmatch(value)) and ".." not in value and "//" not in value and not value.endswith("/")
     elif name == "model_spec":
-        ok = bool(re.fullmatch(r"(openai|anthropic|codex-plus):[A-Za-z0-9_.-]+", value))
+        ok = bool(re.fullmatch(r"(openai|anthropic|codex-plus):[A-Za-z0-9_.-]+", value)
+                  or re.fullmatch(r"claude-code:[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", value))
     elif name == "saga_model_spec":
-        ok = bool(re.fullmatch(r"(openai|anthropic|codex-plus):[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?", value))
+        ok = bool(re.fullmatch(r"(openai|anthropic|codex-plus):[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?", value)
+                  or re.fullmatch(r"claude-code:[A-Za-z0-9][A-Za-z0-9._/-]{0,255}(?::[A-Za-z0-9_.-]+)?", value))
         if ok and value.count(":") == 2:
             provider, _, effort = value.split(":")
             try:
@@ -437,6 +454,63 @@ def _secret(args: argparse.Namespace, name: str, explanation: str, *, previous: 
     if (not value and not optional_clear) or any(c in value for c in "\r\n\0"):
         raise SetupError(f"Invalid {name.replace('_', ' ')}; provide a single non-empty line.")
     return value
+
+
+def _claude_token(args: argparse.Namespace, *, previous: str | None = None) -> str:
+    """Subscription credentials come only from explicit input or the saved env."""
+    file = getattr(args, "claude_token_file", None)
+    stdin = getattr(args, "claude_token_stdin", False)
+    if file is not None and stdin:
+        raise SetupError("Choose only one source for claude token.")
+    guidance = "Run claude setup-token with the official CLI, then supply its OAuth token"
+    if file is not None or stdin:
+        return _secret(args, "claude_token", guidance + " (input hidden).")
+    if previous is not None:
+        value = previous.strip()
+    else:
+        if not sys.stdin.isatty():
+            raise SetupError(guidance + " using --claude-token-file or --claude-token-stdin.")
+        print(guidance + "; input is hidden.")
+        value = getpass.getpass("Claude OAuth token: ").strip()
+    if not value or any(c in value for c in "\r\n\0"):
+        raise SetupError("Invalid claude token; provide a single non-empty OAuth token from claude setup-token.")
+    return value
+
+
+def _worklink_toolchain() -> dict:
+    return {"host": "claude_code", "packages": {
+        "@anthropic-ai/claude-code": "2.1.326",
+        "claude-code-feature-factory": "0.14.1", "feature-factory": "0.14.1",
+    }}
+
+
+def _check_route(previous: dict, spec: str) -> None:
+    selected = previous.get("worklink_toolchain")
+    if selected is not None and selected != _worklink_toolchain():
+        raise SetupError("Invalid Worklink toolchain in manifest.json; use a fresh deployment directory.")
+    if previous and (selected is not None) != spec.startswith("claude-code:"):
+        raise SetupError("Cannot switch the Worklink route of an existing deployment, even with --force; "
+                         "use a fresh --deploy directory.")
+
+
+def _route_preflight(args: argparse.Namespace) -> tuple[Path, dict, str | None]:
+    """Resolve the selected target and refuse switches before any persistence."""
+    deploy = Path(_field(
+        args, "deploy", "Deployment directory: choose a private local directory for Docker files and web key.",
+        default=str(Path.cwd() / "cultivate-agent"),
+    )).expanduser().resolve()
+    manifest = deploy / "manifest.json"
+    if not manifest.exists():
+        return deploy, {}, None
+    try:
+        previous = json.loads(manifest.read_text())
+    except (OSError, ValueError):
+        raise SetupError("Cannot read previous settings from manifest.json; reconcile it before retrying.") from None
+    if not isinstance(previous, dict):
+        raise SetupError("Invalid manifest.json; reconcile it before retrying.")
+    spec = _field(args, "model_spec", "Model spec: claude-code:model, codex-plus:model, openai:model or anthropic:model.")
+    _check_route(previous, spec)
+    return deploy, previous, spec
 
 
 def _tracing_settings(args: argparse.Namespace, previous: dict, prior: dict[str, str], slug: str
@@ -721,8 +795,10 @@ def _heavy_lock_dir(args: argparse.Namespace, previous: dict) -> str | None:
 
 
 def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, codex: bool = False,
-                   heavy_lock_dir: str | None = None) -> str:
+                   heavy_lock_dir: str | None = None, worklink_host: str = "opencode") -> str:
     """Modify the scaffold structurally; fail closed on incompatible shapes."""
+    if worklink_host not in {"opencode", "claude_code"}:
+        raise SetupError("Worklink host must be opencode or claude_code.")
     try:
         # Scaffold's prose header contains a shell printf example with a literal
         # newline; parse the document from its top-level services key instead.
@@ -743,9 +819,16 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                             "XDG_CACHE_HOME": "/home/mimir/.cache",
                             "MIMIR_WORKLINK_AGENT_ID": "cultivate-worklink"})
         environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name
+        if worklink_host == "claude_code":
+            environment["MIMIR_ENABLE_CLAUDE_CODE"] = "1"
+            environment["MIMIR_WORKLINK_HOST"] = "claude_code"
+            environment["MIMIR_FACTORY_ENTRYPOINT"] = (
+                "/opt/mimir-claude/lib/node_modules/claude-code-feature-factory/vendor/feature-factory/bin/factory.js")
         volumes = ["home:/home/mimir/agent", "cache:/home/mimir/.cache", "workspace:/workspace",
                    "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink",
                    "worklink-daemon:/var/lib/mimir-worklink/daemon"]
+        if worklink_host == "claude_code":
+            volumes.pop()
         if codex:
             volumes.append("./codex:/home/mimir/.codex")
             environment["CODEX_HOME"] = "/home/mimir/.codex"
@@ -765,6 +848,8 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
             "volumes": volumes,
         }
         doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon")}
+        if worklink_host == "claude_code":
+            del doc["volumes"]["worklink-daemon"]
         return yaml.safe_dump(doc, sort_keys=False)
     except (KeyError, TypeError, AttributeError, yaml.YAMLError):
         raise SetupError("Incompatible scaffold Compose template; expected agent build and environment mapping.") from None
@@ -791,7 +876,8 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _image_identity(version: str, wheels: dict, architecture: str = "x86_64") -> str:
+def _image_identity(version: str, wheels: dict, architecture: str = "x86_64", *,
+                    worklink_host: str = "opencode") -> str:
     from packaging.version import Version, InvalidVersion
 
     try:
@@ -806,9 +892,14 @@ def _image_identity(version: str, wheels: dict, architecture: str = "x86_64") ->
     except (InvalidVersion, ValueError, TypeError, KeyError):
         raise SetupError("Invalid PyPI wheel identity in manifest.json; reconcile it before retrying.") from None
     label = re.sub(r"[^A-Za-z0-9_-]", "-", version)
-    return (label[:70] + "-" + wheels["mimir-agent"]["sha256"][:16] + "-" +
-            wheels["mimir-cultivate"]["sha256"][:16] +
-            ("-aarch64" if architecture == "aarch64" else ""))
+    identity = (label[:70] + "-" + wheels["mimir-agent"]["sha256"][:16] + "-" +
+                wheels["mimir-cultivate"]["sha256"][:16] +
+                ("-aarch64" if architecture == "aarch64" else ""))
+    if worklink_host == "claude_code":
+        # Independent deployments must not overwrite a legacy image's tag.
+        digest = _digest(identity + json.dumps(_worklink_toolchain(), sort_keys=True))
+        return label[:40] + "-claude-" + digest[:32]
+    return identity
 
 
 def _previous_image(deploy: Path, previous: dict) -> tuple[str, str] | None:
@@ -825,7 +916,8 @@ def _previous_image(deploy: Path, previous: dict) -> tuple[str, str] | None:
     if not isinstance(version, str) or not isinstance(wheels, dict) or not isinstance(tag, str):
         return None
     try:
-        identity = _image_identity(version, wheels, _DOCKER_ARCHITECTURES[docker_platform])
+        identity = _image_identity(version, wheels, _DOCKER_ARCHITECTURES[docker_platform],
+                                   worklink_host=previous.get("worklink_toolchain", {}).get("host", "opencode"))
     except SetupError:
         return None
     if (tag != f"mimir-cultivate-agent:{identity}-{previous.get('toolchain', '')}{str(previous.get('toolchain_version', '')).replace('.', '-')}"
@@ -917,7 +1009,7 @@ def toolchain_test_env(kind: str) -> dict[str, str]:
 def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
                         git_auth: list[str], force: bool = False,
                         toolchain: str | None = None, tracker: dict | None = None,
-                        previous_tracker: dict | None = None) -> bool:
+                        previous_tracker: dict | None = None, model_spec: str | None = None) -> bool:
     """Reconcile the dedicated, controller-owned base and Worklink settings."""
     from .worklink.backends.registry import BackendRegistry, WorklinkConfig, _derive_bash_allowlist
 
@@ -983,6 +1075,19 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         allowlist = ['git *', entry['test_command']]
     config['backends'] = {'opencode': {'bash_allowlist': allowlist,
                                      'test_env': toolchain_test_env(toolchain) if toolchain else {}}}
+    if model_spec is not None and model_spec.startswith("claude-code:"):
+        from .claude_code import bash_rules, resolve_model
+        from .worklink.claude_factory_host import DEFAULT_ENTRYPOINT
+        model = resolve_model(model_spec)
+        bash_rules(entry['test_command'], allowlist)
+        config['defaults']['backend'] = 'claude_code'
+        config['backends'] = {
+            'claude_code': {'model': model, 'bash_allowlist': allowlist,
+                            'pass_env': ['CLAUDE_CODE_OAUTH_TOKEN',
+                                         *(toolchain_test_env(toolchain) if toolchain else {})]},
+            'feature_factory': {'host': 'claude_code', 'model': model,
+                                'entrypoint': DEFAULT_ENTRYPOINT},
+        }
     def render(section: dict | None) -> str:
         rendered = dict(config)
         if section:
@@ -1126,8 +1231,9 @@ def _saga_settings(spec: str, embedding: str) -> dict[str, dict[str, object]]:
     kind, _, dim, key_env = EMBEDDING_MODELS[embedding.split(":", 1)[0]]
     embed_model = LOCAL_MODEL if embedding == "local" else embedding.split(":", 1)[1]
     llm: dict[str, object] = {"provider": "codex_plus" if provider == "codex-plus" else
+                              "claude_code" if provider == "claude-code" else
                               "anthropic" if provider == "anthropic" else "openai_compat", "model": model}
-    if provider != "codex-plus":
+    if provider not in {"codex-plus", "claude-code"}:
         llm["api_key_env"] = provider.upper() + "_API_KEY"
     # Fresh installs must omit temperature regardless of model or effort.
     # Custom sampling is retained only for existing operator configurations.
@@ -1347,6 +1453,19 @@ def toolchain_probe_environment(config) -> dict[str, str]:
     from .worklink.backends.opencode import validate_test_env
     from .worklink.compute import WorkSpec, _enabled_child_env
 
+    if 'claude_code' in config.backend_settings:
+        from .worklink.execution_policy import CLAUDE_LEAF
+        settings = config.backend_settings['claude_code']
+        # Match the leaf's declared tool variables, without sending OAuth to a
+        # compiler/version probe or synthesizing OpenCode configuration.
+        tool_names = {'RUSTUP_HOME', 'CARGO_HOME', 'UV_PYTHON_INSTALL_DIR'}
+        test_env = {name: os.environ[name] for name in settings.get('pass_env', ())
+                    if name in tool_names and name in os.environ}
+        validate_test_env(test_env)
+        spec = WorkSpec(issue_id=0, attempt=1, repo_url='', base_ref='', branch='',
+                        prompt='', rules=None, test_command='', backend='claude_code', timeout_s=30,
+                        env=test_env, backend_config={'pass_env': tuple(test_env)}, execution=CLAUDE_LEAF)
+        return _enabled_child_env(spec, 'setup-toolchain-probe')
     settings = config.backend_settings.get('opencode', {})
     test_env = settings.get('test_env', {})
     validate_test_env(test_env)
@@ -1457,7 +1576,10 @@ def _verify_alert(url: str, owner_key: str, adapter: str) -> None:
 def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, version: str,
              system_packages: list[str] | None = None, alert_adapter: str = "none",
               *, trackers: tuple[str, ...] = ()) -> None:
-    _verify_opencode_daemon(deploy)
+    manifest_path = deploy / "manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    if manifest.get("worklink_toolchain", {}).get("host", "opencode") == "opencode":
+        _verify_opencode_daemon(deploy)
     url = f"http://127.0.0.1:{port}"
     for attempt in range(60):
         try:
@@ -1556,8 +1678,8 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("owner", "Canonical owner identity for authorized web chat."),
         ("display-name", "Owner's human-readable name."),
         ("owner-email", "Owner's email identity."),
-        ("model-spec", "provider:model (codex-plus:... subscription, openai:... or anthropic:...)."),
-        ("saga-model-spec", "Memory model (codex-plus:model[:effort], openai:model[:effort] or anthropic:model[:effort])."),
+        ("model-spec", "provider:model (claude-code:... or codex-plus:... subscription, openai:... or anthropic:...)."),
+        ("saga-model-spec", "Memory model (claude-code:model[:effort], codex-plus:model[:effort], openai:model[:effort] or anthropic:model[:effort])."),
         ("embedding", "local, openai:model, or voyage:model (default: local)."),
         ("otlp-endpoint", "OTLP http(s) base URL (without /v1/traces); none disables saved tracing."),
         ("otel-service-name", "Tracing service name (default: cultivate-<agent slug>)."),
@@ -1581,6 +1703,9 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     for name in ("github-token", "model-key", "saga-model-key", "embedding-key", "otlp-headers"):
         setup.add_argument("--" + name + "-file", help="Read secret from a mode-600 file (never from argv).")
         setup.add_argument("--" + name + "-stdin", action="store_true", help="Read one secret line from stdin.")
+    claude = setup.add_mutually_exclusive_group()
+    claude.add_argument("--claude-token-file", help="Read the OAuth token from official claude setup-token from a mode-600 file.")
+    claude.add_argument("--claude-token-stdin", action="store_true", help="Read the OAuth token from official claude setup-token from one stdin line.")
     setup.add_argument("--tracker", action="append", choices=_TRACKER_CHOICES + ("none",),
                        help="Triage issues assigned to the bot from this tracker (repeatable: github-issues, linear, jira); "
                             "installs the tracker-poller skill and writes the tracker: section of worklink.yaml. "
@@ -1630,6 +1755,7 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verify) -> None:
+    deploy, previous, preflight_spec = _route_preflight(args)
     requested_platform = getattr(args, "platform", None)
     if requested_platform is not None and requested_platform not in _DOCKER_ARCHITECTURES:
         raise SetupError("Unsupported Docker platform; choose linux/amd64 or linux/arm64.")
@@ -1654,14 +1780,6 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     display = _field(args, "display_name", "Owner display name: choose the name shown in chat.")
     owner_email = _field(args, "owner_email", "Owner email: your email address, used for identity reconciliation.")
     print(PAT_HELP)
-    deploy = Path(_field(args, "deploy", "Deployment directory: choose a private local directory for Docker files and web key.", default=str(Path.cwd() / "cultivate-agent"))).expanduser().resolve()
-    manifest_path = deploy / "manifest.json"
-    try:
-        previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    except (OSError, ValueError):
-        raise SetupError("Cannot read previous settings from manifest.json; reconcile it before retrying.") from None
-    if not isinstance(previous, dict):
-        raise SetupError("Invalid manifest.json; reconcile it before retrying.")
     if previous and previous.get("mimir_install_mode") != "pypi":
         raise SetupError("Source-era Cultivate deployments cannot be upgraded, even with --force; create a new --deploy directory and migrate operator data explicitly.")
     saved_platform = previous.get("docker_platform")
@@ -1702,6 +1820,12 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         if gate != "ci":
             raise SetupError("--quick-gate-command is only valid with --worklink-gate ci.")
     heavy_lock_dir = _heavy_lock_dir(args, previous)
+    spec = preflight_spec or _field(args, "model_spec", "Model spec: choose claude-code:model or codex-plus:model for a subscription, "
+                                   "or API-backed openai:model or anthropic:model; used for agent turns.")
+    _check_route(previous, spec)
+    provider = spec.split(":", 1)[0]
+    claude = provider == "claude-code"
+    host = "claude_code" if claude else "opencode"
     if deploy.exists() and (not deploy.is_dir() or deploy.is_symlink()):
         raise SetupError("Deployment directory must be a real directory; choose a new --deploy path.")
     existing_env = (deploy / "compose.env").read_text() if (deploy / "compose.env").is_file() else ""
@@ -1730,9 +1854,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         tracker_env["JIRA_EMAIL"] = email
         tracker_env["JIRA_API_TOKEN"] = _secret(args, "jira_api_token", "Jira service account API token (input hidden).",
                                                 previous=prior.get("JIRA_API_TOKEN"))
-    spec = _field(args, "model_spec", "Model spec: choose codex-plus:model for a ChatGPT/Codex subscription, or API-backed openai:model or anthropic:model; used for agent turns.")
-    provider = spec.split(":", 1)[0]
-    key_name = provider.upper() + "_API_KEY" if provider != "codex-plus" else None
+    key_name = provider.upper() + "_API_KEY" if provider not in {"codex-plus", "claude-code"} else None
+    claude_token = _claude_token(args, previous=prior.get("CLAUDE_CODE_OAUTH_TOKEN")) if claude else None
     model_key = (_secret(args, "model_key", f"Model key: obtain it in your {provider} API console; input is hidden.",
                          previous=prior.get(key_name)) if key_name else None)
     saga_spec = _field(args, "saga_model_spec",
@@ -1741,7 +1864,11 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                         f"Your agent's {spec} is also available if you prefer it.",
                         default=provider + ":" + DEFAULT_SAGA_MODELS[provider] + ":" + DEFAULT_SAGA_EFFORT)
     saga_provider = saga_spec.split(":", 1)[0]
-    saga_key_env = saga_provider.upper() + "_API_KEY" if saga_provider != "codex-plus" else None
+    saga_key_env = saga_provider.upper() + "_API_KEY" if saga_provider not in {"codex-plus", "claude-code"} else None
+    if claude and saga_provider == "anthropic":
+        raise SetupError("The Claude subscription route does not use ANTHROPIC_API_KEY; choose claude-code for Saga.")
+    if not claude and saga_provider == "claude-code":
+        raise SetupError("Claude Saga requires the claude-code agent route; use a fresh deployment.")
     extra_keys = {}
     if saga_key_env and saga_key_env != key_name:
         extra_keys[saga_key_env] = _secret(args, "saga_model_key", "Saga model API key (input hidden).", previous=prior.get(saga_key_env))
@@ -1764,7 +1891,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
               for wheel in (release.agent, release.cultivate)}
     if previous and requested_version == previous.get("mimir_version") and wheels != previous.get("wheels"):
         raise SetupError("Resolved wheels differ from manifest.json for the saved Mimir version; refusing changed release files.")
-    identity = _image_identity(mimir_version, wheels, architecture)
+    identity = _image_identity(mimir_version, wheels, architecture, worklink_host=host)
     files = {name: _content(repo, branch, name, token, request) for name in
              ("rust-toolchain.toml", "Cargo.toml", "package.json", "pyproject.toml", "uv.lock", ".python-version",
               ".github/workflows/rust.yml", ".github/workflows/ci.yml")}
@@ -1806,6 +1933,15 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build",
                   "--build-arg MIMIR_ENABLE_OPENCODE=1",
                   "--build-arg MIMIR_EXTRAS=" + ",".join(sorted(extras))]
+    context_helper = _build_context_helper(host)
+    provision = _PROVISION
+    if claude:
+        build_args = [arg for arg in build_args if arg != "--build-arg MIMIR_ENABLE_OPENCODE=1"]
+        build_args.extend(["--build-arg MIMIR_WORKLINK_HOST=claude_code",
+                           "--build-arg MIMIR_ENABLE_OPENCODE=0", "--build-arg MIMIR_ENABLE_CLAUDE_CODE=1"])
+        provision = _PROVISION.replace("previous_tracker=m.get('previous_tracker_config'))",
+                                       "previous_tracker=m.get('previous_tracker_config'), "
+                                       "model_spec=os.environ['MIMIR_MODEL_SPEC'])")
     interpreter = str(Path(sys.executable).absolute())
     if not Path(interpreter).is_file():
         raise SetupError("Cannot record the setup Python interpreter for later builds.")
@@ -1820,7 +1956,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                      + "\"$interpreter\" -I -S -c 'import hashlib, pathlib, sys; "
                      + "sys.exit(0 if hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() == sys.argv[2] "
                      + "else \"build context helper differs from setup; refusing rebuild\")' "
-                     + "build_context.py " + _digest(_BUILD_CONTEXT_HELPER) + "\n"
+                     + "build_context.py " + _digest(context_helper) + "\n"
                      + '"$interpreter" -I -S build_context.py '
                     + '"$context" ' + '"wheels/' + release.agent.filename + '" "wheels/' + release.cultivate.filename
                     + '" "' + mimir_version + '" "' + release.agent.sha256 + '" "' + release.cultivate.sha256 + '"\n'
@@ -1835,9 +1971,9 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     provenance = ("# MIMIR_INSTALL_MODE=pypi MIMIR_VERSION=" + mimir_version + " MIMIR_AGENT_SHA256="
                   + release.agent.sha256 + " MIMIR_CULTIVATE_SHA256=" + release.cultivate.sha256 + "\n")
     compose = provenance + render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex,
-                                          heavy_lock_dir=heavy_lock_dir)
-    generated = {"compose.yml": compose, ".gitignore": "*\n", "build_context.py": _BUILD_CONTEXT_HELPER,
-                 "provision.py": _PROVISION, "compose.provision.yml": provenance + _PROVISION_COMPOSE}
+                                          heavy_lock_dir=heavy_lock_dir, worklink_host=host)
+    generated = {"compose.yml": compose, ".gitignore": "*\n", "build_context.py": context_helper,
+                 "provision.py": provision, "compose.provision.yml": provenance + _PROVISION_COMPOSE}
     _check_generated(deploy, generated, previous, force=bool(getattr(args, "force", False)))
     # Query the old running container before publishing the new Compose image.
     was_running = bool(run(["docker", "compose", "ps", "-q", "agent"], cwd=deploy)) if old_image else False
@@ -1878,9 +2014,11 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     }
     if key_name:
         env_updates[key_name] = model_key
+    if claude_token is not None:
+        env_updates["CLAUDE_CODE_OAUTH_TOKEN"] = claude_token
     api_key = _env(deploy, env_updates,
                    manage_alerts=alert_adapter != "none" or "operator_alert_adapter" in previous,
-                   managed_model=provider == "codex-plus", manage_tracing=True)
+                   managed_model=provider in {"codex-plus", "claude-code"}, manage_tracing=True)
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
@@ -1900,6 +2038,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                     "toolchain_version": version, "layer_tag": layer_tag, "docker_platform": docker_platform,
                     "generated_sha256": {name: _digest(text) for name, text in generated.items()},
                     **(tracing_manifest if tracing_env else {})}
+    if claude:
+        manifest["worklink_toolchain"] = _worklink_toolchain()
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     # The provision script and manifest are mounted read-only for a one-shot
     # non-root container, never into the long-running agent.
@@ -1932,7 +2072,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
             build_pypi_context(context, agent_wheel=wheel_dir / release.agent.filename,
                                cultivate_wheel=wheel_dir / release.cultivate.filename,
                                version=mimir_version, agent_sha256=release.agent.sha256,
-                               cultivate_sha256=release.cultivate.sha256)
+                               cultivate_sha256=release.cultivate.sha256,
+                               **({"worklink_host": host} if claude else {}))
         except (ValueError, OSError) as exc:
             raise SetupError("Cannot assemble verified wheel Docker context; check released wheel resources.") from None
         docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", tag, *sum((["--build-arg", arg.removeprefix("--build-arg ")] for arg in build_args), []), str(context)],
@@ -1966,7 +2107,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         # s6 starts the agent and daemon independently; setup and daemon-backed
         # workloads seed/reconcile the agent's login before checking readiness.
         docker_step("up", ["docker", "compose", "up", "-d", "agent"])
-        _verify_opencode_daemon(deploy, run=run)
+        if not claude:
+            _verify_opencode_daemon(deploy, run=run)
     if old_image and old_image[1] != layer_tag:
         print("Previous agent image retained: " + old_image[1])
         print("Rollback (from " + str(deploy) + "): docker compose -f compose.yml -f <(printf 'services:\\n  agent:\\n    image: "

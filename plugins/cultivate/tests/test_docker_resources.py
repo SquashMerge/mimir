@@ -217,6 +217,7 @@ def test_shared_service_script_provisions_each_layout(tmp_path: Path, monkeypatc
     for name in ("worklink-opencode-service", "worklink-daemon-gate", "worklink-opencode-login"):
         (resources / name).write_bytes((SCRIPTS / name).read_bytes())
     (resources / "opencode-enabled").write_text("1\n")
+    (resources / "worklink-host").write_text("opencode\n")
     source = (SCRIPTS / "service.sh").read_text()
     source = source.replace("/etc/s6-overlay/s6-rc.d", str(s6)).replace(
         "/usr/local/libexec", str(libexec)).replace("/usr/local/bin", str(bindir)).replace(
@@ -293,6 +294,93 @@ def _assert_daemon_resource_chain(resources, wheels, sdists, contexts) -> None:
 
 def test_sdist_wheel_source_free_context_preserves_daemon_resources(daemon_packages) -> None:
     _assert_daemon_resource_chain(*daemon_packages)
+
+
+def test_claude_source_wheel_library_saved_helper_and_scaffold_parity(
+        daemon_packages, tmp_path, monkeypatch):
+    import hashlib
+    from mimir.plugin_dockerfile import build_pypi_context, worklink_resources
+    from mimir_cultivate.setup import _build_context_helper
+
+    resources, wheels, sdists, _ = daemon_packages
+    version = wheels["mimir-agent"].name.split("-")[1]
+    hashes = {key: hashlib.sha256(path.read_bytes()).hexdigest() for key, path in wheels.items()}
+    library = tmp_path / "claude-library"
+    build_pypi_context(library, agent_wheel=wheels["mimir-agent"], cultivate_wheel=wheels["mimir-cultivate"],
+                       version=version, agent_sha256=hashes["mimir-agent"],
+                       cultivate_sha256=hashes["mimir-cultivate"], worklink_host="claude_code")
+    helper = tmp_path / "claude-helper.py"
+    helper.write_text(_build_context_helper("claude_code"))
+    saved = tmp_path / "claude-saved"
+    subprocess.run([sys.executable, "-I", "-S", str(helper), str(saved), str(wheels["mimir-agent"]),
+                    str(wheels["mimir-cultivate"]), version, hashes["mimir-agent"], hashes["mimir-cultivate"]],
+                   check=True, capture_output=True, text=True)
+    def inventory(root):
+        return {p.relative_to(root).as_posix(): (p.read_bytes(), stat.S_IMODE(p.stat().st_mode))
+                for p in root.rglob("*") if p.is_file()}
+    assert inventory(library) == inventory(saved)
+    scripts, s6 = worklink_resources("claude_code")
+    assert len(scripts) == 7 and len(s6) == 10
+    selected = [row for row in resources if "worklink-opencode" not in row[2]
+                and not row[2].endswith("/worklink-daemon-gate")]
+    _assert_daemon_resource_chain(selected, wheels, sdists, (library, saved))
+    assert not any("worklink-opencode" in name or "worklink-daemon-gate" in name
+                   for name in inventory(library))
+
+    home = tmp_path / "scaffold"
+    home.mkdir()
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kw: (_candidate(),))
+    scaffold(home, worklink_host="claude_code")
+    context = home / ".mimir-scaffold"
+    for name in scripts:
+        path = context / "cultivate-docker" / name
+        assert path.read_bytes() == (SCRIPTS / name).read_bytes()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert {p.relative_to(context / "s6-rc.d").as_posix()
+            for p in (context / "s6-rc.d").rglob("*") if p.is_file()} == set(s6)
+    for name in s6:
+        path = context / "s6-rc.d" / name
+        assert path.read_bytes() == (library / "deploy/s6-overlay/s6-rc.d" / name).read_bytes()
+        assert stat.S_IMODE(path.stat().st_mode) == (0o755 if name.endswith("/run") else 0o644)
+    # Root resources are copied intact; the workspace image then binds its
+    # start.sh bootstrap before service.sh applies executable permissions.
+    import json
+    from mimir.scaffold_docker import _mimir_service_run
+    docker = (home / "Dockerfile").read_text()
+    instruction, = [line[4:] for line in docker.splitlines()
+                    if line.startswith('RUN ["python3"') and "s6-rc.d/mimir/run" in line]
+    argv = json.loads(instruction)
+    output = tmp_path / "workspace-run"
+    argv[-1] = argv[-1].replace("/etc/s6-overlay/s6-rc.d/mimir/run", str(output))
+    subprocess.run(argv, check=True, capture_output=True)
+    assert output.read_text() == _mimir_service_run(cultivate=True)
+
+
+def test_claude_service_installs_no_daemon_or_login_gate(tmp_path):
+    s6 = tmp_path / "s6"
+    for name in ("mimir", "watchdog", "worklink-execd", "worklink-opencode"):
+        path = s6 / name / "run"
+        path.parent.mkdir(parents=True)
+        path.write_text("#!/bin/sh\n")
+    bundle = s6 / "user/contents.d"
+    bundle.mkdir(parents=True)
+    (bundle / "worklink-opencode").touch()
+    resources = tmp_path / "resources"
+    resources.mkdir()
+    (resources / "opencode-enabled").write_text("0\n")
+    (resources / "worklink-host").write_text("claude_code\n")
+    libexec = tmp_path / "libexec"
+    bindir = tmp_path / "bin"
+    source = (SCRIPTS / "service.sh").read_text().replace(
+        "/etc/s6-overlay/s6-rc.d", str(s6)).replace("/usr/local/libexec", str(libexec)).replace(
+        "/usr/local/bin", str(bindir)).replace("/opt/cultivate-docker", str(resources)).replace("-o root -g root ", "")
+    subprocess.run(["sh", "-c", source], check=True, capture_output=True)
+    assert {p.name for p in libexec.iterdir()} == {"worklink-execd"}
+    assert not bindir.exists()
+    assert not (s6 / "worklink-opencode").exists()
+    assert not (bundle / "worklink-opencode").exists()
+    for name in ("mimir", "watchdog", "worklink-execd"):
+        assert (s6 / name / "run").stat().st_mode & stat.S_IXUSR
 
 
 def test_mutation_sdist_executable_bits_lost(daemon_packages, tmp_path: Path) -> None:

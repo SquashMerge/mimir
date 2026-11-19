@@ -11,6 +11,36 @@ from tests.timing import HANG_GUARD_SECONDS
 from mimir.saga import _llm
 
 
+@pytest.mark.asyncio
+async def test_saga_claude_preserves_official_sdk_cli_resolution(monkeypatch):
+    from pathlib import Path
+    claude_agent_sdk = pytest.importorskip("claude_agent_sdk")
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+    captured = []
+    class Client:
+        def __init__(self, *, options):
+            captured.append(options)
+
+        async def connect(self):
+            pass
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", Client)
+    runner = _llm._AsyncClaudeRunner(recycle_after=10)
+    try:
+        await runner._reset_client(model="sonnet", system="offline")
+        options, = captured
+        assert options.model == "sonnet" and options.system_prompt == "offline"
+        assert options.cli_path is None
+        transport = SubprocessCLITransport(prompt="offline construction", options=options)
+        assert Path(transport._find_cli()) == Path(claude_agent_sdk.__file__).parent / "_bundled/claude"
+    finally:
+        await runner.aclose()
+
+
 @pytest.mark.parametrize('provider', ['openai_compat', 'anthropic'])
 @pytest.mark.parametrize('sampling,effort', [
     ('default', 'low'), ('custom', 'low'), ('default', None), ('custom', None),
