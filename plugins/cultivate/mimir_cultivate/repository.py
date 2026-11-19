@@ -5920,8 +5920,16 @@ def checkout_scoped_pr(
     runtime: ToolRuntime[AuthContext],
 ) -> dict[str, Any]:
     """Shared checkout implementation for the host and the callable tool."""
+    from mimir._deepagents_subagent_auth import is_delegated_execution
     from .forge import _client, pr_trust_verdict, remediation_checkout_preflight
 
+    # Acquisition can replace/revoke the shared lease, even on attestation
+    # failure. Delegates use the parent's checkout, not its lifecycle authority.
+    if is_delegated_execution():
+        raise ToolPolicyRefusal(
+            "repository checkout rejected: checkout lifecycle belongs to the parent turn; "
+            "use the parent's existing checkout"
+        )
     context = getattr(runtime, "context", None) if runtime is not None else None
     state, stopped = remediation_checkout_preflight(context, repository, pull_request)
     if stopped is not None:
@@ -6049,7 +6057,9 @@ def repo_cleanup(
     pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Revoke and remove this turn's exact active checkout lease."""
+    """Remove this turn's lease; delegated requests are deferred to turn end."""
+    from mimir._deepagents_subagent_auth import is_delegated_execution
+
     if _retained_scope(runtime, repository, pull_request) is not None:
         raise _retained_refusal("repo_cleanup")
     state = _state(runtime, repository, pull_request)
@@ -6058,12 +6068,48 @@ def repo_cleanup(
         raise ToolPolicyRefusal("repository cleanup rejected: no active checkout lease")
     _refuse_recovery(lease)
     _publish_attested_lease_result(runtime, state)
+    if is_delegated_execution():
+        state.defer_checkout_cleanup()
+        return {"status": "deferred", "scope_id": state.action_scope.scope_id}
     try:
         removed = cleanup_pr_checkout_lease(lease, review_state=state)
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
         raise ToolException(f"repository cleanup rejected: {detail}") from exc
     return {"status": "cleaned", "removed": removed, "scope_id": state.action_scope.scope_id}
+
+
+def cleanup_deferred_pr_checkouts(context: AuthContext) -> None:
+    """Drain delegate requests only after the parent finishes using its grants.
+
+    Reuse exact-lease cleanup, including unpublished-work preservation. Leases
+    with no cleanup request keep their existing recovery/reaper lifecycle.
+    """
+    states = [context.repo_review_state]
+    for registry in (context.repo_pr_scope_registry, context.server_discovered_pr_states):
+        if registry is not None:
+            states.extend(registry.review_states)
+    seen: set[int] = set()
+    for state in states:
+        if state is None or id(state) in seen:
+            continue
+        seen.add(id(state))
+        if state.checkout_cleanup_deferred and state.checkout_lease is not None:
+            try:
+                cleanup_pr_checkout_lease(state.checkout_lease, review_state=state)
+            except (OSError, RuntimeError, ValueError) as exc:
+                # Leave the lease/request for the unchanged expiry reaper.
+                # One failure must not strand the other deferred requests.
+                from mimir.event_logger import log_event_sync
+
+                try:
+                    log_event_sync(
+                        "pr_checkout_deferred_cleanup_failed",
+                        scope_id=state.action_scope.scope_id,
+                        error=_redact_git_output(str(exc)),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not strand cleanup
+                    log.warning("pr_checkout_deferred_cleanup_failed: %s", state.action_scope.scope_id)
 
 
 @tool

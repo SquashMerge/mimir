@@ -15,7 +15,18 @@ from ._context import get_current_turn, is_same_turn_auth_carrier
 _subagent_auth_context: ContextVar[AuthContext | None] = ContextVar(
     "mimir_subagent_auth_context", default=None
 )
+_delegated_execution: ContextVar[bool] = ContextVar("mimir_delegated_execution", default=False)
 _PATCH_MARKER = "_mimir_auth_context_patched"
+
+
+def is_delegated_execution() -> bool:
+    """Task-local lifecycle restriction, never a source of authorization.
+
+    Independent of the auth carrier so a nested task with missing/invalid auth
+    cannot regain parent ownership. Async tasks and tool worker threads inherit
+    the marker; each task wrapper restores it even on failure.
+    """
+    return _delegated_execution.get()
 
 
 class _AuthContextRunnable(Runnable):
@@ -71,9 +82,11 @@ def _wrap_task_tool(task_tool: Any) -> Any:
         token = _subagent_auth_context.set(
             carrier if isinstance(carrier, AuthContext) else None
         )
+        delegated_token = _delegated_execution.set(True)
         try:
             return original_func(*task_args, **task_kwargs)
         finally:
+            _delegated_execution.reset(delegated_token)
             _subagent_auth_context.reset(token)
 
     @wraps(original_coroutine)
@@ -86,9 +99,11 @@ def _wrap_task_tool(task_tool: Any) -> Any:
         token = _subagent_auth_context.set(
             carrier if isinstance(carrier, AuthContext) else None
         )
+        delegated_token = _delegated_execution.set(True)
         try:
             return await original_coroutine(*task_args, **task_kwargs)
         finally:
+            _delegated_execution.reset(delegated_token)
             _subagent_auth_context.reset(token)
 
     task_tool.func = task

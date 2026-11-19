@@ -268,9 +268,10 @@ class CultivateProvider:
         )
         registrar.register_retained_checkout_operation(_retained_checkout_operation)
         registrar.register_turn_hook("tool_readiness", lambda: not github_identity_is_degraded())
-        from .repository import checkout_scoped_pr
+        from .repository import checkout_scoped_pr, cleanup_deferred_pr_checkouts
 
         registrar.register_turn_hook("pr_checkout", checkout_scoped_pr)
+        registrar.register_turn_hook("pr_checkout_cleanup", cleanup_deferred_pr_checkouts)
         registrar.register_server_hook(
             "github_identity_callback",
             lambda callback: set_github_identity_degraded_callback(

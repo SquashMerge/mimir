@@ -304,6 +304,263 @@ def test_provider_creates_and_cleans_up_checkout(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("cleanup_by", ["parent", "turn_end"])
+def test_delegated_cleanup_preserves_parent_pr_grants_until_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool, cleanup_by: str,
+) -> None:
+    from deepagents.middleware.subagents import _build_task_tool
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables import Runnable
+    from mimir._deepagents_subagent_auth import _AuthContextRunnable, _wrap_task_tool
+    from mimir.access_control import ToolRegistry
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate import forge
+    from mimir_cultivate.forge import ReviewProjection, ReviewVerdict
+    from tests.test_structured_subagents import _task_runtime
+
+    selected = load_plugins(enable="cultivate").policy
+    _origin, _source, scope, state = _repo_scope_and_state(
+        tmp_path, event_type="pr_review_requested",
+        allowed_operations=frozenset({"repo.inspect", "repo.checkout", "pr.review"}),
+    )
+    lease = state.checkout_lease
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    auth = replace(
+        _untainted_ifc_auth(), principal=scope.principal, canonical_principal=scope.principal,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    auth = _repo_granted_auth(auth, scope, state, follow_on=True, policy=selected)
+    submitted = []
+
+    def submit_review(bound, verdict, body):
+        submitted.append((bound, verdict, body))
+        return ReviewProjection("review", "mimir-bot", "COMMENTED", body, "now", bound.observed_head_sha)
+
+    client = SimpleNamespace(
+        submit_review=submit_review,
+        get_pull_request_snapshot=lambda *_: SimpleNamespace(
+            repo=scope.canonical_repo, number=scope.pr_number, state="open",
+            head_sha=scope.observed_head_sha,
+        ),
+    )
+    monkeypatch.setattr(forge, "_client", lambda _: client)
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
+    cleanup_results = []
+
+    class Reviewer(Runnable):
+        def invoke(self, input, config=None, *, context=None, **kwargs):
+            assert context.repo_review_state is state
+            cleanup_results.append(repository.repo_cleanup.func(
+                scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=context),
+            ))
+            return {"messages": [AIMessage(content="Read-only review complete")]}
+
+        async def ainvoke(self, input, config=None, *, context=None, **kwargs):
+            # Match LangChain's thread-offloaded sync repository tools.
+            return await asyncio.to_thread(self.invoke, input, config, context=context)
+
+    task = _wrap_task_tool(_build_task_tool([{
+        "name": "reviewer", "description": "Read-only reviewer",
+        "runnable": _AuthContextRunnable(Reviewer()),
+    }]))
+    turn = _ifc_turn(auth)
+    token = set_current_turn(turn)
+    try:
+        with policy_scope(selected):
+            kwargs = dict(description="Review this PR", subagent_type="reviewer", runtime=_task_runtime(auth))
+            if async_mode:
+                asyncio.run(task.coroutine(**kwargs))
+            else:
+                task.func(**kwargs)
+
+            # Check the real scoped-grant boundary first: restoring eager
+            # revocation must fail with the incident's repo_pr_grant_denied,
+            # not merely a different cleanup status.
+            args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+            for name in ("pr_metadata", "pr_inline_review_comment", "pr_submit_review"):
+                decision = ToolRegistry().authorize_tool(name, auth, enforce=True, arguments=args, policy=selected)
+                assert decision.allowed, decision.reason
+
+            gate = BudgetGateMiddleware(policy=selected)
+
+            def handler(request):
+                result = forge.pr_submit_review.func(
+                    **args, verdict=ReviewVerdict.COMMENT, body="Reviewed; no findings",
+                    runtime=SimpleNamespace(context=auth),
+                )
+                return ToolMessage(content=json.dumps(result), tool_call_id=request.tool_call["id"])
+
+            result = gate.wrap_tool_call(_make_request(
+                "pr_submit_review", "parent-review", auth,
+                {**args, "verdict": "comment", "body": "Reviewed; no findings"},
+            ), handler)
+            assert result.status == "success", result.content
+            assert submitted == [(scope, ReviewVerdict.COMMENT, "Reviewed; no findings")]
+            assert cleanup_results == [{"status": "deferred", "scope_id": scope.scope_id}]
+            assert state.checkout_lease is lease and lease.is_active and lease.path.is_dir()
+            if cleanup_by == "parent":
+                assert repository.repo_cleanup.func(
+                    **args, runtime=SimpleNamespace(context=auth),
+                )["removed"] is True
+            else:
+                selected.turn_hooks[("cultivate", "pr_checkout_cleanup")](auth)
+            assert state.checkout_lease is None and not lease.is_active
+            assert not lease.path.exists()
+            # Repeated turn-end cleanup is harmless.
+            selected.turn_hooks[("cultivate", "pr_checkout_cleanup")](auth)
+    finally:
+        reset_current_turn(token)
+
+
+def test_deferred_cleanup_only_drains_requested_states(tmp_path: Path) -> None:
+    from mimir_cultivate.policy import ServerDiscoveredPRStates
+
+    states = []
+    for name in ("requested", "unrequested"):
+        root = tmp_path / name
+        root.mkdir()
+        states.append(_repo_scope_and_state(root)[3])
+    requested, unrequested = states
+    leases = [state.checkout_lease for state in states]
+    requested.defer_checkout_cleanup()
+    discovered = ServerDiscoveredPRStates()
+    discovered.remember(requested)
+    # Deduplicate the requested state's aliases and keep an unrequested lease.
+    auth = replace(
+        _untainted_ifc_auth(), repo_review_state=requested,
+        server_discovered_pr_states=discovered,
+        repo_pr_scope_registry=RepoPRScopeRegistry((unrequested,)),
+    )
+    repository.cleanup_deferred_pr_checkouts(auth)
+    assert requested.checkout_lease is None and not leases[0].path.exists()
+    assert not requested.checkout_cleanup_deferred
+    assert unrequested.checkout_lease is leases[1] and leases[1].is_active
+    assert leases[1].path.exists()
+
+
+def test_failed_deferred_cleanup_does_not_strand_other_requests(tmp_path: Path, monkeypatch) -> None:
+    states = []
+    for name in ("failed", "cleaned"):
+        root = tmp_path / name
+        root.mkdir()
+        state = _repo_scope_and_state(root)[3]
+        state.defer_checkout_cleanup()
+        states.append(state)
+    failed, cleaned = states
+    failed_lease, cleaned_lease = (state.checkout_lease for state in states)
+    cleanup = repository.cleanup_pr_checkout_lease
+
+    def fail_one(lease, **kwargs):
+        if lease is failed_lease:
+            raise OSError("cleanup unavailable")
+        return cleanup(lease, **kwargs)
+
+    monkeypatch.setattr(repository, "cleanup_pr_checkout_lease", fail_one)
+    # Separate carriers exercise all turn-end state sources, even though these
+    # independent fixture checkouts deliberately share a repository/PR number.
+    from mimir_cultivate.policy import ServerDiscoveredPRStates
+
+    discovered = ServerDiscoveredPRStates()
+    discovered.remember(cleaned)
+    auth = replace(
+        _untainted_ifc_auth(), repo_review_state=failed,
+        server_discovered_pr_states=discovered,
+    )
+    repository.cleanup_deferred_pr_checkouts(auth)
+    assert failed.checkout_lease is failed_lease and failed_lease.is_active
+    assert failed.checkout_cleanup_deferred and failed_lease.path.exists()
+    assert cleaned.checkout_lease is None and not cleaned_lease.path.exists()
+    # A subsequent host cleanup can still reclaim the unchanged failed lease.
+    monkeypatch.setattr(repository, "cleanup_pr_checkout_lease", cleanup)
+    repository.cleanup_deferred_pr_checkouts(auth)
+    assert failed.checkout_lease is None and not failed_lease.path.exists()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_delegate_cannot_reacquire_and_revoke_parent_checkout(
+    tmp_path: Path, monkeypatch, async_mode: bool,
+) -> None:
+    from mimir._deepagents_subagent_auth import _wrap_task_tool
+    from mimir.tools.refusals import ToolPolicyRefusal
+    from mimir_cultivate import forge
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    auth = replace(_untainted_ifc_auth(), repo_review_state=state, repo_pr_action_scope=scope)
+
+    def preflight(*_):
+        # This entry point can replace/revoke the shared lease.
+        lease.revoke()
+        state.revoke_checkout_lease(lease)
+        pytest.fail("delegate entered lease-replacing checkout preflight")
+
+    def checkout(**kwargs):
+        return repository.checkout_scoped_pr(scope.canonical_repo, scope.pr_number, kwargs["runtime"])
+
+    async def acheckout(**kwargs):
+        return await asyncio.to_thread(checkout, **kwargs)
+
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", preflight)
+    task = _wrap_task_tool(SimpleNamespace(func=checkout, coroutine=acheckout))
+    with pytest.raises(ToolPolicyRefusal, match="checkout lifecycle belongs to the parent"):
+        if async_mode:
+            asyncio.run(task.coroutine(runtime=SimpleNamespace(context=auth)))
+        else:
+            task.func(runtime=SimpleNamespace(context=auth))
+    assert state.checkout_lease is lease and lease.is_active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["success", "error", "cancel"])
+async def test_parent_turn_end_drains_delegated_cleanup(
+    tmp_path: Path, monkeypatch, ending: str,
+) -> None:
+    from langchain_core.messages import AIMessage
+    from mimir._context import get_current_turn
+    from mimir._deepagents_subagent_auth import _wrap_task_tool
+    from mimir.models import AgentEvent
+    from tests.test_agent import _build_agent, _FakeAgent, _FakeSaga
+
+    manager = load_plugins(enable="cultivate")
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+
+    class Parent(_FakeAgent):
+        async def astream(self, input, *, config, context=None, stream_mode="values"):
+            turn = get_current_turn()
+            turn.auth_context = replace(
+                context, repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+                repo_review_state=state, repo_pr_action_scope=scope,
+            )
+            task = _wrap_task_tool(SimpleNamespace(
+                func=lambda **kwargs: repository.repo_cleanup.func(
+                    scope.canonical_repo, scope.pr_number, kwargs["runtime"],
+                ), coroutine=None,
+            ))
+            assert task.func(runtime=SimpleNamespace(context=turn.auth_context))["status"] == "deferred"
+            assert lease.is_active and lease.path.exists()
+            if ending == "error":
+                raise RuntimeError("parent failed after delegation")
+            if ending == "cancel":
+                raise asyncio.CancelledError
+            async for item in super().astream(input, config=config, context=context, stream_mode=stream_mode):
+                yield item
+
+    agent = _build_agent(tmp_path, fake_agent=Parent([AIMessage(content="Done")]), fake_saga=_FakeSaga())
+    agent._config = replace(agent._config, plugin_manager=manager)
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="Review this PR")
+    if ending == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await agent.run_turn(event)
+    else:
+        await agent.run_turn(event)
+    assert state.checkout_lease is None and not lease.is_active
+    assert not lease.path.exists()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
 def test_trusted_pr_checkout_and_cleanup_do_not_taint_or_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool,
 ) -> None:
