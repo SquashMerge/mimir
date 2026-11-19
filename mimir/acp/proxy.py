@@ -1361,7 +1361,13 @@ class _ShutdownHooks:
             # Preserve close()'s error without dismantling a live loop's wakeup.
             self._loop_close()
             return
-        self._close_wakeup()
+        if self.signum is None:
+            self._close_wakeup()
+        elif self._wakeup is not None:
+            # A signal commits this process to exit. Detach the loop reader but
+            # retain C delivery and its observer through post-loop/atexit drains:
+            # the Python handler cannot escalate while main is parked in a lock.
+            self._loop.remove_reader(self._wakeup[0].fileno())
         self._loop_close()
 
     def install(self) -> None:
