@@ -337,4 +337,7 @@ dev = [
     "mcp>=2.3,<3",
     "faiss-cpu>=1.13",
     "botocore>=1.35",
+    # Property tests under property_tests/ run in the nightly workflow only;
+    # they are outside ``testpaths``, so default and PR runs never collect them.
+    "hypothesis>=6.170.15",
 ]
