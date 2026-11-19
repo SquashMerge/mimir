@@ -1392,6 +1392,8 @@ def _orchestrator_runner(
             return checkout_result
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
             return cp(args, stdout=issue_json)
+        if args == ["chainlink", "locks", "list", "--json"]:
+            return cp(args, stdout='{"locks":{}}')
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
