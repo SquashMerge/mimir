@@ -5923,14 +5923,25 @@ def checkout_scoped_pr(
     from mimir._deepagents_subagent_auth import is_delegated_execution
     from .forge import _client, pr_trust_verdict, remediation_checkout_preflight
 
-    # Acquisition can replace/revoke the shared lease, even on attestation
-    # failure. Delegates use the parent's checkout, not its lifecycle authority.
-    if is_delegated_execution():
-        raise ToolPolicyRefusal(
-            "repository checkout rejected: checkout lifecycle belongs to the parent turn; "
-            "use the parent's existing checkout"
-        )
     context = getattr(runtime, "context", None) if runtime is not None else None
+    if is_delegated_execution() and context is not None:
+        # Check every shared carrier before preflight can remint a scope or
+        # acquisition can replace/revoke an existing lease. First acquisition
+        # remains available to a delegate; its lease belongs to the shared turn.
+        states = [context.repo_review_state]
+        for registry in (context.repo_pr_scope_registry, context.server_discovered_pr_states):
+            if registry is not None:
+                states.extend(registry.review_states)
+        if any(
+            state is not None and state.checkout_lease is not None
+            and isinstance(repository, str) and state.repo.casefold() == repository.casefold()
+            and state.pr_number == pull_request
+            for state in states
+        ):
+            raise ToolPolicyRefusal(
+                "repository checkout rejected: checkout lifecycle belongs to the parent turn "
+                "while it holds a lease for this PR; use the parent's existing checkout"
+            )
     state, stopped = remediation_checkout_preflight(context, repository, pull_request)
     if stopped is not None:
         return {

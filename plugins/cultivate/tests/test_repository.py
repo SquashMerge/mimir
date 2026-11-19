@@ -305,8 +305,10 @@ def test_provider_creates_and_cleans_up_checkout(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("async_mode", [False, True])
 @pytest.mark.parametrize("cleanup_by", ["parent", "turn_end"])
+@pytest.mark.parametrize("acquire_by", ["parent", "delegate"])
 def test_delegated_cleanup_preserves_parent_pr_grants_until_turn_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool, cleanup_by: str,
+    acquire_by: str,
 ) -> None:
     from deepagents.middleware.subagents import _build_task_tool
     from langchain_core.messages import AIMessage
@@ -330,7 +332,20 @@ def test_delegated_cleanup_preserves_parent_pr_grants_until_turn_end(
         repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
         repo_review_state=state, repo_pr_action_scope=scope,
     )
-    auth = _repo_granted_auth(auth, scope, state, follow_on=True, policy=selected)
+    auth = _repo_granted_auth(auth, scope, state, follow_on=acquire_by == "parent", policy=selected)
+    if acquire_by == "delegate":
+        # Start with neither an attached nor an on-disk checkout for this PR.
+        assert repository.cleanup_pr_checkout_lease(lease, review_state=state)
+        assert state.checkout_lease is None and not lease.path.exists()
+        acquire = repository.acquire_pr_checkout_lease
+
+        def local_acquire(*args, **kwargs):
+            return acquire(*args, **kwargs, runner=lambda argv: subprocess.run(
+                argv, capture_output=True, text=True, check=False, env=_fixture_git_env(),
+            ))
+
+        monkeypatch.setattr(repository, "acquire_pr_checkout_lease", local_acquire)
+        monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: True)
     submitted = []
 
     def submit_review(bound, verdict, body):
@@ -350,7 +365,39 @@ def test_delegated_cleanup_preserves_parent_pr_grants_until_turn_end(
 
     class Reviewer(Runnable):
         def invoke(self, input, config=None, *, context=None, **kwargs):
+            nonlocal lease
             assert context.repo_review_state is state
+            if acquire_by == "delegate":
+                assert state.checkout_lease is None
+                args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+
+                def checkout_handler(request):
+                    result = repository.repo_checkout.func(
+                        **args, runtime=SimpleNamespace(context=context),
+                    )
+                    assert result["status"] == "checked_out"
+                    # The fixture uses a local bare origin, not github.com.
+                    # Supply its trusted transport provenance, as in the
+                    # checkout-classification test below; grants and the real
+                    # acquired lease still pass through BudgetGate unchanged.
+                    from mimir.access_control import publish_protected_result
+                    from mimir.models import SourceLabel
+
+                    publish_protected_result((SourceLabel(
+                        principal=context.canonical_principal, domain="repository",
+                        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+                        bridge_instance="forge", sensitivity="internal",
+                        authorized_principals=frozenset({context.canonical_principal}),
+                        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+                    ),))
+                    return ToolMessage(content=json.dumps(result), tool_call_id=request.tool_call["id"])
+
+                result = BudgetGateMiddleware(policy=selected).wrap_tool_call(
+                    _make_request("repo_checkout", "delegate-checkout", context, args), checkout_handler,
+                )
+                assert result.status == "success", result.content
+                lease = state.checkout_lease
+                assert lease is not None and lease.is_active and lease.path.is_dir()
             cleanup_results.append(repository.repo_cleanup.func(
                 scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=context),
             ))
@@ -478,8 +525,9 @@ def test_failed_deferred_cleanup_does_not_strand_other_requests(tmp_path: Path, 
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("carrier", ["direct", "registry", "discovered"])
 def test_delegate_cannot_reacquire_and_revoke_parent_checkout(
-    tmp_path: Path, monkeypatch, async_mode: bool,
+    tmp_path: Path, monkeypatch, async_mode: bool, carrier: str,
 ) -> None:
     from mimir._deepagents_subagent_auth import _wrap_task_tool
     from mimir.tools.refusals import ToolPolicyRefusal
@@ -487,7 +535,17 @@ def test_delegate_cannot_reacquire_and_revoke_parent_checkout(
 
     _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
     lease = state.checkout_lease
-    auth = replace(_untainted_ifc_auth(), repo_review_state=state, repo_pr_action_scope=scope)
+    from mimir_cultivate.policy import ServerDiscoveredPRStates
+
+    discovered = ServerDiscoveredPRStates()
+    if carrier == "discovered":
+        discovered.remember(state)
+    auth = replace(
+        _untainted_ifc_auth(), repo_pr_action_scope=scope,
+        repo_review_state=state if carrier == "direct" else None,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)) if carrier == "registry" else None,
+        server_discovered_pr_states=discovered,
+    )
 
     def preflight(*_):
         # This entry point can replace/revoke the shared lease.
