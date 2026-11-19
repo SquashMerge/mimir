@@ -14785,6 +14785,11 @@ async def test_contained_leaf_and_ci_repair_retirement_boundaries(tmp_path, monk
 
             monkeypatch.setattr(worker_client.WorkerClient, "cancel", unverified_retirement)
             prior_calls = list(calls)
+            stopped = await asyncio.to_thread(control.stop_worklink, tmp_path, 441, runner=runner)
+            assert not stopped.stopped and not stopped.state_cleared and not stopped.claim_released
+            assert "retirement is unverified" in stopped.reason
+            assert load_run_state(tmp_path, 441) == state
+            assert calls == prior_calls
             remaining = await asyncio.to_thread(control.reconcile_run_states, tmp_path, runner=runner)
             assert remaining == [state]
             assert load_run_state(tmp_path, 441) == state
@@ -14810,9 +14815,14 @@ async def test_contained_leaf_and_ci_repair_retirement_boundaries(tmp_path, monk
                 retired.append(identifier)
 
             monkeypatch.setattr(worker_client.WorkerClient, "cancel", verified_retirement)
+            stopped = await asyncio.to_thread(control.stop_worklink, tmp_path, 441, runner=runner)
+            assert stopped.stopped and stopped.state_cleared and stopped.claim_released
+            assert retired == [startup_state.handle_identifier]
+            assert load_run_state(tmp_path, 441) is None
+            save_run_state(tmp_path, startup_state)
             remaining = await asyncio.to_thread(control.reconcile_run_states, tmp_path, runner=runner)
             assert remaining == []
-            assert retired == [startup_state.handle_identifier]
+            assert retired == [startup_state.handle_identifier] * 2
             assert load_run_state(tmp_path, 441) is None
             # Verified retirement and terminal release permit a new admission.
             monkeypatch.setattr(ChainlinkClaims, "review_ready_evidence", lambda *args, **kwargs: None)

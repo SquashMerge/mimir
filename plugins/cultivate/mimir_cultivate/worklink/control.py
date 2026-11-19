@@ -369,6 +369,22 @@ def stop_worklink(
                 _mark_operator_stop(home, issue_id, state.attempt)
                 return WorklinkStopResult(issue_id, True,
                     reason="recorded gate or CI waiter has exited; session terminal recovery via reattach is required")
+            if state.compute_name == "local_subprocess" and state.shim_pid is not None:
+                from .worker_client import WorkerClient
+
+                try:
+                    asyncio.run(WorkerClient(None).cancel(state.handle_identifier))
+                except (RuntimeError, OSError, ValueError):
+                    return WorklinkStopResult(issue_id, False,
+                        reason="contained worker retirement is unverified; recovery state and claim retained")
+                clear_run_state(home, issue_id)
+                release = run([chainlink_bin, "locks", "release", str(issue_id)])
+                unlabel = run([chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"])
+                run([chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:ready"])
+                return WorklinkStopResult(issue_id, True,
+                    state_cleared=load_run_state(home, issue_id) is None,
+                    claim_released=release.returncode == 0,
+                    label_cleared=unlabel.returncode == 0)
             clear_run_state(home, issue_id)
             state_cleared = load_run_state(home, issue_id) is None
             # Epic dispatch uses factory records, not leaf run state. A stale

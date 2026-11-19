@@ -613,6 +613,12 @@ class FactoryPRHeadMismatch(WorklinkError):
     """An open factory PR no longer provably contains the verified commit."""
 
 
+class _FactoryQuotaExhausted(WorklinkError):
+    def __init__(self, retry_after_ms: int | None) -> None:
+        super().__init__("Claude Code factory host quota exhausted")
+        self.retry_after_ms = retry_after_ms
+
+
 class _AutonomousAdmissionRefused(WorklinkError):
     """Fresh autonomous work is fenced by durable incident state."""
 
@@ -3700,6 +3706,19 @@ class WorklinkRunner:
                         controller_error=_factory_controller_error(reason),
                     ),
                 )
+            quota_failure = (
+                isinstance(exc, _FactoryQuotaExhausted)
+                and _backend_quota_pool(selected) == "claude_code"
+                and not published and not host_unverified
+            )
+            reset_at, reset_source = None, ""
+            if quota_failure:
+                if type(exc.retry_after_ms) is int and 0 <= exc.retry_after_ms <= 8 * 86400 * 1000:
+                    reset_at = datetime.now(UTC) + timedelta(milliseconds=exc.retry_after_ms)
+                    reset_source = "provider.retryAfterMs"
+                else:
+                    reset_at = datetime.now(UTC) + timedelta(hours=1)
+                    reset_source = "fallback.hour"
             try:
                 incident = incident_owner.record(
                     producer="factory_exception",
@@ -3708,7 +3727,9 @@ class WorklinkRunner:
                     attempt=claim_record.attempt,
                     error=reason,
                     exit_status=1,
-                    autonomous=autonomous,
+                    autonomous=autonomous or quota_failure,
+                    failure_kind="quota_exhausted" if quota_failure else "operator_required",
+                    quota_reset_at=reset_at,
                     preserved_ref=preserved_ref,
                     preservation_error=preservation_error,
                     run_id=current.run_id if current is not None else run_id,
@@ -3721,12 +3742,29 @@ class WorklinkRunner:
             except OSError as write_exc:
                 incident_owner.bind(write_exc)
                 raise
+            quota_hold = bool(quota_failure and incident is not None
+                              and incident.get("failure_kind") == "quota_exhausted")
+            failure_status = "blocked" if published or isinstance(exc, FactoryPRHeadMismatch) else "failed"
+            if quota_hold:
+                hold = ShutdownAbortRecord(
+                    issue_id=issue_id, attempt=claim_record.attempt,
+                    agent_id=claim_record.agent_id, claimed_at=claim_record.claimed_at,
+                    aborted_at=datetime.now(UTC),
+                )
+                claims._run(
+                    "issue", "comment", str(issue_id),
+                    QUOTA_HOLD_PREFIX + hold.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
+                    + f"\nClaude Code quota hold until {incident['retry_after']} ({reset_source}).",
+                )
+                failure_status = "quota_hold"
+                _log_event("worklink_quota_hold", issue_id=issue_id, attempt=claim_record.attempt,
+                           retry_after=incident["retry_after"], reset_source=reset_source)
             try:
                 claims.transition_issue(
                     issue_id,
-                    status="blocked" if published or isinstance(exc, FactoryPRHeadMismatch) else "failed",
+                    status=failure_status,
                     review_ready=False,
-                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                    attempt=None if quota_hold else claim_record.budget_attempt or claim_record.attempt,
                     reason=reason,
                 )
             except Exception as routing_exc:
@@ -3737,9 +3775,7 @@ class WorklinkRunner:
                 "worklink_transition",
                 issue_id=issue_id,
                 attempt=claim_record.attempt,
-                status="published-with-controller-error" if published else (
-                    "blocked" if isinstance(exc, FactoryPRHeadMismatch) else "failed"
-                ),
+                status="published-with-controller-error" if published else failure_status,
                 review_ready=False,
                 pr_url=published_url,
                 reason=reason,
@@ -3756,16 +3792,14 @@ class WorklinkRunner:
             result = WorklinkRunResult(
                 issue_id,
                 claim_record.attempt,
-                "published-with-controller-error" if published else (
-                    "blocked" if isinstance(exc, FactoryPRHeadMismatch) else "failed"
-                ),
+                "published-with-controller-error" if published else failure_status,
                 pr_url=published_url,
                 checkout=Path(current.sandbox) if current is not None else None,
                 branch=current.branch if current is not None else None,
                 reason=reason,
                 preserved_ref=preserved_ref,
                 preservation_error=preservation_error,
-                incident_recorded=autonomous,
+                incident_recorded=autonomous or quota_hold,
             )
         except BaseException as exc:
             release_permitted = False
@@ -4207,14 +4241,16 @@ class WorklinkRunner:
                 raise WorklinkError("factory driver survived cancellation before park")
             # Cancellation can deliver a final factory transition. Qualify that
             # observation before any writer acts on the earlier running state.
-            if handle.opencode_session_id is not None:
+            if host_identity is not None:
                 current = await asyncio.to_thread(
                     backend.status, factory_record.run_id,
                     sandbox=Path(factory_record.sandbox), launcher=factory_record.launcher,
                 )
                 _require_factory_status(current, factory_record)
-                if current.lock_session not in {None, factory_record.session}:
+                if current.lock_session not in {None, host_identity}:
                     raise WorklinkError("factory lock owner changed during cancellation before park")
+                if current.lock == "absent" and current.lock_session is not None:
+                    raise WorklinkError("factory absent lock unexpectedly reports a host owner")
                 factory_record = replace(
                     factory_record.observed(current, datetime.now(UTC).isoformat()),
                     controller_phase="terminal" if current.is_terminal else "parked" if current.is_parked else "running",
@@ -4343,7 +4379,7 @@ class WorklinkRunner:
             )
 
         async def repark_startup_failure(reason: str) -> WorklinkRunResult:
-            if handle.opencode_session_id is not None:
+            if host_identity is not None:
                 # No manifest is normal while the driver performs intake/init.
                 # It has the same bounded startup budget as acquiring its lock;
                 # never invent a host-owned run just to park an absent one.
@@ -4597,7 +4633,10 @@ class WorklinkRunner:
                     handoff_claimed = False
                     if (host_identity is not None and status.lock_session is not None
                             and status.lock_session != host_identity):
-                        if factory_record.host == "claude_code" and wait_task.done() and not wait_task.cancelled() and wait_task.exception() is None and _factory_lock_refusal(wait_task.result()):
+                        if (factory_record.host == "claude_code" and wait_task.done()
+                                and not wait_task.cancelled() and wait_task.exception() is None
+                                and _factory_lock_refusal(wait_task.result(), host="claude_code",
+                                    run_id=factory_record.run_id, status=status, session=host_identity)):
                             raise WorklinkError("factory driver did not acquire the retained run lock; foreign owner left unchanged")
                         raise WorklinkError(f"factory lock session does not match the {host_label} host session")
                     if host_identity is not None and status.lock == "absent" and status.lock_session is not None:
@@ -4843,7 +4882,8 @@ class WorklinkRunner:
                         detail = _factory_controller_error(
                             f"{result.session_error.type}: {result.session_error.message}")
                     detail = _factory_controller_error(detail)
-                    if _factory_lock_refusal(result):
+                    if _factory_lock_refusal(result, host=factory_record.host,
+                            run_id=factory_record.run_id, status=status, session=host_identity):
                         reason = "factory driver did not acquire the retained run lock"
                         if detail:
                             reason += f": {detail[:300]}"
@@ -4881,6 +4921,14 @@ class WorklinkRunner:
                             branch=factory_record.branch,
                             reason=reason,
                         )
+                    if factory_record.host == "claude_code" and _backend_quota_pool(backend) == "claude_code":
+                        raw = await backend.interpret(
+                            WorkOrder(issue.issue_id, Path(factory_record.sandbox), "", None,
+                                      run_timeout, {}), result)
+                        if raw.backend_status == "quota_exhausted":
+                            if not factory_record.children_reaped:
+                                await cancel_once()
+                            raise _FactoryQuotaExhausted(raw.retry_after_ms)
                     suffix = f": {detail[:300]}" if detail else ""
                     raise WorklinkError(
                         f"{host_label} host stopped while factory status was running{suffix}"
@@ -5539,8 +5587,9 @@ def _factory_checkout_repository(checkout: Path, runner: Runner) -> str | None:
     return None
 
 
-def _factory_lock_refusal(result: ComputeResult) -> bool:
-    if not (result.timed_out or result.output_overflow or result.launch_error):
+def _claude_factory_lock_refusals(result: ComputeResult) -> set[tuple[str, str]]:
+    refusals: set[tuple[str, str]] = set()
+    if not (result.timed_out or result.output_overflow or result.output_truncated or result.launch_error):
         reports: list[str] = []
 
         def text_blocks(content: object) -> None:
@@ -5570,9 +5619,23 @@ def _factory_lock_refusal(result: ComputeResult) -> bool:
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "tool_result":
                             text_blocks(block.get("content"))
-        if any(re.search(r"run '[a-z0-9._-]+' is held by session [^\s]+ \(heartbeat [^)]+\)", report)
-               for report in reports):
-            return True
+        for report in reports:
+            refusals.update(re.findall(
+                r"run '([a-z0-9._-]+)' is held by session ([^\s]+) \(heartbeat [^)]+\)", report))
+    return refusals
+
+
+def _factory_lock_refusal(
+    result: ComputeResult, *, host: str = "opencode", run_id: str | None = None,
+    status: FactoryStatus | None = None, session: str | None = None,
+) -> bool:
+    if host == "claude_code":
+        return bool(
+            status is not None and status.valid and status.run_id == run_id
+            and status.lock in {"fresh", "stale"} and status.lock_session is not None
+            and session is not None and status.lock_session != session
+            and (run_id, status.lock_session) in _claude_factory_lock_refusals(result)
+        )
     if (
         result.exit_code != 0
         or result.timed_out

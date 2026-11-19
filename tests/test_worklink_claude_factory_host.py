@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import uuid
 
@@ -198,6 +199,7 @@ def test_real_local_factory_status_and_competing_lock(real_package, tmp_path):
 @pytest.mark.parametrize("location", ["result", "assistant", "tool_result"])
 def test_captured_stream_lock_refusal_is_recognized(location):
     from mimir_cultivate.worklink.orchestrator import _factory_lock_refusal
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
     text = (FIXTURES / "feature_factory_0_14_1/lock-refusal.stderr.txt").read_text()
     if location == "result":
         stream = (FIXTURES / "claude_code_2_1_326/lock_refused.jsonl").read_text()
@@ -206,7 +208,10 @@ def test_captured_stream_lock_refusal_is_recognized(location):
     else:
         stream = json.dumps({"type": "user", "message": {"content": [{"type": "tool_result",
             "tool_use_id": "fixture", "content": [{"type": "text", "text": text}]}]}})
-    assert _factory_lock_refusal(compute.ComputeResult(0, stream, ""))
+    status = FactoryStatus(run_id="chainlink-2126", valid=True, sandbox_path="/fixture",
+        lock="fresh", lock_session="claude-code:11111111-1111-4111-8111-111111111111")
+    assert _factory_lock_refusal(compute.ComputeResult(0, stream, ""), host="claude_code",
+        run_id=status.run_id, status=status, session="claude-code:22222222-2222-4222-8222-222222222222")
     assert not _factory_lock_refusal(compute.ComputeResult(0, json.dumps({"type": "unknown", "result": text}), ""))
 
 
@@ -502,7 +507,10 @@ async def test_factory_admission_follows_durable_process_binding(real_package, t
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_kind", ["running", "completed", "foreign"])
+@pytest.mark.parametrize("status_kind", [
+    "running", "completed", "foreign", "foreign-other-run", "foreign-other-owner",
+    "owned-quote", "absent-quote",
+])
 async def test_claude_factory_status_authority_and_early_exit(tmp_path, monkeypatch, status_kind):
     from mimir_cultivate.worklink import orchestrator as orch
     from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
@@ -516,7 +524,10 @@ async def test_claude_factory_status_authority_and_early_exit(tmp_path, monkeypa
     status = FactoryStatus(run_id="chainlink-2126", valid=True, sandbox_path=str(sandbox),
         status="completed" if status_kind == "completed" else "running", mode="autonomous",
         branch="feature/chainlink-2126", pr_base="main", pr_draft=False, dead_lock=False, lock="fresh",
-        lock_session="claude-code:" + ("33333333-3333-4333-8333-333333333333" if status_kind == "foreign" else identifier))
+        lock_session="claude-code:" + (
+            "11111111-1111-4111-8111-111111111111" if status_kind.startswith("foreign") else identifier))
+    if status_kind == "absent-quote":
+        status = replace(status, lock="absent", lock_session=None)
     record = FactoryRunRecord(run_id=status.run_id, issue_id=2126, attempt=1,
         repository="owner/repo", base_ref="main", branch=status.branch, launcher=host.DEFAULT_ENTRYPOINT,
         sandbox=str(sandbox), session="claude-code:" + identifier, lock_session="claude-code:" + identifier,
@@ -524,11 +535,17 @@ async def test_claude_factory_status_authority_and_early_exit(tmp_path, monkeypa
         observed_at=None, controller_phase="running")
     save_factory_record(tmp_path, record)
     output = (FIXTURES / "claude_code_2_1_326" /
-              ("lock_refused.jsonl" if status_kind == "foreign" else "success.jsonl")).read_text()
+              ("lock_refused.jsonl" if status_kind not in {"running", "completed"} else "success.jsonl")).read_text()
+    if status_kind == "foreign-other-run":
+        output = output.replace("run 'chainlink-2126'", "run 'chainlink-999'")
+    elif status_kind == "foreign-other-owner":
+        output = output.replace("11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333")
     events = []
+    observed = threading.Event()
 
     class Compute:
         async def wait(self, selected, timeout):
+            observed.set()
             return compute.ComputeResult(0, output, "", handle=handle, children_reaped=True)
 
         def job_alive(self, selected):
@@ -546,6 +563,7 @@ async def test_claude_factory_status_authority_and_early_exit(tmp_path, monkeypa
 
         def status(self, *args, **kwargs):
             assert kwargs["launcher"] == record.launcher
+            assert observed.wait(5)
             return status
 
         def heartbeat(self, *args, **kwargs):
@@ -571,7 +589,10 @@ async def test_claude_factory_status_authority_and_early_exit(tmp_path, monkeypa
     if status_kind == "completed":
         assert (await asyncio.wait_for(invocation, 10)).status == "review_ready"
     else:
-        with pytest.raises(orch.WorklinkError, match="Claude host stopped while factory status was running" if status_kind == "running" else "did not acquire"):
+        expected = ("did not acquire" if status_kind == "foreign"
+                    else "lock session does not match" if status_kind.startswith("foreign")
+                    else "Claude host stopped while factory status was running")
+        with pytest.raises(orch.WorklinkError, match=expected):
             await asyncio.wait_for(invocation, 10)
         assert load_factory_record(tmp_path, record.run_id).opencode_session_id is None
     assert "cleanup" in events
@@ -741,3 +762,269 @@ async def test_claude_recovery_requires_proof_and_fresh_durable_uuid(real_packag
         with pytest.raises(orch.WorklinkError, match="verified descendant retirement"):
             await invocation
         assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [
+    "quota", "quota-fallback", "quota-limit", "quota-unverified",
+    "allowed-warning", "nonquota", "quota-completed",
+])
+async def test_claude_epic_quota_uses_ledger_and_exact_claim(real_package, tmp_path, monkeypatch, outcome):
+    from mimir_cultivate.worklink import orchestrator as orch
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+    from mimir_cultivate.worklink.checkout import CheckoutLease
+    from mimir_cultivate.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimResult, QUOTA_HOLD_PREFIX
+    from mimir_cultivate.worklink.dispatch_failures import (
+        MAX_CONSECUTIVE_QUOTA_HOLDS, current_failure_record, dispatch_failure_state_dir, record_failure,
+    )
+    from mimir_cultivate.worklink.factory_state import load_factory_record
+
+    repo, checkout = tmp_path / "repo", tmp_path / "operator"
+    repo.mkdir()
+    checkout.mkdir()
+    claim = ClaimRecord(2126, 1, "fixture", datetime.now(UTC))
+    events, calls = [], []
+    collected = threading.Event()
+    quota = outcome.startswith("quota")
+    stream = (FIXTURES / "claude_code_2_1_326" /
+              ("quota_exhausted.jsonl" if quota else "rate_limit_warning.jsonl")).read_text()
+    messages = [json.loads(line) for line in stream.splitlines()]
+    if outcome == "quota-fallback":
+        messages = [message for message in messages if message["type"] != "rate_limit_event"]
+    else:
+        for message in messages:
+            if message["type"] == "rate_limit_event":
+                message["rate_limit_info"]["resetsAt"] = datetime.now(UTC).timestamp() + 120
+    if outcome == "nonquota":
+        messages[-1].update(is_error=True, api_error_status=500)
+    output = "\n".join(json.dumps(message) for message in messages)
+
+    class Factory(FeatureFactoryBackend):
+        def status(self, run_id, **kwargs):
+            assert collected.wait(5)
+            record = load_factory_record(tmp_path, run_id)
+            return FactoryStatus(run_id=run_id, valid=True, sandbox_path=record.sandbox,
+                status="completed" if outcome == "quota-completed" else "running",
+                mode="autonomous", branch=record.branch, pr_base="main", pr_draft=False,
+                lock="fresh", dead_lock=False, lock_session=record.lock_session)
+
+        def heartbeat(self, *args, **kwargs):
+            pass
+
+        def terminal(self, *args, **kwargs):
+            pytest.fail("host result cannot terminalize the factory")
+
+    class Compute:
+        name = "local_subprocess"
+
+        async def launch(self, spec):
+            self.identifier = spec.backend_config["worker_identifier"]
+            (checkout / ".factory-sandboxes/chainlink-2126").mkdir(parents=True)
+            return compute.LaunchHandle("local_subprocess", self.identifier, 42, 999999999)
+
+        async def admit_factory_handle(self, handle):
+            assert load_factory_record(tmp_path, "chainlink-2126").handle == handle
+
+        async def wait(self, handle, timeout):
+            collected.set()
+            return compute.ComputeResult(1 if quota or outcome == "nonquota" else 0,
+                output, "", handle=handle, children_reaped=outcome != "quota-unverified")
+
+        def job_alive(self, handle):
+            return False
+
+        async def cancel(self, handle):
+            events.append("cancel")
+            if outcome == "quota-unverified":
+                raise RuntimeError("executor retirement refused")
+
+        async def cleanup(self, handle):
+            events.append("cleanup")
+
+    backend = Factory(host="claude_code", entrypoint=str(entrypoint(real_package)))
+    registry = BackendRegistry()
+    registry.register(backend)
+    monkeypatch.setattr(registry, "select_compute", lambda **kwargs: Compute())
+    monkeypatch.setattr(orch, "assert_base_repo_not_worker_writable", lambda *args, **kwargs: None)
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(orch, "_create_backend_checkout", lambda *args, **kwargs:
+        CheckoutLease(2126, 1, repo, checkout, "issue/2126-a1", "main", isolated_checkout=True))
+    monkeypatch.setattr(orch, "_sweep_retained_attempts", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "_preserve_failed_factory_run", lambda **kwargs: (None, None))
+    monkeypatch.setattr(orch.WorklinkRunner, "_preserve_factory_attempt", lambda *args: None)
+    monkeypatch.setattr(orch, "_git_credential_settings", lambda *args: ())
+    order = order_for(checkout)
+    order = replace(order, env={**order.env, "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid"})
+    monkeypatch.setattr(orch.WorklinkRunner, "_factory_launch_order", lambda *args, **kwargs: (order, "fixture-bot"))
+    transitions = []
+    monkeypatch.setattr(ChainlinkClaims, "transition_issue", lambda self, *args, **kwargs: transitions.append(kwargs))
+
+    def claim_issue(self, *args, **kwargs):
+        kwargs["before_claim"]()
+        return ClaimResult(True, claim)
+
+    monkeypatch.setattr(ChainlinkClaims, "claim_issue", claim_issue)
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        text = json.dumps({"id": 2126, "title": "epic", "description": "build",
+                           "labels": ["worklink", "worklink:epic"], "comments": []})
+        if args[:3] == ["git", "-C", str(repo)] and "config" in args:
+            text = "git@github.com:owner/repo.git\n"
+        return subprocess.CompletedProcess(args, 0, text, "")
+
+    async def finish(self, **kwargs):
+        assert kwargs["factory_record"].status.status == "completed"
+        return orch.WorklinkRunResult(2126, 1, "review_ready")
+
+    monkeypatch.setattr(orch.WorklinkRunner, "_finish_factory_070", finish)
+    before = datetime.now(UTC)
+    if outcome == "quota-limit":
+        for prior in range(MAX_CONSECUTIVE_QUOTA_HOLDS):
+            record_failure(dispatch_failure_state_dir(tmp_path), issue_id=2126, attempt=prior + 1,
+                exit_status=1, error="previous typed quota hold", log_path=None,
+                failure_kind="quota_exhausted", quota_reset_at=before + timedelta(minutes=2))
+    result = await orch.WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run_epic(2126)
+    record = load_factory_record(tmp_path, "chainlink-2126")
+    assert record.children_reaped == (outcome != "quota-unverified")
+    assert record.transcript and events[-1] == "cleanup"
+    assert (["chainlink", "locks", "release", "2126"] in calls) == (outcome != "quota-unverified")
+    holds = [args[-1] for args in calls if args[:3] == ["chainlink", "issue", "comment"]
+             and args[-1].startswith(QUOTA_HOLD_PREFIX)]
+    incident = current_failure_record(dispatch_failure_state_dir(tmp_path), 2126)
+    if outcome in {"quota", "quota-fallback"}:
+        assert result.status == "quota_hold", result.reason
+        assert incident["failure_kind"] == "quota_exhausted"
+        assert incident["attempt_consumed"] is False and incident["quota_holds"] == 1
+        reset = datetime.fromisoformat(incident["retry_after"])
+        seconds = (reset - before).total_seconds()
+        assert (3595 < seconds < 3610) if outcome == "quota-fallback" else (115 < seconds < 135)
+        assert len(holds) == 1 and "Claude Code quota hold" in holds[0]
+        reader = ChainlinkClaims(chainlink_bin="chainlink", agent_id="fixture", runner=runner, home_path=tmp_path)
+        assert reader.attempts_used([claim.to_comment(), holds[0]]) == 0
+        other = replace(claim, agent_id="different-claim")
+        assert reader.attempts_used([other.to_comment(), holds[0]]) == 1
+        assert transitions[-1]["status"] == "quota_hold" and transitions[-1]["attempt"] is None
+    elif outcome == "quota-limit":
+        assert result.status == "failed" and not holds
+        assert incident["failure_kind"] == "operator_required"
+        assert incident["attempt_consumed"] is True
+    else:
+        assert result.status == ("review_ready" if outcome == "quota-completed" else "failed")
+        assert not holds and incident is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", [
+    "completed", "needs-human", "foreign-fresh", "foreign-stale", "running",
+    "startup-foreign-stale", "startup-absent",
+])
+async def test_claude_park_requalifies_after_cancellation(tmp_path, monkeypatch, ending):
+    from mimir_cultivate.worklink import orchestrator as orch
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+    from mimir_cultivate.worklink.claims import ClaimRecord
+    from mimir_cultivate.worklink.factory_state import save_factory_record, load_factory_record
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(orch, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "get_running_loop": lambda: SimpleNamespace(time=lambda: clock.now),
+    }))
+    monkeypatch.setattr(orch, "_epic_run_timeout_s", lambda: 100.0)
+    monkeypatch.setattr(orch, "_factory_startup_status_timeout_s", lambda: 10.0)
+    identifier = str(uuid.uuid4())
+    sandbox = tmp_path / "operator/.factory-sandboxes/chainlink-2126"
+    sandbox.mkdir(parents=True)
+    handle = compute.LaunchHandle("local_subprocess", identifier, 42, 999999999)
+    current = FactoryStatus(run_id="chainlink-2126", valid=True, sandbox_path=str(sandbox),
+        status="running", mode="autonomous", branch="feature/chainlink-2126", pr_base="main",
+        pr_draft=False, lock="fresh", dead_lock=False, lock_session="claude-code:" + identifier)
+    record = FactoryRunRecord(run_id=current.run_id, issue_id=2126, attempt=1,
+        repository="owner/repo", base_ref="main", branch=current.branch, launcher=host.DEFAULT_ENTRYPOINT,
+        sandbox=str(sandbox), session=current.lock_session, lock_session=current.lock_session,
+        host="claude_code", launch_generation=identifier, handle=handle,
+        status=None, observed_at=None, controller_phase="running")
+    save_factory_record(tmp_path, record)
+    retired = asyncio.Event()
+    events = []
+    cancelled = terminalized = snapshotted = False
+
+    class Compute:
+        async def wait(self, selected, timeout):
+            await retired.wait()
+            return compute.ComputeResult(-15, "", "", handle=selected, children_reaped=True)
+
+        def job_alive(self, selected):
+            return not cancelled
+
+        async def cancel(self, selected):
+            nonlocal cancelled
+            assert selected == handle
+            cancelled = True
+            events.append("cancel")
+            retired.set()
+
+        async def cleanup(self, selected):
+            events.append("cleanup")
+
+    class Factory:
+        poll_interval_s = 0.001
+
+        def status(self, *args, **kwargs):
+            assert kwargs["launcher"] == record.launcher
+            if terminalized:
+                return replace(current, status="needs-human",
+                    park_snapshot="/fixture/snapshot" if snapshotted else None)
+            if cancelled:
+                events.append("status-after-cancel")
+                if "foreign" in ending:
+                    return replace(current, lock="stale" if ending.endswith("stale") else "fresh",
+                        dead_lock=ending.endswith("stale"),
+                        lock_session="claude-code:11111111-1111-4111-8111-111111111111")
+                return replace(current, status=ending) if ending in {"completed", "needs-human"} else current
+            clock.now = 11.0 if ending.startswith("startup") else 60.0
+            return replace(current, lock="absent", lock_session=None) if ending.startswith("startup") else current
+
+        def heartbeat(self, *args, **kwargs):
+            pass
+
+        def terminal(self, *args, **kwargs):
+            nonlocal terminalized
+            assert ending == "running"
+            assert events[-1] == "status-after-cancel"
+            terminalized = True
+            events.append("terminal")
+
+        def snapshot(self, *args, **kwargs):
+            nonlocal snapshotted
+            assert ending == "running" and terminalized
+            snapshotted = True
+            events.append("snapshot")
+
+    async def finish(self, **kwargs):
+        saved = kwargs["factory_record"]
+        assert saved.children_reaped
+        assert saved.status.status == ("completed" if ending == "completed" else "needs-human")
+        if ending == "running":
+            assert saved.status.park_snapshot == "/fixture/snapshot"
+        return orch.WorklinkRunResult(2126, 1, "review_ready" if ending == "completed" else "needs-human")
+
+    monkeypatch.setattr(orch.WorklinkRunner, "_finish_factory_070", finish)
+    invocation = orch.WorklinkRunner(home=tmp_path, repo=sandbox)._supervise_factory_070(
+        issue=orch.IssueContext(2126, "epic", "build", {"worklink:epic"}),
+        claim_record=ClaimRecord(2126, 1, "fixture", datetime.now(UTC)),
+        claims=SimpleNamespace(heartbeat_issue=lambda *args, **kwargs: None),
+        backend=Factory(), compute=Compute(), factory_record=record, test_cmd="true",
+        runner=lambda *args, **kwargs: pytest.fail("unexpected external command"),
+        started_at=datetime.now(UTC))
+    if ending.startswith("startup"):
+        with pytest.raises(orch.WorklinkError, match="did not acquire the run lock"):
+            await asyncio.wait_for(invocation, 10)
+    elif ending.startswith("foreign"):
+        with pytest.raises(orch.WorklinkError, match="owner changed during cancellation"):
+            await asyncio.wait_for(invocation, 10)
+    else:
+        result = await asyncio.wait_for(invocation, 10)
+        assert result.status == ("review_ready" if ending == "completed" else "needs-human")
+    assert terminalized == snapshotted == (ending == "running")
+    assert cancelled and events[-1] == "cleanup"
+    assert load_factory_record(tmp_path, record.run_id).children_reaped
