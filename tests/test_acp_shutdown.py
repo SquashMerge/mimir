@@ -417,7 +417,8 @@ loop.run_until_complete(run())
 assert observed
 assert installed._wakeup is not None  # retained for outer async drains
 loop.close()
-assert installed._wakeup is None
+assert installed._wakeup is not None  # retained for post-loop escalation too
+assert installed._observer.is_alive()
 assert signal.getsignal(signum) is installed._handler
 installed._watchdog.cancel()
 '''
@@ -905,6 +906,79 @@ asyncio.run(run())
             process.kill()
             process.wait()
     assert (returncode, stderr) == (128 + signal.SIGINT, b"")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+async def test_repeat_signal_escalates_while_main_is_parked_post_loop(
+    repeat: signal.Signals,
+) -> None:
+    # No watchdog and no process-directed repeat: only the observer can exit
+    # while main is parked in an atexit callback after asyncio.run closes its loop.
+    source = r'''
+import atexit, asyncio, os, signal, sys, threading
+from types import SimpleNamespace
+from mimir.acp import proxy
+
+repeat = int(sys.argv[1])
+proxy.threading.Timer.start = lambda self: None
+parked = threading.Event()
+
+def deliver():
+    assert os.read(0, 1) == b'r'
+    # Synchronize with Event.wait releasing its condition lock after registering
+    # main's waiter, rather than racing the marker immediately before the wait.
+    while True:
+        with parked._cond:
+            if parked._cond._waiters:
+                break
+    signal.pthread_kill(threading.get_ident(), repeat)
+
+async def run():
+    global hooks, loop
+    loop = asyncio.get_running_loop()
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=lambda: None))
+    forwarded = asyncio.Event()
+    drain = hooks._drain_wakeup
+    def observed():
+        drain()
+        forwarded.set()
+    hooks._drain_wakeup = observed
+    hooks.install()
+    hooks.closing = True  # This test owns the graceful drain, not cancellation.
+    threading.Thread(target=deliver, daemon=True).start()
+    os.kill(os.getpid(), signal.SIGTERM)
+    await forwarded.wait()  # The observer has consumed the first C-level byte.
+    assert hooks._signal_observed
+    assert hooks.signum == signal.SIGTERM
+    hooks.close()
+
+def after_loop():
+    assert loop.is_closed()
+    assert not hooks._watchdog.is_alive()
+    os.write(1, b'parked\n')
+    parked.wait()
+    raise AssertionError('parked main returned')
+
+asyncio.run(run())
+atexit.register(after_loop)
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, str(repeat), stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with asyncio.timeout(60):  # Hang guard, not a latency requirement.
+            assert await process.stdout.readline() == b"parked\n"
+            process.stdin.write(b"r")
+            await process.stdin.drain()
+            stdout, stderr = await process.communicate()
+        assert (process.returncode, stdout, stderr) == (128 + repeat, b"", b"")
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
 
 
 @pytest.mark.asyncio
