@@ -59,11 +59,11 @@ if [ "${1:-}" = --isolated-tests ]; then
     shift
 fi
 if [ "$#" -ne 2 ]; then
-    echo "usage: sh scripts/verify_claude_subscription.sh <leaf|factory|setup> <inspected-plugin-package>" >&2
+    echo "usage: sh scripts/verify_claude_subscription.sh <leaf|factory|setup|spawn> <inspected-plugin-package>" >&2
     exit 64
 fi
 case "$1" in
-    leaf|factory|setup) ;;
+    leaf|factory|setup|spawn) ;;
     *) echo "unknown subscription verification phase: $1" >&2; exit 64 ;;
 esac
 case "$2" in
@@ -111,7 +111,7 @@ do
         uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"
 done
 
-if [ "$1" = factory ] || [ "$1" = setup ]; then
+if [ "$1" = factory ] || [ "$1" = setup ] || [ "$1" = spawn ]; then
     for module in \
         tests/test_worklink_claude_factory_host.py \
         tests/test_worklink_factory_supervisor.py \
@@ -128,7 +128,7 @@ if [ "$1" = factory ] || [ "$1" = setup ]; then
         uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 tests/test_worklink_autonomy.py
 fi
 
-if [ "$1" = setup ]; then
+if [ "$1" = setup ] || [ "$1" = spawn ]; then
     uv run --locked --extra dev --extra bench --extra claude-code python -m compileall -q \
         mimir/scaffold_docker.py mimir/plugin_dockerfile.py plugins/cultivate/mimir_cultivate/setup.py
     sh -n plugins/cultivate/mimir_cultivate/docker/base.sh
@@ -143,6 +143,28 @@ if [ "$1" = setup ]; then
         plugins/cultivate/tests/test_setup.py \
         plugins/cultivate/tests/test_docker_resources.py \
         plugins/cultivate/mimir_cultivate/defaults/skills/worklink-tool-pins/tests/test_worklink_tool_pins_poller.py
+    do
+        sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
+            uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"
+    done
+fi
+
+if [ "$1" = spawn ]; then
+    uv run --locked --extra dev --extra bench --extra claude-code python -m compileall -q \
+        plugins/cultivate/mimir_cultivate/policy.py mimir/tools/budget_gate.py
+    for module in \
+        tests/test_spawn_claude_code.py \
+        tests/test_spawn_caps.py \
+        tests/test_budget_gate_and_alias.py \
+        tests/test_tool_registry.py \
+        tests/test_service_tool_surface.py \
+        tests/test_access_control.py \
+        tests/test_information_flow.py \
+        tests/test_plugins_core_policy.py \
+        tests/test_tool_descriptors.py \
+        tests/test_plugin_policy_parity.py \
+        plugins/cultivate/tests/test_policy_tools.py \
+        plugins/cultivate/tests/test_package.py
     do
         sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
             uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"

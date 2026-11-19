@@ -587,6 +587,38 @@ def test_current_request_inventory_is_filtered_not_widened():
         assert f"Available tools: {listed}." in filtered.system_message.text
 
 
+@pytest.mark.parametrize("model,name", [
+    ("claude-code:sonnet", "spawn_claude_code"),
+    ("codex-plus:test", "spawn_open_code"),
+])
+def test_selected_spawn_binds_authorized_workspace_and_artifact_paths(monkeypatch, tmp_path, model, name):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir.tools.budget_gate import _request_with_resolved_spawn_paths
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", model)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    for entry in ("repos", "artifacts"):
+        (tmp_path / entry).mkdir()
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        service = build_trigger_service_principal(
+            canonical="poller:spawn-paths", trigger="poller", profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION, capabilities=(name,), creation_path="test",
+        )
+        assert service.sink_policy_for(name).adapter == "spawn_workspace"
+        request = ToolCallRequest(
+            tool_call={"name": name, "args": {"cwd": "repos", "artifact_root": "artifacts"},
+                       "id": "paths", "type": "tool_call"},
+            tool=None, state=None, runtime=Runtime(context=auth(service)),
+        )
+        resolved = _request_with_resolved_spawn_paths(request, name, auth(service))
+    assert resolved.tool_call["args"] == {
+        "cwd": str(tmp_path / "repos"), "artifact_root": str(tmp_path / "artifacts"),
+    }
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 async def test_registered_hidden_tool_still_reaches_handler(asynchronous):
     middleware = ServiceToolSurfaceMiddleware()
