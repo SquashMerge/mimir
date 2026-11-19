@@ -84,7 +84,16 @@ async def test_leaf_production_create_prompt_model_and_permissions(tmp_path):
                 {"action": "shell", "resource": "uv *", "effect": "allow"}],
         }
         prompt = next(body for _, route, _, body in daemon.requests if route.endswith("/prompt"))
-        assert prompt == {"text": "rules first\n\nbuild", "resume": True}
+        assert prompt == {"text": spec.session_request.text, "resume": True}
+        assert prompt["text"].endswith("rules first\n\nbuild")
+        listed_patterns = [
+            line.removeprefix("- `").removesuffix("`")
+            for line in prompt["text"].splitlines() if line.startswith("- `")
+        ]
+        assert listed_patterns == [
+            rule["resource"] for rule in create["permissions"]
+            if rule["action"] == "shell" and rule["effect"] == "allow"
+        ]
         assert spec.local_argv is None and spec.env == {}
         assert "worker_projections" not in spec.backend_config
         assert raw.backend_status == "success"
