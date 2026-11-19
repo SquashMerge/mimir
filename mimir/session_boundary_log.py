@@ -277,9 +277,30 @@ def _lookup_github_artifacts(
     if not isinstance(data, dict):
         raise RuntimeError("GitHub response had no data")
 
+    errors = payload.get("errors")
+    unknown_aliases: set[str] = set()
+    if result.returncode != 0 or errors:
+        # gh prints partial GraphQL data even on exit 1. Only alias-scoped
+        # NOT_FOUND errors are expected; auth and other request failures must
+        # still discard the entire batch, even if it contains terminal states.
+        aliases = {f"a{i}" for i in range(len(artifacts))}
+        if not isinstance(errors, list) or not errors:
+            raise RuntimeError(result.stderr.strip() or "GitHub validation failed")
+        for error in errors:
+            if not (
+                isinstance(error, dict)
+                and error.get("type") == "NOT_FOUND"
+                and isinstance(error.get("path"), list)
+                and error["path"]
+                and error["path"][0] in aliases
+            ):
+                raise RuntimeError(result.stderr.strip() or "GitHub validation failed")
+            unknown_aliases.add(error["path"][0])
+
     statuses: dict[GithubArtifact, str | None] = {}
     for index, artifact in enumerate(artifacts):
-        repository = data.get(f"a{index}")
+        alias = f"a{index}"
+        repository = None if alias in unknown_aliases else data.get(alias)
         if not isinstance(repository, dict):
             statuses[artifact] = None
             continue
@@ -299,24 +320,6 @@ def _lookup_github_artifacts(
             )
         else:
             statuses[artifact] = "REMOTE" if repository.get("ref") else None
-    if result.returncode != 0:
-        errors = payload.get("errors")
-        # gh exits non-zero even when GraphQL returns useful data alongside
-        # per-alias NOT_FOUND errors. Other errors must still fail open.
-        if not (
-            any(status is not None for status in statuses.values())
-            and isinstance(errors, list) and errors
-            and all(
-                isinstance(error, dict)
-                and error.get("type") == "NOT_FOUND"
-                and isinstance(error.get("path"), list)
-                and error["path"]
-                and error["path"][0] in data
-                and error["path"][0] in {f"a{i}" for i in range(len(artifacts))}
-                for error in errors
-            )
-        ):
-            raise RuntimeError(result.stderr.strip() or "GitHub validation failed")
     return statuses
 
 
