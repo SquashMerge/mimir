@@ -164,6 +164,8 @@ if [ "$1" = spawn ]; then
         tests/test_plugins_core_policy.py \
         tests/test_tool_descriptors.py \
         tests/test_plugin_policy_parity.py \
+        tests/test_plugin_skills_cli.py \
+        plugins/cultivate/tests/test_defaults.py \
         plugins/cultivate/tests/test_policy_tools.py \
         plugins/cultivate/tests/test_package.py
     do
