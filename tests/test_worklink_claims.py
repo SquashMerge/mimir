@@ -765,6 +765,82 @@ def test_heartbeat_issue_appends_fresh_claim_record() -> None:
     assert parsed == [updated]
 
 
+@pytest.fixture
+def lock_table_claims():
+    def make_claims(payload):
+        def runner(args):
+            assert list(args) == ["chainlink", "locks", "list", "--json"]
+            return subprocess.CompletedProcess(args, 0, json.dumps(payload), "")
+
+        return ChainlinkClaims(agent_id="mimir-a", runner=runner)
+
+    return make_claims
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ([], set()),
+    ({"locks": []}, set()),
+    ({"locks": {}}, set()),
+    ([{"issue_id": 1}], {1}),
+    ({"locks": [{"issue_id": 1}]}, {1}),
+    ({"version": 1, "locks": {"1": {}}, "settings": {}}, {1}),
+    ({"locks": {"1": {"issue_id": 2}}}, {2}),
+    ({"locks": {"1": {}, "2": {}}}, {1, 2}),
+])
+@pytest.mark.parametrize("require_identity", [False, True])
+def test_lock_table_supported_shapes_agree_with_reconciliation(
+    lock_table_claims, payload, expected, require_identity,
+):
+    claims = lock_table_claims(payload)
+    assert claims._active_worklink_lock_ids(require_identity=require_identity) == expected
+    assert claims.active_worklink_lock_count() == len(expected)
+    assert set(claims._reconciliation_locks(claims._run("locks", "list", "--json"))) == expected
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("entry", [{}, None, "anonymous", {"issue_id": "invalid"}])
+def test_lock_table_identity_required_rejects_anonymous_list_entry(
+    lock_table_claims, wrapped, entry,
+):
+    locks = [entry]
+    claims = lock_table_claims({"locks": locks} if wrapped else locks)
+    with pytest.raises(RuntimeError, match="^chainlink locks list --json omitted issue identity$"):
+        claims._active_worklink_lock_ids(require_identity=True)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("locks", [
+    [{"issue_id": 1}, {}],
+    [{}, {"issue_id": 1}],
+    [{}, {}, {"issue_id": 1}],
+    [{"issue_id": 1}, {}, {}],
+    [{"issue_id": -1}, {}],
+    [{}, {"issue_id": -2}],
+])
+def test_lock_table_anonymous_reservations_never_collide(lock_table_claims, wrapped, locks):
+    claims = lock_table_claims({"locks": locks} if wrapped else locks)
+    assert claims.active_worklink_lock_count() == len(locks)
+
+
+def test_lock_table_anonymous_mapping_reservations_never_collide(lock_table_claims):
+    claims = lock_table_claims({"locks": {"anonymous": {}, "-1": {}, "another": {}, "1": {}}})
+    assert claims.active_worklink_lock_count() == 4
+    with pytest.raises(RuntimeError, match="omitted issue identity"):
+        claims._active_worklink_lock_ids(require_identity=True)
+
+
+@pytest.mark.parametrize("payload", [
+    None, False, 1, "locks", {}, {"other": []},
+    {"locks": None}, {"locks": False}, {"locks": 1}, {"locks": "locks"},
+])
+def test_lock_table_unknown_shapes_fail_closed_with_parser_parity(lock_table_claims, payload):
+    claims = lock_table_claims(payload)
+    with pytest.raises(RuntimeError, match="^chainlink locks list --json returned unexpected shape$"):
+        claims.active_worklink_lock_count()
+    with pytest.raises(ValueError, match="^reconciliation lock table has an invalid shape$"):
+        claims._reconciliation_locks(claims._run("locks", "list", "--json"))
+
+
 def test_claim_issue_enforces_max_active_locks_after_reservation() -> None:
     calls: list[list[str]] = []
 

@@ -443,6 +443,16 @@ def _claim_is_newer(candidate: ClaimRecord, current: ClaimRecord) -> bool:
     return cand_anchor > cur_anchor
 
 
+def _lock_table_entries(data: Any) -> Iterable[tuple[str | None, Any]]:
+    """Accept shared lock table shapes; only mapping keys can identify issues."""
+    locks = data.get("locks") if isinstance(data, dict) else data
+    if isinstance(locks, dict):
+        return locks.items()
+    if isinstance(locks, list):
+        return ((None, value) for value in locks)
+    raise ValueError("invalid lock table shape")
+
+
 def _lock_issue_id(lock: dict[str, Any]) -> int | None:
     for key in ("issue_id", "id", "issue"):
         raw = lock.get(key)
@@ -857,11 +867,11 @@ class ChainlinkClaims:
         if result.returncode != 0:
             raise RuntimeError("reconciliation lock table unavailable")
         data = json.loads(result.stdout)
-        locks = data.get("locks") if isinstance(data, dict) else data
-        if not isinstance(locks, (dict, list)):
-            raise ValueError("reconciliation lock table has an invalid shape")
+        try:
+            entries = _lock_table_entries(data)
+        except ValueError as exc:
+            raise ValueError("reconciliation lock table has an invalid shape") from exc
         records: dict[int, dict[str, Any]] = {}
-        entries = locks.items() if isinstance(locks, dict) else ((None, v) for v in locks)
         for key, value in entries:
             if not isinstance(value, dict):
                 raise ValueError("reconciliation lock omitted claimant")
@@ -1547,15 +1557,13 @@ class ChainlinkClaims:
             data = json.loads(result.stdout or "{}")
         except json.JSONDecodeError as exc:
             raise RuntimeError("chainlink locks list --json returned invalid JSON") from exc
-        locks = data.get("locks", data if isinstance(data, list) else {})
+        try:
+            entries = _lock_table_entries(data)
+        except ValueError as exc:
+            raise RuntimeError("chainlink locks list --json returned unexpected shape") from exc
         ids: set[int] = set()
-        if isinstance(locks, dict):
-            iterable = locks.items()
-        elif isinstance(locks, list):
-            iterable = enumerate(locks)
-        else:
-            raise RuntimeError("chainlink locks list --json returned unexpected shape")
-        for index, (key, value) in enumerate(iterable):
+        anonymous = 0
+        for key, value in entries:
             raw = _lock_issue_id(value) if isinstance(value, dict) else None
             if raw is None:
                 try:
@@ -1563,8 +1571,13 @@ class ChainlinkClaims:
                 except (TypeError, ValueError):
                     if require_identity:
                         raise RuntimeError("chainlink locks list --json omitted issue identity")
-                    raw = -(index + 1)
+                    anonymous += 1
+                    continue
             ids.add(raw)
+        # Allocate only after reading every identity, below all parsed IDs (even
+        # negative ones), so anonymous reservations never disappear in the set.
+        floor = min(0, min(ids, default=0))
+        ids.update(range(floor - anonymous, floor))
         return ids
 
     def _issue_comments(self, issue_id: int, *, strict: bool = False) -> list[str]:
