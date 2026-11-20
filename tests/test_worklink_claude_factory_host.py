@@ -306,7 +306,8 @@ print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "r
         "env": {**spec.env, "PATH": os.environ["PATH"], "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "credential.https://github.com.helper", "GIT_CONFIG_VALUE_0": "!fixture-helper"},
         "projections": [{"path": p, "document": d.decode()} for p, d in home_projection_documents("claude_factory")],
-        "home_projection_profile": "claude_factory", "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+        "home_projection_profile": "claude_factory", "retirement": "contained_process_tree",
+        "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
         "timeout_s": 30, "stdout_limit": 65536, "stderr_limit": 65536,
     }
     messages, admissions = [], []
@@ -419,7 +420,7 @@ async def test_factory_admission_follows_durable_process_binding(real_package, t
             events.append("cleanup")
 
     bound = Compute()
-    monkeypatch.setattr(registry, "select_compute", lambda **kwargs: bound)
+    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "for_path_checkout", lambda uid: bound)
     monkeypatch.setattr(orch, "assert_base_repo_not_worker_writable", lambda *args, **kwargs: None)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
     monkeypatch.setattr(orch, "_create_backend_checkout", lambda *args, **kwargs:
@@ -648,6 +649,7 @@ async def test_claude_factory_containment_preserves_only_explicit_epic_inputs(re
         pid = os.getpid()
         process_start_ticks = 42
         timed_out = output_overflow = False
+        children_reaped = True
 
         async def wait(self):
             return 0
@@ -678,6 +680,157 @@ async def test_claude_factory_containment_preserves_only_explicit_epic_inputs(re
     assert not {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENCODE_CONFIG"}.intersection(request["env"])
     assert observed[1] == handle
     assert result.children_reaped and result.stdout_path is result.stderr_path is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", [False, True])
+@pytest.mark.parametrize("recovery", [False, True])
+async def test_factory_compute_binding_overrides_configured_daemon_after_recorded_host(
+    real_package, tmp_path, monkeypatch, route, recovery,
+):
+    from mimir_cultivate.worklink import orchestrator as orch, daemon_gate, daemon_health
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+    from mimir_cultivate.worklink.backends.registry import WorklinkConfig
+    from mimir_cultivate.worklink.checkout import CheckoutLease
+    from mimir_cultivate.worklink.claims import ClaimRecord, ClaimResult
+    from mimir_cultivate.worklink.factory_state import load_factory_record, save_factory_record
+
+    repo, operator = tmp_path / "repo", tmp_path / "operator"
+    repo.mkdir()
+    sandbox = operator / ".factory-sandboxes/chainlink-2126"
+    sandbox.mkdir(parents=True)
+    launcher = str(entrypoint(real_package))
+    prior_id = str(uuid.uuid4())
+    status = FactoryStatus(run_id="chainlink-2126", valid=True, sandbox_path=str(sandbox),
+        status="running", mode="autonomous", branch="feature/chainlink-2126", pr_base="main",
+        pr_draft=False, lock="fresh", dead_lock=False, lock_session="claude-code:" + prior_id,
+        next="implementation", next_present=True)
+    retained = FactoryRunRecord(run_id=status.run_id, issue_id=2126, attempt=1,
+        repository="owner/repo", base_ref="main", branch=status.branch, launcher=launcher,
+        sandbox=str(sandbox), session=status.lock_session, lock_session=status.lock_session,
+        host="claude_code", launch_generation=prior_id,
+        handle=compute.LaunchHandle("local_subprocess", prior_id, 42, 999999999),
+        status=status, observed_at=None, controller_phase="interrupted",
+        children_reaped=True, session_checkout=str(operator))
+    config_path = tmp_path / "worklink.yaml"
+
+    def configure(host_name, compute_name, entry):
+        config_path.write_text(json.dumps({
+            "defaults": {"compute_backend": "local_subprocess" if route else compute_name},
+            "routes": ([{"backend": "feature_factory", "label": "worklink:epic",
+                         "compute_backend": compute_name}] if route else []),
+            "backends": {"feature_factory": {"host": host_name, "entrypoint": entry}},
+        }))
+
+    configure("claude_code", "local_subprocess", launcher)
+    if recovery:
+        save_factory_record(tmp_path, retained)
+        # Change both mutable knobs after recording the original authority.
+        configure("opencode", "opencode_daemon", "/opt/changed/feature-factory/bin/factory.js")
+    else:
+        configure("claude_code", "opencode_daemon", launcher)
+    registry = BackendRegistry(WorklinkConfig.load(config_path))
+    assert isinstance(registry.select_compute(labels={"worklink:epic"}, repo="owner/repo"),
+                      compute.OpenCodeDaemonComputeBackend)
+    events, bindings = [], []
+
+    class Compute:
+        name = "local_subprocess"
+
+        async def launch(self, spec):
+            pending = load_factory_record(tmp_path, status.run_id)
+            assert pending.host == "claude_code" and pending.launcher == launcher
+            assert pending.handle is None and not pending.children_reaped
+            assert pending.launch_generation == spec.backend_config["worker_identifier"] != prior_id
+            assert pending.lock_session == "claude-code:" + pending.launch_generation
+            assert spec.session_request is None
+            assert spec.execution.home_projection_profile == "claude_factory"
+            events.append("held")
+            return compute.LaunchHandle("local_subprocess", pending.launch_generation, 43, 999999998)
+
+        async def admit_factory_handle(self, handle):
+            current = load_factory_record(tmp_path, status.run_id)
+            assert current.handle == handle and current.launcher == launcher
+            assert current.lock_session == "claude-code:" + handle.identifier
+            assert events[-2:] == ["held", "durable"]
+            events.append("admit")
+
+    bound = Compute()
+
+    def bind(uid):
+        bindings.append(uid)
+        return bound
+
+    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "for_path_checkout", bind)
+    monkeypatch.setattr(compute.OpenCodeDaemonComputeBackend, "launch",
+                        lambda *args: pytest.fail("Claude launched on daemon compute"))
+    monkeypatch.setattr(daemon_gate, "prepare_daemon_health",
+                        lambda *args: pytest.fail("Claude consulted daemon admission"))
+    monkeypatch.setattr(daemon_health, "daemon_health",
+                        lambda *args: pytest.fail("Claude consulted daemon health"))
+    monkeypatch.setattr(orch, "assert_base_repo_not_worker_writable", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "_repo_remote_url", lambda *args, **kwargs: "git@github.com:owner/repo.git")
+    monkeypatch.setattr(orch, "_sweep_retained_attempts", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "_git_credential_settings", lambda *args: ())
+    monkeypatch.setattr(orch, "_create_backend_checkout", lambda *args, **kwargs:
+        CheckoutLease(2126, 1, repo, operator, status.branch, "main", isolated_checkout=True))
+    monkeypatch.setattr(orch, "_verify_factory_recovery_target", lambda **kwargs: sandbox)
+    monkeypatch.setattr(orch, "_verify_factory_recovery_binding", lambda **kwargs: sandbox)
+    monkeypatch.setattr(orch, "_release_issue_and_clear_run_state", lambda *args, **kwargs: True)
+    monkeypatch.setattr(orch.ChainlinkClaims, "transition_issue", lambda *args, **kwargs: None)
+    order = order_for(operator)
+    order = replace(order, env={**order.env, "GIT_AUTHOR_NAME": "Fixture",
+                               "GIT_AUTHOR_EMAIL": "fixture@example.invalid"})
+    monkeypatch.setattr(orch.WorklinkRunner, "_factory_launch_order",
+                        lambda *args, **kwargs: (order, "fixture-bot"))
+
+    def claim(self, *args, **kwargs):
+        kwargs["before_claim"]()
+        return ClaimResult(True, ClaimRecord(2126, 2 if recovery else 1, "fixture", datetime.now(UTC)))
+
+    monkeypatch.setattr(orch.ChainlinkClaims, "claim_issue", claim)
+
+    def live(self, *args, **kwargs):
+        assert self.host == "claude_code" and kwargs["launcher"] == launcher
+        return replace(status, lock="absent", lock_session=None) if "release-old" in events else status
+
+    def release(self, run_id, action, **kwargs):
+        assert self.host == "claude_code" and action == "release"
+        assert kwargs["launcher"] == launcher and kwargs["session"] == retained.lock_session
+        events.append("release-old")
+
+    monkeypatch.setattr(FeatureFactoryBackend, "status", live)
+    monkeypatch.setattr(FeatureFactoryBackend, "lock", release)
+
+    def save(home, record):
+        save_factory_record(home, record)
+        if events and events[-1] == "held" and record.handle is not None:
+            events.append("durable")
+
+    monkeypatch.setattr(orch, "save_factory_record", save)
+
+    async def supervise(self, **kwargs):
+        assert kwargs["compute"] is bound
+        record = kwargs["factory_record"]
+        assert record.host == "claude_code" and record.launcher == launcher
+        assert events[-3:] == ["held", "durable", "admit"]
+        save_factory_record(tmp_path, replace(record, children_reaped=True))
+        events.append("supervise")
+        return orch.WorklinkRunResult(2126, record.attempt, "interrupted")
+
+    monkeypatch.setattr(orch.WorklinkRunner, "_supervise_factory_070", supervise)
+
+    def runner(args, **kwargs):
+        issue = {"id": 2126, "title": "epic", "description": "build",
+                 "labels": ["worklink", "worklink:epic"], "comments": []}
+        return subprocess.CompletedProcess(args, 0, json.dumps(issue), "")
+
+    # No injected registry or compute selector: run_epic loads the real file,
+    # constructs BackendRegistry and applies the recorded-host override itself.
+    result = await orch.WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(2126)
+    assert result.status == "interrupted", result
+    assert len(bindings) == 1
+    assert events == (["release-old"] if recovery else []) + ["held", "durable", "admit", "supervise"]
 
 
 @pytest.mark.asyncio
@@ -844,7 +997,7 @@ async def test_claude_epic_quota_uses_ledger_and_exact_claim(real_package, tmp_p
     backend = Factory(host="claude_code", entrypoint=str(entrypoint(real_package)))
     registry = BackendRegistry()
     registry.register(backend)
-    monkeypatch.setattr(registry, "select_compute", lambda **kwargs: Compute())
+    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "for_path_checkout", lambda uid: Compute())
     monkeypatch.setattr(orch, "assert_base_repo_not_worker_writable", lambda *args, **kwargs: None)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
     monkeypatch.setattr(orch, "_create_backend_checkout", lambda *args, **kwargs:

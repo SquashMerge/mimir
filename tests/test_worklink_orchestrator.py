@@ -3272,6 +3272,7 @@ def test_deadline_before_worker_collection_records_timeout(
 ) -> None:
     """Real executor/client/compute race, with terminal delivery held by a barrier."""
     import socket
+    import time
     from mimir_cultivate.worklink import compute, worker_client, worker_exec
 
     repo = tmp_path / "repo"
@@ -3289,7 +3290,7 @@ def test_deadline_before_worker_collection_records_timeout(
     threads: list[threading.Thread] = []
     cancellations: list[str] = []
     identifiers: list[str] = []
-    processes: list[subprocess.Popen] = []
+    processes: list[worker_exec._FactoryProcess] = []
     results: list[ComputeResult] = []
     monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "worker-homes")
     worker_exec.HOME_ROOT.mkdir()
@@ -3309,10 +3310,17 @@ def test_deadline_before_worker_collection_records_timeout(
     cancel = worker_exec._handle_cancel
 
     def wait(proc, *args):
+        assert isinstance(proc, worker_exec._FactoryProcess)
         processes.append(proc)
         if worker_state == "live":
+            # The contained policy now supervises this leaf. Let its real
+            # monitor run during cancellation; stop() waits for that monitor's
+            # ECHILD proof rather than reaping Popen directly.
+            deadline_at = time.monotonic() + 10
+            while not (worktree / "changed.txt").exists():
+                assert time.monotonic() < deadline_at, "payload did not enter its live state"
+                time.sleep(0.01)
             ready.set()
-            assert release.wait(10), "controller did not cancel the live worker"
         return monitor(proc, *args)
 
     def cleanup(home):
@@ -3417,7 +3425,7 @@ def test_deadline_before_worker_collection_records_timeout(
     finally:
         release.set()
         for proc in processes:
-            if proc.poll() is None:
+            if not proc.done.is_set():
                 worker_exec._terminate_process_group(proc)
         for thread in threads:
             thread.join(10)

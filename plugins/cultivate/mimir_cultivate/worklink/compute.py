@@ -941,6 +941,8 @@ class LocalSubprocessComputeBackend:
                         projections,
                         identifier=identifier,
                         home_projection_profile=profile,
+                        retirement=("contained_process_tree"
+                                    if spec.execution.retirement == "contained_process_tree" else "process"),
                         timeout_s=spec.timeout_s,
                         stdout_limit=stdout_limit,
                         stderr_limit=stderr_limit,
@@ -1037,13 +1039,7 @@ class LocalSubprocessComputeBackend:
                 command=command,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
-                # The executor supervises factory workers and private Claude
-                # profiles with its subreaper; lost/refused reports raise.
-                children_reaped=(
-                    _spec.execution.checkout_protocol == "factory_worker"
-                    or (_spec.execution.retirement == "contained_process_tree"
-                        and _spec.execution.home_projection_profile != "none")
-                ),
+                children_reaped=collected.children_reaped,
             )
 
         proc = job

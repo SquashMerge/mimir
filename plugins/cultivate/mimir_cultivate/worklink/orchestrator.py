@@ -3196,6 +3196,9 @@ class WorklinkRunner:
         execution = selected.capabilities().execution
         if execution.substrate == "contained_subprocess" and execution.checkout_protocol == "factory_worker":
             runner = _factory_git_runner(runner)
+            from .identities import get_identities
+
+            compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
         if execution.substrate == "opencode_daemon" and callable(getattr(compute, "_launch_contained", None)):
             runner = _factory_git_runner(runner)
             from .compute import OpenCodeDaemonComputeBackend
