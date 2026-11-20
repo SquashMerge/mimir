@@ -574,29 +574,78 @@ async def test_malformed_child_page_is_rejected(tmp_path, monkeypatch, page):
             await client.children(controller.record.opencode_session_id)
 
 
-@pytest.mark.parametrize("bound", ["count", "size"])
-async def test_child_bounds_count_unique_latest_entries(tmp_path, monkeypatch, bound):
-    from mimir_cultivate.worklink import daemon_client
-
+async def test_child_count_bound_counts_unique_latest_entries(tmp_path, monkeypatch):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         controller = await create(client, tmp_path)
         root = controller.record.opencode_session_id
         children = [{"id": f"ses_child{i}", "parentID": root}
-                    for i in range(4096 if bound == "count" else 1)]
+                    for i in range(4096)]
         newer = {**children[-1], "title": "new"}
         pages = iter([
             {"data": children, "cursor": {"previous": None, "next": "next"}},
             {"data": [newer], "cursor": {"previous": None, "next": None}},
         ])
-        if bound == "size":
-            # Either version fits, but counting both versions exceeds the bound.
-            monkeypatch.setattr(daemon_client, "MAX_ITEM_BYTES",
-                                (len(json.dumps(newer).encode()) + 15) // 16)
         async def request(*args, **kwargs):
             return next(pages)
         monkeypatch.setattr(client, "_request", request)
         result = await client.children(root)
         assert result == [*children[:-1], newer]
+
+
+@pytest.mark.parametrize("entries_per_page", [0, 1, 2])
+async def test_child_pagination_work_is_bounded_with_fresh_cursors(
+    tmp_path, monkeypatch, entries_per_page,
+):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        child = {"id": "ses_relisted", "parentID": root}
+        calls = 0
+        expected_calls = 8192 // max(1, entries_per_page) + 1
+
+        async def request(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            # A removed work bound must fail promptly, not hang the test runner.
+            assert calls <= expected_calls, "pagination escaped its work bound"
+            return {"data": [child] * entries_per_page,
+                    "cursor": {"previous": None, "next": f"cur{calls}"}}
+
+        monkeypatch.setattr(client, "_request", request)
+        with pytest.raises(DaemonClientError, match="session children exceed bound"):
+            await client.children(root)
+        assert calls == expected_calls
+
+
+@pytest.mark.parametrize("payload", ["child", "metadata"])
+async def test_child_pagination_counts_bytes_across_all_pages(tmp_path, monkeypatch, payload):
+    from mimir_cultivate.worklink import daemon_client
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        monkeypatch.setattr(daemon_client, "MAX_ITEM_BYTES", 64)
+        calls = 0
+
+        async def request(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            assert calls <= 2, "pagination escaped its cumulative byte bound"
+            child = {"id": "ses_relisted", "parentID": root}
+            result = {"data": [child], "cursor": {"previous": None, "next": f"cur{calls}"}}
+            if payload == "child":
+                child["title"] = "x" * 600
+            else:
+                result["padding"] = "x" * 600
+            # A single full page fits; two exceed the read budget. Unique
+            # retained state, occurrences, and page count remain below bounds.
+            assert 512 < len(json.dumps(result).encode()) < 16 * daemon_client.MAX_ITEM_BYTES
+            return result
+
+        monkeypatch.setattr(client, "_request", request)
+        with pytest.raises(DaemonClientError, match="session children exceed bound"):
+            await client.children(root)
+        assert calls == 2
 
 
 @pytest.mark.parametrize("level", ["children", "replacement", "tree"])

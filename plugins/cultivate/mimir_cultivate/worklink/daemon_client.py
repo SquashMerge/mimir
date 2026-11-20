@@ -233,6 +233,7 @@ class OpenCodeDaemonClient:
         cursor = None
         limit = 100
         size = 0
+        pages_read = occurrences = bytes_read = 0
         while True:
             # Native cursors retain the original query; do not repeat parent/order.
             params = {"cursor": cursor, "limit": str(limit)} if cursor is not None else {
@@ -247,6 +248,14 @@ class OpenCodeDaemonClient:
             if (not isinstance(result, dict) or not isinstance(result.get("data"), list)
                     or any(not isinstance(child, dict) for child in result["data"])):
                 raise DaemonClientError("invalid session page")
+            # Deduplication bounds retained state, not pagination work. Charge
+            # every page (even empty ones), occurrence, and full response body.
+            pages_read += 1
+            occurrences += len(result["data"])
+            bytes_read += len(json.dumps(result).encode())
+            if (pages_read > 2 * 4096 or occurrences > 2 * 4096
+                    or bytes_read > 16 * MAX_ITEM_BYTES):
+                raise DaemonClientError("session children exceed bound")
             for child in result["data"]:
                 try:
                     _identifier(child.get("id"), "ses")
