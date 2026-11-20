@@ -90,7 +90,19 @@ async def test_fake_form_info_and_reply_match_captured_schema(fake_opencode_daem
         assert await client.forms(sid) == []
 
 
-@pytest.mark.parametrize("case", ["foreign_parent", "duplicate_child", "bad_child_id", "bad_cursor", "repeated_cursor"])
+async def test_children_listing_keeps_last_same_page_occurrence(fake_opencode_daemon):
+    daemon = fake_opencode_daemon
+    async with OpenCodeDaemonClient(**daemon.connection) as client:
+        root = await create(client)
+        child = daemon.new_session({"parentID": root})
+        newer = {**child, "title": "Latest child state"}
+        daemon.faults[("GET", "/api/session")].append(SyntheticFault(body=json.dumps({
+            "data": [child, newer], "cursor": {"previous": None, "next": None},
+        }).encode()))
+        assert await client.children(root) == [newer]
+
+
+@pytest.mark.parametrize("case", ["foreign_parent", "foreign_repeat", "bad_child_id", "bad_cursor", "repeated_cursor"])
 async def test_children_listing_fails_closed_on_invalid_binding_or_pagination(fake_opencode_daemon, case):
     daemon = fake_opencode_daemon
     async with OpenCodeDaemonClient(**daemon.connection) as client:
@@ -100,8 +112,8 @@ async def test_children_listing_fails_closed_on_invalid_binding_or_pagination(fa
         cursor = {"previous": None, "next": None}
         if case == "foreign_parent":
             data[0]["parentID"] = "ses_other"
-        elif case == "duplicate_child":
-            data *= 2
+        elif case == "foreign_repeat":
+            data.append({**child, "parentID": "ses_other"})
         elif case == "bad_child_id":
             data[0]["id"] = "../foreign"
         elif case == "bad_cursor":
@@ -112,7 +124,7 @@ async def test_children_listing_fails_closed_on_invalid_binding_or_pagination(fa
         body = json.dumps({"data": data, "cursor": cursor}).encode()
         for _ in range(2):
             daemon.faults[("GET", "/api/session")].append(SyntheticFault(body=body))
-        reason = {"foreign_parent": "foreign child session", "duplicate_child": "invalid child session binding",
+        reason = {"foreign_parent": "foreign child session", "foreign_repeat": "foreign child session",
                   "bad_child_id": "invalid child session identity", "bad_cursor": "invalid session page",
                   "repeated_cursor": "repeated session cursor"}[case]
         with pytest.raises(DaemonClientError, match=reason):
@@ -154,9 +166,10 @@ async def test_children_listing_has_aggregate_bounds(fake_opencode_daemon, monke
         async def pages(*args, **kwargs):
             calls.append(kwargs)
             assert len(calls) < 20, "aggregate bound must fire before this synthetic sentinel"
-            data = ([{"id": f"ses_{i}", "parentID": root} for i in range(4097)] if bound == "count" else [])
-            return {"data": data, "cursor": {"previous": None, "next": str(len(calls))},
-                    "padding": "x" * (1024 * 1024 - 1024) if bound == "bytes" else ""}
+            data = ([{"id": f"ses_{i}", "parentID": root} for i in range(4097)] if bound == "count" else [
+                {"id": f"ses_{len(calls)}", "parentID": root, "title": "x" * (1024 * 1024 - 1024)},
+            ])
+            return {"data": data, "cursor": {"previous": None, "next": str(len(calls))}}
         monkeypatch.setattr(client, "_request", pages)
         with pytest.raises(DaemonClientError, match="session children exceed bound"):
             await client.children(root)
