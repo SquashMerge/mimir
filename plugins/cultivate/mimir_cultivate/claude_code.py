@@ -9,7 +9,9 @@ from pathlib import Path
 import re
 import shlex
 import time
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
+
+from langchain_core.tools import tool
 
 from .contained_execution import SensitiveMaterialScrubber
 from .worklink.backends.base import blocked_reason_from_output
@@ -233,3 +235,191 @@ def parse_stream(stdout: str, exit_code: int, *, now: float | None = None) -> St
         return StreamResult("failed", "Claude success contradicts its execution errors")
     reason = blocked_reason_from_output(final["result"], "")
     return StreamResult("blocked", reason, reason) if reason else StreamResult("success")
+
+
+async def _spawn_claude_code_impl(
+    prompt: str, cwd: str | None = None, timeout_s: int = 1800,
+    name: str | None = None, model: str | None = None,
+    artifact_root: str | None = None, *, contained_runner: Any, checkout_factory: Any,
+    pass_env: Sequence[str] = (),
+) -> str:
+    import os
+    import uuid
+
+    from mimir.config import model_spec_at_call_time
+    from mimir.contained_snapshot import SnapshotCredentialsRefused
+    from mimir.tools.registry import (
+        _STATE, _spawn_acquire_rate_slot, _spawn_current_depth,
+        _spawn_guard_init, _spawn_release_rate_slot,
+    )
+    from .contained_execution import base_worker_environment
+    from .opencode import (
+        SpawnTerminalResult, _confined_artifact_base, build_opencode_proposal,
+        classify_spawn_terminal_state, write_spawn_artifacts,
+    )
+    from .worklink.execution_policy import home_projection_documents
+    from .worklink.worker_client import WorkerProjection
+
+    tool_name = "spawn_claude_code"
+    cfg = _STATE["spawn_config"]
+    if cfg is None:
+        return f"{tool_name} failed: no spawn config"
+    guard = _spawn_guard_init()
+    depth = _spawn_current_depth()
+    if depth >= guard.max_depth:
+        return f"{tool_name} refused: recursion depth cap reached ({depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth})."
+    if not isinstance(prompt, str) or not prompt.strip():
+        return f"{tool_name} failed: prompt is required"
+    token, error = await _spawn_acquire_rate_slot(guard, tool_name)
+    if error is not None:
+        return error
+
+    identifier = str(uuid.uuid4())
+    run_id = f"claude-{uuid.uuid4().hex[:12]}"
+    default = Path(cfg.get("default_cwd") or os.environ.get("HOME", "."))
+    seed = Path(cwd).expanduser() if cwd else default
+    home = Path(os.environ.get("HOME", str(default))).expanduser()
+    configured_spec = model_spec_at_call_time()
+    scrubber = SensitiveMaterialScrubber(home=home, checkout=seed, artifact_root=artifact_root)
+    from .opencode import register_spawn_secrets
+    register_spawn_secrets(scrubber, os.environ)
+    checkout = None
+    retain = False
+    execution = None
+    selected_model = None
+    stdout = b""
+    stderr = b""
+    terminal = classify_spawn_terminal_state(configuration_reason="invalid_configuration")
+    artifact_base = None
+    artifact_handle = None
+    try:
+        try:
+            artifact_base = _confined_artifact_base(
+                str(artifact_root or cfg.get("artifact_root") or home / ".factory/runs"), home,
+            )
+            artifact_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except (OSError, RuntimeError, ValueError):
+            terminal = classify_spawn_terminal_state(artifact_available=False)
+        else:
+            try:
+                selected_model = resolve_model(configured_spec, model)
+                environment = leaf_environment(os.environ, pass_env)
+                # Spawn has no operator-supplied test command. Admit only the
+                # repository's established Git and Python test-runner prefixes.
+                rules = bash_rules("uv run pytest")
+                argv = leaf_argv(scrubber.scrub_text(prompt), selected_model,
+                                 Path("/var/lib/mimir-worklink/homes") / identifier, rules)
+                if type(timeout_s) is not int or timeout_s <= 0:
+                    raise ValueError("invalid timeout")
+                terminal = None
+            except ValueError:
+                terminal = classify_spawn_terminal_state(configuration_reason="invalid_configuration")
+            if terminal is None:
+                try:
+                    checkout = checkout_factory(seed, default_cwd=default,
+                                                known_sensitive=tuple(v.encode() for v in environment.values() if v))
+                except SnapshotCredentialsRefused:
+                    terminal = classify_spawn_terminal_state(provisioning_reason="seed_credentials")
+                except (OSError, RuntimeError, ValueError):
+                    terminal = classify_spawn_terminal_state(provisioning_reason="invalid_seed")
+            if terminal is None:
+                assert checkout is not None and guard.sem is not None
+                try:
+                    async with guard.sem:
+                        retain = True
+                        execution = await contained_runner(
+                            argv, checkout.capability,
+                            {**base_worker_environment(identifier), **environment,
+                             "MIMIR_SPAWN_DEPTH": str(depth + 1)},
+                            tuple(WorkerProjection(path, document) for path, document
+                                  in home_projection_documents("claude_leaf")),
+                            identifier=identifier, home_projection_profile="claude_leaf",
+                            timeout_s=timeout_s, stdout_limit=MAX_STREAM_BYTES,
+                            stderr_limit=1024 * 1024, scrubber=scrubber,
+                        )
+                        retain = False
+                    stdout, stderr = execution.stdout, execution.stderr
+                    if execution.timed_out or execution.output_overflow:
+                        terminal = classify_spawn_terminal_state(
+                            timed_out=execution.timed_out, output_overflow=execution.output_overflow,
+                            exit_code=execution.exit_code,
+                        )
+                    else:
+                        try:
+                            parsed = parse_stream(stdout.decode("utf-8", "strict"), execution.exit_code)
+                        except UnicodeDecodeError:
+                            parsed = StreamResult("failed", "Claude output is not UTF-8")
+                        if parsed.status != "success":
+                            terminal = SpawnTerminalResult(
+                                "authentication_required" if parsed.status == "auth_error" else "failed",
+                                execution.exit_code, parsed.status, "spawn_claude_code_completed",
+                            )
+                        else:
+                            proposal = build_opencode_proposal(
+                                checkout.path, scrubber=scrubber, base_tree=checkout.base_tree,
+                            )
+                            terminal = classify_spawn_terminal_state(
+                                exit_code=execution.exit_code, proposal_result=proposal,
+                            )
+                except (OSError, RuntimeError, ValueError, UnicodeError):
+                    terminal = classify_spawn_terminal_state(containment_available=False)
+            assert terminal is not None
+            manifest = {
+                "schema_version": 2, "run_id": run_id, "launcher": "mimir.spawn_claude_code",
+                "name": name, "model": selected_model, "status": terminal.status,
+                "reason_code": terminal.reason_code, "exit_code": terminal.exit_code,
+                "seed_tree": checkout.base_tree if checkout else None,
+                "timed_out": bool(execution and execution.timed_out),
+                "output_overflow": bool(execution and execution.output_overflow),
+                "checkout_retained": retain, "worker_identifier": identifier,
+            }
+            try:
+                artifact_handle = write_spawn_artifacts(
+                    artifact_base, run_id, prompt=prompt, stdout=stdout, stderr=stderr,
+                    manifest=manifest, scrubber=scrubber, proposal=terminal.proposal,
+                )
+            except (OSError, RuntimeError, ValueError):
+                terminal = classify_spawn_terminal_state(artifact_available=False)
+    except BaseException:
+        if artifact_base is not None:
+            try:
+                write_spawn_artifacts(
+                    artifact_base, run_id, prompt=prompt, stdout=stdout, stderr=stderr,
+                    manifest={"schema_version": 2, "run_id": run_id,
+                              "launcher": "mimir.spawn_claude_code", "status": "interrupted",
+                              "worker_identifier": identifier, "checkout_retained": retain},
+                    scrubber=scrubber,
+                )
+            except (OSError, RuntimeError, ValueError):
+                pass
+        raise
+    finally:
+        try:
+            if checkout is not None:
+                checkout.close(retain=retain)
+        finally:
+            if execution is None and not retain:
+                await _spawn_release_rate_slot(guard, token)
+    return json.dumps({
+        "run_id": run_id, "status": terminal.status, "reason_code": terminal.reason_code,
+        "exit_code": terminal.exit_code, "stdout": scrubber.scrub_text(stdout)[:2000],
+        "result": scrubber.scrub_text(stdout)[:2000], "stderr": scrubber.scrub_text(stderr)[:500],
+        "artifact_dir": artifact_handle, "name": scrubber.scrub_text(name) if name else name,
+        "proposal": terminal.proposal.as_dict() if terminal.proposal else None,
+    })
+
+
+@tool
+async def spawn_claude_code(
+    prompt: str, cwd: str | None = None, timeout_s: int = 1800,
+    name: str | None = None, model: str | None = None,
+    artifact_root: str | None = None,
+) -> str:
+    """Run official Claude in a fresh contained checkout and return a bounded proposal."""
+    from .contained_checkout import create_opencode_checkout
+    from .contained_execution import execute_contained
+
+    return await _spawn_claude_code_impl(
+        prompt, cwd, timeout_s, name, model, artifact_root,
+        contained_runner=execute_contained, checkout_factory=create_opencode_checkout,
+    )
