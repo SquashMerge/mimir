@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import csv
+from importlib import metadata
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import sysconfig
+import tomllib
 
 import pytest
 
@@ -91,6 +95,47 @@ def disposable_repository(tmp_path: Path) -> Path:
         )
     for name in ("Dockerfile", "pyproject.toml", "uv.lock"):
         shutil.copy2(ROOT / name, destination / name)
+    plugin = destination / "plugins/cultivate"
+    configuration = tomllib.loads((plugin / "pyproject.toml").read_text())
+    project = configuration["project"]
+    # Reproduce the wheel's resource layout and inventory from its declaration,
+    # not from an optional installation in the interpreter running these tests.
+    includes = configuration["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
+    for source, target in includes.items():
+        source_path, target_path = plugin / source, plugin / target
+        if source_path == target_path:
+            continue
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+    distribution = plugin / f"mimir_cultivate-{project['version']}.dist-info"
+    distribution.mkdir()
+    (distribution / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {project['name']}\nVersion: {project['version']}\n"
+    )
+    entries = project["entry-points"]["mimir.plugins"]
+    (distribution / "entry_points.txt").write_text(
+        "[mimir.plugins]\n" + "".join(f"{name} = {value}\n" for name, value in entries.items())
+    )
+    with (distribution / "RECORD").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        for path in sorted((plugin / "mimir_cultivate").rglob("*")):
+            if path.is_file():
+                writer.writerow((path.relative_to(plugin).as_posix(), "", ""))
+
+    # Start children without site initialization. Mirror dependencies but omit
+    # ambient Cultivate metadata, so neither missing nor installed workspace
+    # metadata can change discovery or create duplicate plugin candidates.
+    dependencies = destination / "dependencies"
+    dependencies.mkdir()
+    for library in {sysconfig.get_path("purelib"), sysconfig.get_path("platlib")}:
+        for path in Path(library).iterdir():
+            if path.name.endswith((".dist-info", ".egg-info")):
+                name = metadata.PathDistribution(path).metadata.get("Name", "")
+                if name.lower().replace("_", "-") == "mimir-cultivate":
+                    continue
+            target = dependencies / path.name
+            if not target.exists():
+                target.symlink_to(path, target_is_directory=path.is_dir())
     return destination
 
 
@@ -99,12 +144,29 @@ def run_control(repository: Path, mutation: Mutation, stage: str) -> subprocess.
     env.pop("PYTEST_ADDOPTS", None)
     env.pop("MIMIR_PLUGINS", None)
     env.pop("MIMIR_ACCESS_CONTROL_ENFORCED", None)
-    env["PYTHONPATH"] = os.pathsep.join((
-        str(repository), str(repository / "plugins/cultivate"),
-    ))
+    env.pop("PYTHONPATH", None)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "--tb=short", "-o", "addopts=", mutation.test],
+        [sys.executable, "-S", "-c", """
+from pathlib import Path
+import runpy
+import sys
+
+repository = Path(sys.argv.pop(1))
+sys.path[:0] = [str(repository), str(repository / "plugins/cultivate"),
+               str(repository / "dependencies")]
+from importlib import metadata
+import mimir_cultivate
+from mimir.plugins.discovery import enabled_plugins
+
+assert Path(mimir_cultivate.__file__).is_relative_to(repository)
+candidates = enabled_plugins(enable="cultivate")
+assert len(candidates) == 1 and candidates[0].name == "cultivate"
+assert Path(candidates[0].entry_point.dist.locate_file("")).is_relative_to(repository)
+assert metadata.version("mimir-cultivate") == candidates[0].version
+sys.argv[0] = "pytest"
+runpy.run_module("pytest", run_name="__main__")
+""", str(repository), "-q", "--tb=short", "-o", "addopts=", mutation.test],
         cwd=repository, env=env, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=180,
     )
