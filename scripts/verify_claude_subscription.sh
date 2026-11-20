@@ -59,11 +59,11 @@ if [ "${1:-}" = --isolated-tests ]; then
     shift
 fi
 if [ "$#" -ne 2 ]; then
-    echo "usage: sh scripts/verify_claude_subscription.sh <leaf|factory|setup|spawn> <inspected-plugin-package>" >&2
+    echo "usage: sh scripts/verify_claude_subscription.sh <leaf|factory|setup|spawn|integrated> <inspected-plugin-package>" >&2
     exit 64
 fi
 case "$1" in
-    leaf|factory|setup|spawn) ;;
+    leaf|factory|setup|spawn|integrated) ;;
     *) echo "unknown subscription verification phase: $1" >&2; exit 64 ;;
 esac
 case "$2" in
@@ -112,7 +112,7 @@ do
         uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"
 done
 
-if [ "$1" = factory ] || [ "$1" = setup ] || [ "$1" = spawn ]; then
+if [ "$1" = factory ] || [ "$1" = setup ] || [ "$1" = spawn ] || [ "$1" = integrated ]; then
     for module in \
         tests/test_worklink_claude_factory_host.py \
         tests/test_worklink_factory_supervisor.py \
@@ -122,6 +122,27 @@ if [ "$1" = factory ] || [ "$1" = setup ] || [ "$1" = spawn ]; then
         tests/test_web_ui.py \
         tests/test_spawn_opencode.py
     do
+        if [ "$1" = integrated ] && [ "$module" = tests/test_worklink_claude_factory_host.py ]; then
+            mkdir -p .factory
+            sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
+                uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 \
+                --junitxml=.factory/claude-factory-acceptance.xml "$module"
+            python3 - <<'PY'
+import xml.etree.ElementTree as ET
+
+cases = ET.parse(".factory/claude-factory-acceptance.xml").findall(".//testcase")
+for name in (
+    "test_real_exports_are_authoritative",
+    "test_real_local_factory_status_and_competing_lock",
+    "test_real_exports_and_foreground_wrapper_through_worker_executor",
+):
+    selected = [case for case in cases if case.attrib["name"].split("[", 1)[0] == name]
+    if not selected or any(len(case.findall("skipped")) or len(case.findall("failure"))
+                           or len(case.findall("error")) for case in selected):
+        raise SystemExit(f"mandatory offline package/worker test did not pass: {name}")
+PY
+            continue
+        fi
         sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
             uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"
     done
@@ -129,7 +150,7 @@ if [ "$1" = factory ] || [ "$1" = setup ] || [ "$1" = spawn ]; then
         uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 tests/test_worklink_autonomy.py
 fi
 
-if [ "$1" = setup ] || [ "$1" = spawn ]; then
+if [ "$1" = setup ] || [ "$1" = spawn ] || [ "$1" = integrated ]; then
     uv run --locked --extra dev --extra bench --extra claude-code python -m compileall -q \
         mimir/scaffold_docker.py mimir/plugin_dockerfile.py plugins/cultivate/mimir_cultivate/setup.py
     sh -n plugins/cultivate/mimir_cultivate/docker/base.sh
@@ -150,7 +171,7 @@ if [ "$1" = setup ] || [ "$1" = spawn ]; then
     done
 fi
 
-if [ "$1" = spawn ]; then
+if [ "$1" = spawn ] || [ "$1" = integrated ]; then
     uv run --locked --extra dev --extra bench --extra claude-code python -m compileall -q \
         plugins/cultivate/mimir_cultivate/policy.py mimir/tools/budget_gate.py
     for module in \
@@ -172,6 +193,14 @@ if [ "$1" = spawn ]; then
         sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
             uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 "$module"
     done
+fi
+
+if [ "$1" = integrated ]; then
+    uv run --locked --extra dev --extra bench --extra claude-code python -m compileall -q \
+        tests/test_claude_subscription_mutations.py
+    sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
+        uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 \
+        tests/test_claude_subscription_mutations.py
 fi
 
 sh scripts/heavy_run.sh env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED uv run --locked --extra dev --extra bench --extra claude-code pytest -q -n 6 tests
