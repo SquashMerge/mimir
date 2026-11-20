@@ -204,6 +204,41 @@ async def test_spawn_terminal_and_proposal_bounds(spawn_tree, tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [b"\xff", b"\xe2\x82"])
+@pytest.mark.parametrize("timed_out,overflow,expected", [
+    (False, False, "failed"), (True, False, "timeout"), (False, True, "output_overflow"),
+])
+async def test_spawn_invalid_utf8_transport_precedence(
+    spawn_tree, tmp_path, monkeypatch, raw, timed_out, overflow, expected,
+):
+    home, seed = spawn_tree
+    secret = "oauth-" + "owned"
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", secret)
+    record = {}
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(0, secret.encode() + raw, secret.encode(), timed_out, overflow, 0, 0)
+
+    result = json.loads(await _spawn_claude_code_impl(
+        "implement", str(seed), contained_runner=runner,
+        checkout_factory=factory_for(tmp_path, record),
+    ))
+    assert result["status"] == expected
+    assert result["proposal"] is None
+    directory = home / "artifacts" / result["artifact_dir"]
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert manifest["status"] == expected
+    assert manifest["timed_out"] is timed_out
+    assert manifest["output_overflow"] is overflow
+    assert manifest["checkout_retained"] is False
+    assert not (directory / "proposal.json").exists()
+    for path in directory.iterdir():
+        assert secret not in path.read_text()
+    assert secret not in json.dumps(result)
+    assert record["checkout"].closed and not record["checkout"].retained
+
+
+@pytest.mark.asyncio
 async def test_spawn_cancellation_retains_uncertain_checkout_and_identity(spawn_tree, tmp_path, monkeypatch):
     home, seed = spawn_tree
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-" + "owned")

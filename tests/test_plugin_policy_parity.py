@@ -545,8 +545,11 @@ def test_selected_coding_tools_reach_a_permitted_production_boundary(
     assert fetched.status != "error"
 
 
+@pytest.mark.parametrize("model,spawn", [
+    ("claude-code:sonnet", "spawn_claude_code"), ("codex-plus:test", "spawn_open_code"),
+])
 def test_selected_spawn_and_build_admit_clean_bound_destinations(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str, spawn: str,
 ) -> None:
     pytest.importorskip("mimir_cultivate")
     from mimir.plugins.core import policy_scope
@@ -558,10 +561,11 @@ def test_selected_spawn_and_build_admit_clean_bound_destinations(
     repo.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", model)
     selected = load_plugins(enable="cultivate").policy
     with policy_scope(selected):
         for tool, target, arguments in (
-            ("spawn_open_code", str(home), {"cwd": str(home)}),
+            (spawn, str(home), {"cwd": str(home)}),
             ("worklink_run", str(repo), {}),
         ):
             for enforce in (False, True):
@@ -571,3 +575,15 @@ def test_selected_spawn_and_build_admit_clean_bound_destinations(
                 )
                 assert decision.allowed and not decision.would_block, (tool, enforce, decision.reason)
                 assert decision.flow_direction.value == "both"
+        denied = policy.ToolRegistry().authorize_tool(
+            spawn, _context("user", False), enforce=True,
+            target_channel=str(home), arguments={"cwd": str(home)},
+        )
+        assert denied.allowed is False
+        assert denied.reason == "admin_required"
+        tainted = policy.ToolRegistry().authorize_tool(
+            spawn, _context("admin", True), enforce=True,
+            target_channel=str(home), arguments={"cwd": str(home)},
+        )
+        assert tainted.allowed is False
+        assert tainted.reason == "write_blocked_by_untrusted_ingest"

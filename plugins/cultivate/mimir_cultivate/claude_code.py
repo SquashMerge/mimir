@@ -339,21 +339,28 @@ async def _spawn_claude_code_impl(
                         )
                         retain = False
                     stdout, stderr = execution.stdout, execution.stderr
-                    parsed = parse_stream(stdout.decode("utf-8", "strict"), execution.exit_code)
-                    proposal = None
-                    if parsed.status == "success" and not execution.timed_out and not execution.output_overflow:
-                        proposal = build_opencode_proposal(checkout.path, scrubber=scrubber,
-                                                           base_tree=checkout.base_tree)
-                    if parsed.status != "success" and not execution.timed_out and not execution.output_overflow:
-                        terminal = SpawnTerminalResult(
-                            "authentication_required" if parsed.status == "auth_error" else "failed",
-                            execution.exit_code, parsed.status, "spawn_claude_code_completed",
-                        )
-                    else:
+                    if execution.timed_out or execution.output_overflow:
                         terminal = classify_spawn_terminal_state(
                             timed_out=execution.timed_out, output_overflow=execution.output_overflow,
-                            exit_code=execution.exit_code, proposal_result=proposal,
+                            exit_code=execution.exit_code,
                         )
+                    else:
+                        try:
+                            parsed = parse_stream(stdout.decode("utf-8", "strict"), execution.exit_code)
+                        except UnicodeDecodeError:
+                            parsed = StreamResult("failed", "Claude output is not UTF-8")
+                        if parsed.status != "success":
+                            terminal = SpawnTerminalResult(
+                                "authentication_required" if parsed.status == "auth_error" else "failed",
+                                execution.exit_code, parsed.status, "spawn_claude_code_completed",
+                            )
+                        else:
+                            proposal = build_opencode_proposal(
+                                checkout.path, scrubber=scrubber, base_tree=checkout.base_tree,
+                            )
+                            terminal = classify_spawn_terminal_state(
+                                exit_code=execution.exit_code, proposal_result=proposal,
+                            )
                 except (OSError, RuntimeError, ValueError, UnicodeError):
                     terminal = classify_spawn_terminal_state(containment_available=False)
             assert terminal is not None

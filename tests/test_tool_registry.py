@@ -236,6 +236,58 @@ def test_coding_tool_is_registered_only_when_enabled_and_available(
     ) if tool.name == "spawn_open_code") is spawn_open_code
 
 
+@pytest.mark.parametrize("model,name", [
+    ("claude-code:sonnet", "spawn_claude_code"), ("codex-plus:test", "spawn_open_code"),
+])
+@pytest.mark.parametrize("available", [False, True])
+def test_selected_spawn_requires_its_own_provider(monkeypatch, tmp_path, model, name, available):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.manager import load_plugins
+    from mimir.tools import all_mimir_tools
+    from mimir_cultivate import opencode, forge
+    from mimir_cultivate.claude_code import CLAUDE_EXECUTABLE
+    from mimir_cultivate.worklink import daemon_gate, daemon_health
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", model)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    selected = load_plugins(enable="cultivate").policy
+    probes = []
+    real_access = os.access
+
+    def access(path, mode, **kwargs):
+        if str(path) == CLAUDE_EXECUTABLE:
+            probes.append("claude")
+            return available
+        return real_access(path, mode, **kwargs)
+
+    def opencode_available():
+        probes.append("opencode")
+        assert name == "spawn_open_code", "Claude startup must not probe OpenCode"
+        return available
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("tool availability must not probe a daemon")
+
+    monkeypatch.setattr(os, "access", access)
+    monkeypatch.setattr(opencode, "opencode_available", opencode_available)
+    monkeypatch.setattr(daemon_gate, "prepare_daemon_health", forbidden)
+    monkeypatch.setattr(daemon_health, "daemon_health", forbidden)
+    if available:
+        names = {tool.name for tool in all_mimir_tools(policy=selected)}
+        assert name in names
+        assert ("spawn_open_code" if name == "spawn_claude_code" else "spawn_claude_code") not in names
+    else:
+        diagnostic = "managed Claude CLI" if name == "spawn_claude_code" else "opencode CLI"
+        with pytest.raises(RuntimeError, match=diagnostic):
+            all_mimir_tools(policy=selected)
+    assert probes == ["claude" if name == "spawn_claude_code" else "opencode"]
+    probes.clear()
+    core_names = {tool.name for tool in all_mimir_tools(policy=load_plugins(enable="").policy)}
+    assert not {"spawn_open_code", "spawn_claude_code"} & core_names
+    assert probes == []
+
+
 def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
