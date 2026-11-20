@@ -7,7 +7,10 @@ import os
 from pathlib import Path
 import stat
 import signal
+import shlex
+import socket
 import sys
+import threading
 from types import SimpleNamespace
 import uuid
 
@@ -71,6 +74,7 @@ async def test_claude_containment_does_not_depend_on_compute_name(order, monkeyp
         pid = os.getpid()
         process_start_ticks = 123
         timed_out = output_overflow = False
+        children_reaped = True
 
         async def wait(self):
             return 0
@@ -96,6 +100,7 @@ async def test_claude_containment_does_not_depend_on_compute_name(order, monkeyp
     assert len(launches) == 1
     launch = launches[0]
     assert launch["home_projection_profile"] == "claude_leaf"
+    assert launch.get("retirement", "process") == "contained_process_tree"
     assert launch["identifier"] == spec.backend_config["worker_identifier"]
     assert "HOME" not in launch["env"] and "CLAUDE_CONFIG_DIR" not in launch["env"]
     assert "OPENCODE_CONFIG" not in launch["env"]
@@ -322,6 +327,204 @@ async def test_deterministic_gate_cancellation_requires_terminal_retirement(orde
         await asyncio.gather(*(entry[0] for entry in backend._jobs.values()), return_exceptions=True)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["success", "nonzero", "timeout", "cancel", "lost", "refused"])
+async def test_deterministic_gate_retires_sessioned_child_through_executor(order, monkeypatch, ending):
+    from mimir_cultivate.worklink.evidence import _run_compute_gate
+    from mimir_cultivate.worklink import control, orchestrator as orch
+    from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
+
+    homes = order.checkout / "homes"
+    homes.mkdir()
+    marker = order.checkout / "child.json"
+    script = order.checkout / "gate.py"
+    script.write_text(
+        "import json, os, pathlib, subprocess, sys, time\n"
+        "home = pathlib.Path(os.environ['HOME'])\n"
+        "assert not {'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CONFIG_DIR', "
+        "'GH_TOKEN', 'GITHUB_TOKEN', 'MIMIR_MODEL_SPEC'} & os.environ.keys()\n"
+        "assert not (home / '.claude').exists()\n"
+        "assert not list(home.rglob('*.json'))\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
+        f"pathlib.Path({str(marker)!r}).write_text(json.dumps({{'child': child.pid, 'uid': os.getuid()}}))\n"
+        + ("time.sleep(120)\n" if ending in {"timeout", "cancel"} else
+           f"sys.exit({7 if ending == 'nonzero' else 0})\n")
+    )
+    monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
+    monkeypatch.setattr(worker_exec, "get_identities",
+                        lambda: SimpleNamespace(worklink_uid=os.getuid(), worklink_gid=os.getgid()))
+    # Only checkout authorization and the root-only identity transition are
+    # substituted. The leaf launch_path contract, socket/FD transport, executor,
+    # supervisor and its ECHILD proof all execute.
+    monkeypatch.setattr(worker_exec, "_open_path_checkout",
+                        lambda request: os.open(request["path"], os.O_RDONLY | os.O_DIRECTORY))
+    monkeypatch.setattr(worker_exec, "_drop_worker_privileges", lambda: None)
+    threads, requests = [], []
+
+    def connect(self, *args):
+        controller, executor = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        thread = threading.Thread(target=worker_exec.handle_connection, args=(executor,))
+        thread.start()
+        threads.append(thread)
+        return controller
+
+    monkeypatch.setattr(worker_client.WorkerClient, "_connect", connect)
+    launch = worker_exec._handle_launch
+
+    def observe(connection, request, fds):
+        requests.append(request)
+        return launch(connection, request, fds)
+
+    monkeypatch.setattr(worker_exec, "_handle_launch", observe)
+    if ending in {"lost", "refused"}:
+        wait = worker_exec._wait_factory
+
+        class RejectTerminal:
+            def __init__(self, channel):
+                self.channel = channel
+
+            def __getattr__(self, name):
+                return getattr(self.channel, name)
+
+            def recv(self, size):
+                raw = self.channel.recv(size)
+                if raw and json.loads(raw).get("kind") == "terminal":
+                    return b"" if ending == "lost" else json.dumps(
+                        {"kind": "terminal", "error": "fixture retirement refusal"}).encode()
+                return raw
+
+        def reject(proc, *args):
+            proc.channel = RejectTerminal(proc.channel)
+            return wait(proc, *args)
+
+        monkeypatch.setattr(worker_exec, "_wait_factory", reject)
+    backend = compute.LocalSubprocessComputeBackend.for_path_checkout(os.getuid())
+    spec = replace(spec_for(order), timeout_s=1 if ending == "timeout" else 30)
+    handles = []
+
+    def launched(handle):
+        handles.append(handle)
+        save_run_state(order.checkout, WorklinkRunState(
+            issue_id=2126, attempt=1, backend="claude_code", compute_name=backend.name,
+            handle_substrate=handle.substrate, handle_identifier=handle.identifier,
+            process_start_ticks=handle.process_start_ticks, shim_pid=handle.shim_pid,
+            branch="issue/2126-a1", base_ref="main", local_base="main",
+            repo=str(order.checkout), repo_url="repo", checkout=str(order.checkout),
+            test_command="true", started_at="2026-11-20T00:00:00+00:00"))
+
+    task = asyncio.create_task(_run_compute_gate(
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
+        checkout=order.checkout, work_spec=spec, compute=backend, on_launch=launched))
+    child = None
+    try:
+        async def spawned():
+            while not marker.exists():
+                if task.done():
+                    await task
+                    pytest.fail("gate exited before spawning its child")
+                await asyncio.sleep(0.01)
+            return json.loads(marker.read_text())
+
+        observed = await asyncio.wait_for(spawned(), 10)
+        child = observed["child"]
+        assert observed["uid"] == os.getuid()
+        if ending == "cancel":
+            task.cancel()
+        if ending in {"lost", "refused"}:
+            with pytest.raises(compute.ComputeCleanupError):
+                await asyncio.wait_for(task, 15)
+            [handle] = handles
+            assert backend._handles[handle.identifier] == handle
+            assert handle.identifier in backend._jobs
+            assert handle.identifier not in worker_exec._exited
+            with pytest.raises(compute.ComputeCleanupError):
+                await backend.cleanup(handle)
+            state = load_run_state(order.checkout, 2126)
+            assert state.handle_identifier == handle.identifier
+            monkeypatch.setattr(control, "process_is_alive", lambda state: False)
+
+            def no_claim_release(*args, **kwargs):
+                pytest.fail("unverified gate retirement released its claim")
+
+            stopped = await asyncio.to_thread(
+                control.stop_worklink, order.checkout, 2126, runner=no_claim_release)
+            assert not stopped.stopped and not stopped.state_cleared and not stopped.claim_released
+            assert load_run_state(order.checkout, 2126) == state
+            assert await asyncio.to_thread(
+                control.reconcile_run_states, order.checkout, runner=no_claim_release) == [state]
+            assert load_run_state(order.checkout, 2126) == state
+            issue = orch.IssueContext(2126, "leaf", "build", set())
+            monkeypatch.setattr(orch.ChainlinkIssueReader, "read", lambda *args: issue)
+            monkeypatch.setattr(orch, "validate_leaf", lambda issue: None)
+            monkeypatch.setattr(orch, "_repo_remote_url",
+                                lambda *args, **kwargs: "git@github.com:owner/repo.git")
+            monkeypatch.setattr(orch, "assert_base_repo_not_worker_writable", lambda *args, **kwargs: None)
+            refused = await orch.WorklinkRunner(
+                home=order.checkout, repo=order.checkout, runner=no_claim_release,
+            ).run(2126, backend_name="claude_code")
+            assert refused.status == "refused" and "retirement is unverified" in refused.reason
+            assert load_run_state(order.checkout, 2126) == state
+        elif ending == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 15)
+        else:
+            result = await asyncio.wait_for(task, 15)
+            assert result.children_reaped
+            assert result.timed_out is (ending == "timeout")
+            if ending != "timeout":
+                assert result.exit_code == (7 if ending == "nonzero" else 0)
+        assert len(requests) == 1
+        assert requests[0]["op"] == "launch_path"
+        assert requests[0]["home_projection_profile"] == "none"
+        assert requests[0]["projections"] == []
+        assert requests[0]["retirement"] == "contained_process_tree"
+        if ending not in {"lost", "refused"}:
+            assert not backend._jobs and not backend._handles
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        assert not list(homes.iterdir())
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for thread in threads:
+            await asyncio.to_thread(thread.join, 15)
+            assert not thread.is_alive()
+        if child is not None:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["runner", "client", "executor"])
+@pytest.mark.parametrize("retirement", [None, True, [], "daemon_session", "unknown"])
+async def test_retirement_selector_is_validated_independently(tmp_path, boundary, retirement):
+    identifier = str(uuid.uuid4())
+    if boundary == "runner":
+        with pytest.raises(ValueError, match="retirement policy"):
+            await contained_execution.execute_contained(
+                ("/bin/true",), SimpleNamespace(path=tmp_path), {}, identifier=identifier,
+                retirement=retirement, timeout_s=1, stdout_limit=10, stderr_limit=10)
+    elif boundary == "client":
+        client = worker_client.WorkerClient(SimpleNamespace(verify=lambda _: None))
+        with pytest.raises(ValueError, match="retirement policy"):
+            await client.launch(
+                local_checkout=tmp_path, argv=("/bin/true",), env={}, identifier=identifier,
+                retirement=retirement, timeout_s=1)
+    else:
+        request = {
+            "version": 1, "op": "launch", "id": identifier, "issue": 2126, "attempt": 1,
+            "device": 0, "inode": 0, "argv": ["/bin/true"], "env": {}, "projections": [],
+            "home_projection_profile": "none", "retirement": retirement,
+            "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+            "timeout_s": 1, "stdout_limit": 10, "stderr_limit": 10,
+        }
+        with pytest.raises(RuntimeError, match="retirement policy"):
+            worker_exec._handle_launch(object(), request, [1, 1, 1])
+
+
 @pytest.mark.parametrize("profile", ["claude_leaf", "claude_factory"])
 @pytest.mark.parametrize("boundary", ["client", "runner", "executor"])
 @pytest.mark.asyncio
@@ -451,7 +654,8 @@ def test_executor_fake_cli_consumes_private_config_and_retires_descendants(tmp_p
         "device": 0, "inode": 0, "argv": [sys.executable, str(fake), *args],
         "env": {"PATH": "/usr/bin:/bin", "CLAUDE_CODE_OAUTH_TOKEN": "fixture-" + "oauth"},
         "projections": [{"path": p, "document": d.decode()} for p, d in home_projection_documents(profile)],
-        "home_projection_profile": profile, "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+        "home_projection_profile": profile, "retirement": "contained_process_tree",
+        "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
         "timeout_s": 10, "stdout_limit": 65536, "stderr_limit": 65536,
     }
     messages = []
@@ -509,7 +713,8 @@ async def test_leaf_publishing_credentials_are_refused_at_each_boundary(tmp_path
             "version": 1, "op": "launch", "id": identifier, "issue": 2126, "attempt": 1,
             "device": 0, "inode": 0, "argv": ["/bin/true"], "env": env,
             "projections": [{"path": p.path, "document": p.document.decode()} for p in projections],
-            "home_projection_profile": "claude_leaf", "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+            "home_projection_profile": "claude_leaf", "retirement": "contained_process_tree",
+            "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
             "timeout_s": 1, "stdout_limit": 10, "stderr_limit": 10,
         }
         out, err = open_output_pair(None, 10, None, 10)

@@ -32,7 +32,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v18-private-claude-profiles"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v19-independent-retirement"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
@@ -237,6 +237,8 @@ class WorkerProcess:
     stdout_bytes: int = 0
     stderr_bytes: int = 0
     process_start_ticks: int | None = None
+    children_reaped: bool = False
+    _requires_children_reaped: bool = False
 
     async def wait(self) -> int:
         if self.returncode is None:
@@ -266,6 +268,9 @@ class WorkerProcess:
                 raise RuntimeError(str(response["error"]))
             if response.get("id") != self.identifier or response.get("status") != "terminal":
                 raise RuntimeError("worker executor returned an invalid terminal result")
+            if self._requires_children_reaped and response.get("children_reaped") is not True:
+                raise RuntimeError("worker executor did not verify descendant retirement")
+            self.children_reaped = response.get("children_reaped") is True
             self.returncode = int(response["exit_code"])
             self.timed_out = response.get("timed_out") is True
             self.output_overflow = response.get("output_overflow") is True
@@ -608,6 +613,7 @@ class WorkerClient:
         env: Mapping[str, str],
         projections: Sequence[WorkerProjection] = (),
         home_projection_profile: str = "none",
+        retirement: str = "process",
         identifier: str,
         timeout_s: float,
         stdout_sink: OutputSink | None = None,
@@ -630,6 +636,8 @@ class WorkerClient:
         ):
             raise ValueError("worker command must contain non-empty strings")
         _validate_projection_profile(home_projection_profile, projections)
+        if not isinstance(retirement, str) or retirement not in {"process", "contained_process_tree"}:
+            raise ValueError("unknown worker retirement policy")
         if "HOME" in env:
             raise ValueError("worker HOME is assigned by the executor")
         if "CLAUDE_CONFIG_DIR" in env:
@@ -659,6 +667,7 @@ class WorkerClient:
             "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
             "id": identifier,
             "home_projection_profile": home_projection_profile,
+            "retirement": retirement,
             "argv": list(argv),
             "env": filter_otlp_env(env),
             "projections": [
@@ -730,7 +739,14 @@ class WorkerClient:
             ticks = response.get("process_start_ticks")
             if ticks is not None and (type(ticks) is not int or ticks < 0):
                 raise RuntimeError("worker executor returned an invalid process identity")
-            return WorkerProcess(identifier, int(response["pid"]), sock, process_start_ticks=ticks)
+            return WorkerProcess(
+                identifier, int(response["pid"]), sock, process_start_ticks=ticks,
+                _requires_children_reaped=(
+                    retirement == "contained_process_tree"
+                    or home_projection_profile != "none"
+                    or self._launch_op in {"launch_factory", "launch_factory_control"}
+                ),
+            )
         except Exception:
             sock.close()
             raise

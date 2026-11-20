@@ -614,10 +614,14 @@ async def test_closed_worker_direct_parity_inventory(
         monitor = worker_exec._wait_with_output_limits
 
         def after_output_producer(proc: Any, *args: Any) -> Any:
-            # Output goes directly to files, so completion does not need the
-            # monitor to drain a pipe. Startup belongs to the protocol ceiling.
-            proc.wait()
-            return monitor(proc, *args)
+            # The monitor must consume the supervisor's terminal report before
+            # waiting for its exit; that report also proves descendant cleanup.
+            assert isinstance(proc, worker_exec._FactoryProcess)
+            result = monitor(proc, *args)
+            assert proc.done.is_set()
+            assert proc.error is None
+            assert proc.returncode == result[0]
+            return result
 
         monkeypatch.setattr(worker_exec, "_wait_with_output_limits", after_output_producer)
 

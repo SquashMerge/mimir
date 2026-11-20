@@ -54,6 +54,7 @@ class CollectedExecutionResult:
     output_overflow: bool
     stdout_dropped_bytes: int
     stderr_dropped_bytes: int
+    children_reaped: bool = False
 
 
 HEAVY_LOCK_ENV = "MIMIR_HEAVY_LOCK_FILE"
@@ -323,6 +324,7 @@ async def execute_contained(
     *,
     identifier: str,
     home_projection_profile: str = "none",
+    retirement: str = "process",
     timeout_s: float,
     stdout_limit: int,
     stderr_limit: int,
@@ -336,6 +338,8 @@ async def execute_contained(
         raise ValueError("worker output limits must be positive")
     if timeout_s <= 0:
         raise ValueError("worker timeout must be positive")
+    if not isinstance(retirement, str) or retirement not in {"process", "contained_process_tree"}:
+        raise ValueError("unknown worker retirement policy")
     if isinstance(argv, (str, bytes)) or not argv or not argv[0] or any(
         not isinstance(arg, str) or "\x00" in arg for arg in argv
     ):
@@ -394,6 +398,7 @@ async def execute_contained(
             env=dict(worker_env),
             projections=checked_projections,
             **({"home_projection_profile": home_projection_profile} if home_projection_profile != "none" else {}),
+            **({"retirement": retirement} if retirement != "process" else {}),
             identifier=identifier,
             timeout_s=timeout_s,
             stdout_sink=stdout_sink,
@@ -503,6 +508,7 @@ async def execute_contained(
             output_overflow=output_overflow,
             stdout_dropped_bytes=stdout_dropped,
             stderr_dropped_bytes=stderr_dropped,
+            children_reaped=getattr(process, "children_reaped", False),
         )
     finally:
         try:

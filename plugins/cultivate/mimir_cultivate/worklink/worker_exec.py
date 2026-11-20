@@ -42,7 +42,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v18-private-claude-profiles"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v19-independent-retirement"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
@@ -63,12 +63,12 @@ _LINUX_CAPABILITY_U32S_3 = 2
 _LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "device", "inode",
     "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
-    "executor_identity", "home_projection_profile",
+    "executor_identity", "home_projection_profile", "retirement",
 })
 _PATH_LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "path", "run_uid",
     "argv", "env", "projections", "timeout_s", "stdout_limit", "stderr_limit",
-    "executor_identity", "home_projection_profile",
+    "executor_identity", "home_projection_profile", "retirement",
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _FACTORY_CANCEL_FIELDS = frozenset({"version", "op", "executor_identity", "handle"})
@@ -104,22 +104,25 @@ class _FactoryProcess:
     stop_deadline: float | None = None
     control_output: tuple[_ControlOutput, ...] = ()
     admission_pending: bool = False
+    stop_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def pid(self) -> int:
         return self.process.pid
 
     def request_stop(self) -> None:
-        if self.done.is_set():
-            return
-        if self.stop_deadline is None:
+        with self.stop_lock:
+            if self.done.is_set() or self.stop_deadline is not None:
+                return
+            # Controller and collector deadlines can request the same retirement.
+            # A second unread packet would reset the supervisor's terminal socket.
             self.stop_deadline = time.monotonic() + _FACTORY_STOP_TIMEOUT_S
-        try:
-            self.channel.send(b"stop", socket.MSG_DONTWAIT)
-        except OSError:
-            # A full queue already carries a stop; EOF means the monitor will
-            # detect the lost supervisor rather than acknowledging cleanup.
-            pass
+            try:
+                self.channel.send(b"stop", socket.MSG_DONTWAIT)
+            except OSError:
+                # A full queue already carries a stop; EOF means the monitor will
+                # detect the lost supervisor rather than acknowledging cleanup.
+                pass
 
     def stop(self) -> None:
         self.request_stop()
@@ -1271,7 +1274,10 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
     factory = request.get("op") in {"launch_factory", "launch_factory_control"}
-    supervised = factory or request["home_projection_profile"] != "none"
+    retirement = request["retirement"]
+    if not isinstance(retirement, str) or retirement not in {"process", "contained_process_tree"}:
+        raise RuntimeError("unknown worker retirement policy")
+    supervised = factory or request["home_projection_profile"] != "none" or retirement == "contained_process_tree"
     held = request.get("op") == "launch_factory" and request["home_projection_profile"] == "claude_factory"
     checkout_root = None if path_addressed else _validate_checkout(fds[0], request)
     for fd in fds[0 if path_addressed else 1:]:
@@ -1410,6 +1416,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             "output_overflow": output_overflow,
             "stdout_bytes": stdout_bytes,
             "stderr_bytes": stderr_bytes,
+            "children_reaped": supervised,
         }, nonblocking=supervised)
     finally:
         with _jobs_lock:
