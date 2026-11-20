@@ -100,7 +100,8 @@ def test_allowlist_preserves_prefix_grammar_and_proves_argument_boundary():
 
 def test_supplied_fixture_is_verbatim_and_wire_metadata_remains_raw():
     raw = (FIXTURES / "success.jsonl").read_bytes()
-    assert hashlib.sha256(raw).hexdigest() == "5ec588a0bb09881b804fd5e5a21fa68f19b7ed88060a0f6d33c02b2afb429913"
+    assert len(raw) == 6846
+    assert hashlib.sha256(raw).hexdigest() == "1a386e8e95c4716bf3d1718fd364e02a9512cf29de56b756e2dc57d37174a327"
     assert raw.endswith(b"\n") and len(raw.splitlines()) == 4
     assert parse_stream(raw.decode(), 0).status == "success"
     rate = json.loads(raw.splitlines()[2])["rate_limit_info"]
@@ -109,6 +110,48 @@ def test_supplied_fixture_is_verbatim_and_wire_metadata_remains_raw():
     from claude_agent_sdk._internal.message_parser import parse_message
     parsed = parse_message(json.loads(raw.splitlines()[2]))
     assert parsed.rate_limit_info.raw == rate
+
+
+def test_supplied_fixture_preserves_capability_order():
+    capabilities = json.loads(success().splitlines()[0])["capabilities"]
+    for sequence in (
+        ["request_marker_lists_v1", "ask_user_question_unanswered_v1", "lifecycle_wakeup_source_v1"],
+        ["mcp_tool_ui_meta_v1", "ui_surface_v1", "mcp_call_result_not_for_model_v1"],
+    ):
+        start = capabilities.index(sequence[0])
+        assert capabilities[start:start + len(sequence)] == sequence
+
+
+def test_lock_derivative_changes_only_final_result_text():
+    events = [json.loads(line) for line in success().splitlines()]
+    refusal = (FIXTURES.parent / "feature_factory_0_14_1/lock-refusal.stderr.txt").read_text()
+    events[-1]["result"] = refusal
+    expected = "".join(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n" for event in events)
+    assert (FIXTURES / "lock_refused.jsonl").read_bytes() == expected.encode("utf-8")
+
+
+def test_quota_and_warning_derivatives_preserve_retained_records_and_raw_metadata():
+    from claude_agent_sdk._internal.message_parser import parse_message
+
+    source = [json.loads(line) for line in success().splitlines()]
+    for filename, status in (
+        ("quota_exhausted.jsonl", "rejected"),
+        ("rate_limit_warning.jsonl", "allowed_warning"),
+    ):
+        events = [json.loads(line) for line in (FIXTURES / filename).read_text().splitlines()]
+        expected_rate = {**source[2], "rate_limit_info": {**source[2]["rate_limit_info"], "status": status}}
+        if status == "rejected":
+            retained = ("type", "subtype", "result", "session_id", "duration_ms", "duration_api_ms", "num_turns")
+            expected_result = {key: source[3][key] for key in retained}
+            expected_result.update(is_error=True, api_error_status=429)
+            assert events == [expected_rate, expected_result]
+        else:
+            assert events == [expected_rate]
+        rate = events[0]["rate_limit_info"]
+        assert parse_message(events[0]).rate_limit_info.raw == rate
+        for key in ("resetsAt", "rateLimitType", "overageStatus", "overageDisabledReason",
+                    "isUsingOverage", "unifiedWindows"):
+            assert rate[key] == source[2]["rate_limit_info"][key]
 
 
 def test_derived_quota_and_warning_use_typed_fields():
