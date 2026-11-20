@@ -1,17 +1,24 @@
 # Claude Code 2.1.326 stream fixtures
 
-`success.jsonl` is the operator's four-line Claude 2.1.326 capture, relayed
-verbatim by the driver in the be-leaf attempt1 continuation. Environment
-forwarding was unavailable (`MIMIR_WORK_ITEM_JSON` was absent). No fields were
-added or removed, wire keys were not normalized, and the final newline is kept.
-SHA-256: `5ec588a0bb09881b804fd5e5a21fa68f19b7ed88060a0f6d33c02b2afb429913`.
+`success.jsonl` is the operator's four-line Claude 2.1.326 capture.
+The be-leaf attempt1 relay omitted two system capabilities. In remediation-1,
+the driver attested a comparison against the entire original fenced source:
+inserting `ask_user_question_unanswered_v1` between `request_marker_lists_v1`
+and `lifecycle_wakeup_source_v1`, and `ui_surface_v1` between
+`mcp_tool_ui_meta_v1` and `mcp_call_result_not_for_model_v1`, restores exact
+byte equality. These two literal insertions were applied without
+reserializing the capture. The builder did not independently access the
+original payload (`MIMIR_WORK_ITEM_JSON` was absent).
+The restored capture is 6846 bytes, including its final LF; formatting,
+event order and raw wire keys are preserved.
+SHA-256: `1a386e8e95c4716bf3d1718fd364e02a9512cf29de56b756e2dc57d37174a327`.
 
 Original operator command:
 `claude -p "Reply with exactly: ok" --output-format stream-json --verbose --setting-sources project --strict-mcp-config --max-turns 1 --session-id <uuid>`.
 It ran in an empty Git repository; the operator replaced only `cwd`,
 `original_cwd`, and `memory_paths.auto`. The builder ran no live Claude session.
 
-The other two fixtures are **derived**, not observed subscription failures.
+The quota and warning fixtures are **derived**, not observed subscription failures.
 Their source is this capture plus the locked `claude-agent-sdk==0.2.180`
 `types.py` (`RateLimitInfo`, `RateLimitStatus`, `ResultMessage`) and
 `_internal/message_parser.py` (`rate_limit_event`, `result`). The SDK explicitly
@@ -41,6 +48,6 @@ does not rely on error prose.
 four success events, replaces only the final result's `result` string with
 the unmodified locally captured `feature_factory_0_14_1/lock-refusal.stderr.txt`,
 and serializes all four events as compact UTF-8 JSONL. All other fields and
-values, including raw camelCase rate metadata, are preserved. The original
-`success.jsonl` bytes and hash above remain unchanged. The factory fixture's
+values, including raw camelCase rate metadata, are preserved. The corrected
+complete success capture is the source for this derivative. The factory fixture's
 provenance documents its isolated local capture.
