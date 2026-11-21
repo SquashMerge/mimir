@@ -306,7 +306,10 @@ async def reconcile_startup(home: Path, log_event: Any) -> None:
     except (OSError, ValueError, RuntimeError):
         await log_event("worklink_codex_reconcile_failed", reason="daemon_unavailable")
     try:
-        resumed = reattach_inflight_worklink_runs(home)
+        # Reconciliation performs blocking filesystem/CLI work and may run the
+        # executor's async cancellation through asyncio.run. Keep that entire
+        # synchronous recovery path outside the server's running event loop.
+        resumed = await asyncio.to_thread(reattach_inflight_worklink_runs, home)
         await log_event("worklink_reattach_dispatched", issues=resumed)
     except Exception as exc:  # noqa: BLE001 - restart reconciliation must not abort boot
         await log_event("worklink_reattach_dispatch_failed", error=str(exc))

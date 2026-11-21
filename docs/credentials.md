@@ -84,10 +84,18 @@ Claude leaves and coding spawns receive OAuth explicitly and refuse
 `GH_TOKEN`, `GITHUB_TOKEN` and `FACTORY_PUBLISHING_IDENTITY`, even if requested
 through `pass_env`. Factory epics separately admit the OAuth token plus the
 explicit publishing token/identity, preserving alias and conflict checks.
-Private worker HOME/config projections contain no host login state. These are
-contained subprocesses, not daemon sessions; the default network-isolation
-policy is unchanged. Rotating a saved token requires explicitly reconciling
-the private deployment env. Switching routes requires a fresh deployment.
+Private worker HOME/config projections contain no host login state. These
+launch-time environment checks are **not a same-uid secret boundary**. Claude
+leaves, coding spawns and factory epics share `worklink_uid` and the PID namespace;
+there is no `PR_SET_DUMPABLE=0` isolation. Arbitrary leaf/test code can read a
+concurrent factory's `/proc/<pid>/environ` (including its publishing token and
+identity) and its `CLAUDE_CONFIG_DIR`. Leaves also receive the subscription OAuth
+token directly and can read and exfiltrate it. `network_isolated=False` means
+network exfiltration is not prevented. Do not run mutually untrusted workloads
+or treat an epic-only launch projection as protection from another worker.
+These are contained subprocesses, not daemon sessions. Rotating a saved token
+requires explicitly reconciling the private deployment env. Switching routes
+requires a fresh deployment.
 
 | Env var / storage | Used by | Upstream regen | Verification probe |
 |---|---|---|---|

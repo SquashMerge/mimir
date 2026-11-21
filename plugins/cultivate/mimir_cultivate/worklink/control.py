@@ -444,16 +444,51 @@ def stop_worklink(
                     continue
                 if factory.host == "claude_code" and factory.handle is not None:
                     from .worker_client import WorkerClient
+                    from .backends.feature_factory import FeatureFactoryBackend
+                    from .factory_state import load_factory_record
+                    from .orchestrator import (
+                        _factory_controller_error, _require_factory_status,
+                        _write_factory_host_evidence,
+                    )
 
+                    backend = FeatureFactoryBackend(entrypoint=factory.launcher, host=factory.host)
                     try:
+                        before = backend.status(factory.run_id, sandbox=Path(factory.sandbox), launcher=factory.launcher)
+                        _require_factory_status(before, factory)
+                        if factory.lock_session is None or before.lock_session not in {None, factory.lock_session}:
+                            raise RuntimeError("factory host ownership changed")
                         _mark_operator_stop(home, issue_id, factory.attempt,
                                             lock_session=factory.lock_session)
-                        asyncio.run(WorkerClient(None).cancel(factory.handle.identifier))
-                        save_factory_record(home, replace(factory, children_reaped=True,
-                            controller_phase="stopped", controller_error="operator requested stop"))
-                    except (RuntimeError, OSError, ValueError):
+                        # A durable executor retirement proof survives loss of
+                        # the executor's in-memory worker tombstone. Without
+                        # that proof, unknown worker IDs must still fail closed.
+                        if not factory.children_reaped:
+                            asyncio.run(WorkerClient(None).cancel(factory.handle.identifier))
+                        after = backend.status(factory.run_id, sandbox=Path(factory.sandbox), launcher=factory.launcher)
+                        _require_factory_status(after, factory)
+                        latest = load_factory_record(home, factory.run_id)
+                        if (after.lock_session not in {None, factory.lock_session}
+                                or latest is None
+                                or any(getattr(latest, name) != getattr(factory, name) for name in (
+                                    "handle", "host", "lock_session", "launch_generation",
+                                    "attempt", "sandbox", "session", "launcher",
+                                ))):
+                            raise RuntimeError("factory host ownership changed during stop")
+                    except (RuntimeError, OSError, ValueError) as exc:
+                        detail = _factory_controller_error(f"contained retirement or ownership unverified: {exc}")
+                        # Never overwrite a concurrent record (or its durable
+                        # children_reaped proof) with the pre-cancellation copy.
+                        _write_factory_host_evidence(home, factory, "failed", detail)
                         uncertain = True
-                        problems.append(f"factory {factory.run_id}: contained retirement unverified; state and claim retained")
+                        problems.append(f"factory {factory.run_id}: {detail}; state and claim retained")
+                        continue
+                    stopped = replace(latest.observed(after, datetime.now(UTC).isoformat()),
+                        controller_phase="terminal" if latest.controller_phase == "terminal" or after.is_terminal
+                            else "parked" if after.is_parked else "stopped",
+                        children_reaped=True, controller_error="operator requested stop")
+                    save_factory_record(home, stopped)
+                    _write_factory_host_evidence(home, stopped, "interrupted",
+                        "operator requested stop; factory status: " + str(after.status))
                     continue
                 if factory_process_is_alive(factory) and factory.handle is not None:
                     try:

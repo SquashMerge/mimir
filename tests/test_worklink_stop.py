@@ -108,6 +108,67 @@ def test_startup_reconciliation_requires_contained_retirement(tmp_path, monkeypa
     assert retired == [state.handle_identifier]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retirement", ["verified", "unknown", "refused"])
+async def test_async_server_startup_reconciles_contained_leaf(tmp_path, monkeypatch, retirement):
+    from mimir_cultivate import server
+    from mimir_cultivate.worklink import daemon_gate
+
+    state = WorklinkRunState(
+        issue_id=700, attempt=3, backend="claude_code", compute_name="local_subprocess",
+        handle_substrate="local_subprocess", handle_identifier=str(uuid.uuid4()),
+        process_start_ticks=42, shim_pid=12345,
+        branch="issue/700-a3", base_ref="main", local_base="main", repo=str(tmp_path),
+        repo_url="", test_command="pytest", started_at=datetime.now(UTC).isoformat(),
+    )
+    save_run_state(tmp_path, state)
+    monkeypatch.setattr(control, "process_is_alive", lambda current: False)
+    monkeypatch.setattr(daemon_gate, "wait_for_daemon", lambda env: {})
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    main_thread = threading.get_ident()
+    retired, calls, events = [], [], []
+
+    async def cancel(self, identifier):
+        assert threading.get_ident() != main_thread
+        retired.append(identifier)
+        if retirement != "verified":
+            raise RuntimeError("unknown worker id" if retirement == "unknown" else "reap refused")
+
+    def run(args):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, json.dumps({"labels": []}), "")
+
+    async def log(event, **fields):
+        events.append((event, fields))
+
+    monkeypatch.setattr(worker_client.WorkerClient, "cancel", cancel)
+    monkeypatch.setattr(control, "_runner", lambda *args: run)
+    monkeypatch.setattr(server, "log_event_sync", lambda event, **fields: events.append((event, fields)))
+    await server.reconcile_startup(tmp_path, log)
+
+    assert retired == [state.handle_identifier]
+    if retirement == "verified":
+        assert load_run_state(tmp_path, 700) is None
+        assert ["chainlink", "locks", "release", "700"] in calls
+        assert ["chainlink", "issue", "label", "700", "worklink:ready"] in calls
+    else:
+        assert load_run_state(tmp_path, 700) == state
+        assert calls == []
+        assert any(event == "worklink_run_state_reconcile_failed" for event, _ in events)
+    assert ("worklink_reattach_dispatched", {"issues": []}) in events
+
+
+def _claude_factory_status(record, *, status="running", lock_session=None):
+    from mimir_cultivate.worklink.factory_state import FactoryStatus
+
+    return FactoryStatus(
+        run_id=record.run_id, valid=True, sandbox_path=record.sandbox,
+        status=status, mode="autonomous", branch=record.branch,
+        pr_base=record.base_ref, pr_draft=False, lock="fresh", dead_lock=False,
+        lock_session=lock_session or record.lock_session,
+    )
+
+
 @pytest.mark.parametrize("verified", [False, True])
 def test_claude_factory_stop_requires_executor_retirement_not_daemon_cancel(tmp_path, monkeypatch, verified):
     identifier = str(uuid.uuid4())
@@ -121,6 +182,15 @@ def test_claude_factory_stop_requires_executor_retirement_not_daemon_cancel(tmp_
         status=None, observed_at=None, controller_phase="running")
     save_factory_record(tmp_path, record)
     retired, calls = [], []
+    from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+    observed = []
+
+    def status(self, *args, **kwargs):
+        assert self.host == "claude_code"
+        observed.append(record.run_id)
+        return _claude_factory_status(record)
+
+    monkeypatch.setattr(FeatureFactoryBackend, "status", status)
 
     async def cancel(self, selected):
         retired.append(selected)
@@ -140,9 +210,74 @@ def test_claude_factory_stop_requires_executor_retirement_not_daemon_cancel(tmp_
     assert "opencode_session_id" not in marker
     assert control.operator_stop_requested(tmp_path, 700, 1, lock_session=record.lock_session)
     assert not control.operator_stop_requested(tmp_path, 700, 1, lock_session="claude-code:" + str(uuid.uuid4()))
+    assert len(observed) == (2 if verified else 1)
+    evidence = json.loads((tmp_path / "state/worklink/evidence/700-1.json").read_text())
+    assert evidence["status"] == ("failed" if not verified else "interrupted")
     if not verified:
         assert current == record
         assert calls == []
+
+
+@pytest.mark.parametrize("scenario", [
+    "reaped", "terminal", "concurrent_update", "foreign_before", "foreign_after",
+    "handle_changed", "host_changed", "invalid_before", "invalid_after",
+])
+def test_claude_factory_stop_checks_status_and_preserves_latest_record(tmp_path, monkeypatch, scenario):
+    from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+
+    identifier = str(uuid.uuid4())
+    record = FactoryRunRecord(
+        run_id="chainlink-700", issue_id=700, attempt=1, repository="owner/repo",
+        base_ref="main", branch="feature/chainlink-700", launcher="/opt/claude/factory.js",
+        sandbox=str(tmp_path / "operator/.factory-sandboxes/chainlink-700"),
+        host="claude_code", session="claude-code:" + identifier, lock_session="claude-code:" + identifier,
+        launch_generation=identifier, handle=LaunchHandle("local_subprocess", identifier, 42, 999999999),
+        status=None, observed_at=None, controller_phase="running", children_reaped=scenario == "reaped")
+    save_factory_record(tmp_path, record)
+    observations, cancelled, calls = [], [], []
+    updated = record
+
+    def status(self, *args, **kwargs):
+        nonlocal updated
+        assert self.host == "claude_code"
+        observations.append(len(observations))
+        after = len(observations) == 2
+        if after and scenario in {"terminal", "concurrent_update"}:
+            updated = replace(record, controller_phase="terminal" if scenario == "terminal" else "running",
+                              transcript=str(tmp_path / "concurrent-transcript"), children_reaped=True)
+            save_factory_record(tmp_path, updated)
+        if after and scenario in {"handle_changed", "host_changed"}:
+            updated = replace(record, **({"handle": LaunchHandle("local_subprocess", str(uuid.uuid4()), 43, 999999998)}
+                                        if scenario == "handle_changed" else {"host": "opencode"}))
+            save_factory_record(tmp_path, updated)
+        foreign = scenario == ("foreign_after" if after else "foreign_before")
+        observed = _claude_factory_status(record,
+            status="completed" if scenario == "terminal" and after else "running",
+            lock_session="claude-code:" + str(uuid.uuid4()) if foreign else None)
+        return replace(observed, valid=False) if scenario == ("invalid_after" if after else "invalid_before") else observed
+
+    async def cancel(self, selected):
+        cancelled.append(selected)
+
+    monkeypatch.setattr(FeatureFactoryBackend, "status", status)
+    monkeypatch.setattr(worker_client.WorkerClient, "cancel", cancel)
+    result = stop_worklink(tmp_path, 700,
+        runner=lambda args: calls.append(args) or subprocess.CompletedProcess(args, 0, "", ""))
+    current = load_factory_record(tmp_path, record.run_id)
+    success = scenario in {"reaped", "terminal", "concurrent_update"}
+    assert result.stopped == result.claim_released == success
+    assert cancelled == ([] if scenario in {"reaped", "foreign_before", "invalid_before"} else [identifier])
+    assert len(observations) == (1 if scenario in {"foreign_before", "invalid_before"} else 2)
+    if success:
+        assert current.children_reaped
+        assert current.controller_phase == ("terminal" if scenario == "terminal" else "stopped")
+        if scenario != "reaped":
+            assert current.transcript == str(tmp_path / "concurrent-transcript")
+    else:
+        assert current == updated
+        assert calls == []
+    evidence = json.loads((tmp_path / "state/worklink/evidence/700-1.json").read_text())
+    assert evidence["status"] == ("interrupted" if success else "failed")
 
 
 @pytest.mark.asyncio
