@@ -35,6 +35,29 @@ def order(tmp_path):
                            "MIMIR_MODEL_SPEC": "claude-code:opus"}, tmp_path / "transcripts")
 
 
+@pytest.fixture
+def native_worker_entry(monkeypatch):
+    """Enter the real child session/checkout without claiming a privileged drop.
+
+    These transport/supervisor tests run as the invoking uid, which need not
+    have production's empty supplementary groups/capability bounding set. The
+    irreversible transition and its verification have dedicated executor tests.
+    Replace that whole boundary, not just half of its implementation.
+    """
+    def enter(checkout_fd):
+        os.setsid()
+        os.fchdir(checkout_fd)
+
+    def privileged_boundary():
+        pytest.fail("native-uid harness entered privileged identity transition/verification")
+
+    monkeypatch.setattr(worker_exec, "_drop_worker", enter)
+    # Fail even on hosts whose ambient identity happens to satisfy the verifier:
+    # restoring the old privileges-only stub must not silently pass there.
+    monkeypatch.setattr(worker_exec, "_drop_worker_privileges", privileged_boundary)
+    monkeypatch.setattr(worker_exec, "_verify_worker_identity", privileged_boundary)
+
+
 def spec_for(order, backend=None):
     return (backend or ClaudeCodeBackend()).work_spec(order, attempt=1, repo_url="repo", base_ref="main",
                                                       branch="issue/2126-a1", test_command="uv run pytest -q")
@@ -329,7 +352,9 @@ async def test_deterministic_gate_cancellation_requires_terminal_retirement(orde
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["success", "nonzero", "timeout", "cancel", "lost", "refused"])
-async def test_deterministic_gate_retires_sessioned_child_through_executor(order, monkeypatch, ending):
+async def test_deterministic_gate_retires_sessioned_child_through_executor(
+    order, monkeypatch, ending, native_worker_entry,
+):
     from mimir_cultivate.worklink.evidence import _run_compute_gate
     from mimir_cultivate.worklink import control, orchestrator as orch
     from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
@@ -353,12 +378,11 @@ async def test_deterministic_gate_retires_sessioned_child_through_executor(order
     monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
     monkeypatch.setattr(worker_exec, "get_identities",
                         lambda: SimpleNamespace(worklink_uid=os.getuid(), worklink_gid=os.getgid()))
-    # Only checkout authorization and the root-only identity transition are
-    # substituted. The leaf launch_path contract, socket/FD transport, executor,
-    # supervisor and its ECHILD proof all execute.
+    # Only checkout authorization and the complete privileged worker-entry
+    # boundary (native_worker_entry) are substituted. The leaf launch_path
+    # contract, socket/FD transport, executor, supervisor and ECHILD proof execute.
     monkeypatch.setattr(worker_exec, "_open_path_checkout",
                         lambda request: os.open(request["path"], os.O_RDONLY | os.O_DIRECTORY))
-    monkeypatch.setattr(worker_exec, "_drop_worker_privileges", lambda: None)
     threads, requests = [], []
 
     def connect(self, *args):
@@ -609,7 +633,9 @@ def test_claude_worker_environment_rechecks_credential_and_config_admission(orde
 
 
 @pytest.mark.parametrize("profile", ["claude_leaf", "claude_factory"])
-def test_executor_fake_cli_consumes_private_config_and_retires_descendants(tmp_path, monkeypatch, profile):
+def test_executor_fake_cli_consumes_private_config_and_retires_descendants(
+    tmp_path, monkeypatch, profile, native_worker_entry,
+):
     from mimir_cultivate.claude_code import leaf_argv
     from mimir.output_capture import open_output_pair
 
@@ -645,9 +671,8 @@ def test_executor_fake_cli_consumes_private_config_and_retires_descendants(tmp_p
     monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
     monkeypatch.setattr(worker_exec, "_validate_checkout", lambda *_: None)
     monkeypatch.setattr(worker_exec, "get_identities", lambda: SimpleNamespace(worklink_uid=os.getuid(), worklink_gid=os.getgid()))
-    # This harness already runs as the configured worker uid. Privileged uid-drop
-    # ordering has separate executor tests; no root capability is available here.
-    monkeypatch.setattr(worker_exec, "_drop_worker_privileges", lambda: None)
+    # native_worker_entry substitutes the complete privileged identity boundary;
+    # real cwd/session entry, private projections and descendant retirement remain.
     args = leaf_argv("build", "sonnet", home, ("Bash(git:*)", "Bash(uv:*)"))[1:] if profile == "claude_leaf" else ("-p", "factory")
     request = {
         "version": 1, "op": "launch", "id": identifier, "issue": 2126, "attempt": 1,
