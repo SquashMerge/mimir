@@ -122,6 +122,31 @@ def test_reader_bounds_growth_even_when_stat_lies(tmp_path, monkeypatch):
         ev._gate_read(path, 2)
 
 
+@pytest.mark.parametrize("change", ["grow", "shrink", "short-read"])
+def test_prefix_reader_rejects_changed_reports(tmp_path, monkeypatch, change):
+    path = tmp_path.resolve() / "report"
+    path.write_bytes(b"original")
+    original = ev._gate_open
+
+    @contextlib.contextmanager
+    def changing(target):
+        with original(target) as source:
+            class Changed:
+                def fileno(self):
+                    return source.fileno()
+
+                def read(self, size):
+                    if change == "short-read":
+                        return b""
+                    path.write_bytes(b"x" if change == "shrink" else b"x" * 100)
+                    return source.read(size)
+            yield Changed()
+
+    monkeypatch.setattr(ev, "_gate_open", changing)
+    with pytest.raises(ValueError, match="changed"):
+        ev._gate_read_prefix(path, 4)
+
+
 def test_report_root_is_resolved_at_creation(tmp_path, monkeypatch):
     alias = tmp_path / "alias"
     target = tmp_path / "real"

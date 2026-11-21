@@ -123,7 +123,7 @@ async def test_gate_child_denies_otlp_carriers_after_spec_and_ambient_merge(
 
     compute = ChildCompute()
     if route == "factory":
-        def factory_child(checkout, argv, *, env, timeout, output_limit, allow_output_truncation):
+        def factory_child(checkout, argv, *, env, timeout, output_limit, allow_output_truncation, identifier):
             compute.gate_env = dict(env)
             return subprocess.run(argv, cwd=checkout, env=env, capture_output=True)
         monkeypatch.setattr(worker_client, "run_factory_control", factory_child)
@@ -729,6 +729,49 @@ def test_pytest_report_read_failures_are_distinguishable(
     assert result.report_error == expected
 
 
+@pytest.mark.parametrize("setup_count,total", [(100, 100), (95, 100), (94, 100), (1, 100)])
+@pytest.mark.parametrize("oversize", [False, True])
+def test_mass_setup_errors_are_environment_failures(tmp_path, monkeypatch, setup_count, total, oversize):
+    first = "PermissionError: [Errno 13] Permission denied: '/home/mimir/.cargo/bin/factory.js'"
+    document = (
+        f'<testsuite tests="{total}" errors="{setup_count}" failures="0" skipped="0">'
+        f'<testcase name="first"><error message="failed on setup with &quot;{first}&quot;">'
+        "first traceback</error></testcase>"
+        + ('<testcase><error message="failed on setup with another error">trace</error></testcase>'
+           * (setup_count - 1))
+        + "</testsuite>"
+    )
+    if oversize:
+        monkeypatch.setattr(ev, "_PYTEST_REPORT_MAX_BYTES", 400)
+        document = document.replace("first traceback", "first traceback" + "x" * 1000)
+    (tmp_path / "junit.xml").write_text(document)
+    result = read_pytest_result("pytest", tmp_path)
+    assert result.counts.errors == setup_count
+    assert result.report_error == ("junit_oversize" if oversize else None)
+    reason = ev._gate_failure_reason(result)
+    validation = validate_evidence(base_evidence(tests=result))
+    assert not validation.review_ready
+    assert validation.evidence.failure_reason == reason
+    if setup_count >= 95:
+        assert "environment failure" in reason
+        assert first in reason
+        assert "gate_environment_failure" in validation.reasons
+    else:
+        assert "environment failure" not in reason
+
+
+@pytest.mark.parametrize("phase", ["teardown", "call"])
+def test_non_setup_errors_are_not_environment_failures(tmp_path, phase):
+    (tmp_path / "junit.xml").write_text(
+        '<testsuite tests="2" errors="2"><testcase>'
+        f'<error message="failed on {phase} with bug">trace</error>'
+        '</testcase></testsuite>'
+    )
+    result = read_pytest_result("pytest", tmp_path)
+    assert result.environment_failure is None
+    assert "environment failure" not in ev._gate_failure_reason(result)
+
+
 def _init_gate_repo(tmp_path: Path, test_source: str) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -740,6 +783,45 @@ def _init_gate_repo(tmp_path: Path, test_source: str) -> Path:
     subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
     (repo / "test_gate_sample.py").write_text(test_source, encoding="utf-8")
     return repo
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oversize", [False, True])
+async def test_real_factory_gate_setup_failure_keeps_first_error(tmp_path, monkeypatch, oversize):
+    from mimir_cultivate.worklink import worker_client
+    from mimir_cultivate.worklink.compute import WorkSpec
+    from tests.worklink_control_helpers import install_local_control_executor
+
+    repo = _init_gate_repo(
+        tmp_path,
+        "import pytest\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def broken_environment():\n"
+        "    raise PermissionError('unreadable-controller-path')\n"
+        "def test_one(): pass\n"
+        "def test_two(): pass\n",
+    )
+    install_local_control_executor(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (repo, 2183, 1))
+    if oversize:
+        monkeypatch.setattr(ev, "_PYTEST_REPORT_MAX_BYTES", 512)
+    command = f"{shlex.quote(sys.executable)} -m pytest -q -n 0 test_gate_sample.py"
+    spec = WorkSpec(2183, 1, "", "main", "branch", "", None, command, "feature_factory",
+                    30, local_checkout=repo, output_root=tmp_path / "artifacts")
+    result = await observe_evidence(
+        issue=2183, attempt=1, backend="feature_factory", branch="branch", checkout=repo,
+        started_at=datetime.now(UTC), base_ref="main", backend_status="completed", test_command=command,
+        compute=object(), work_spec=spec,
+    )
+    assert not result.review_ready
+    assert "gate_environment_failure" in result.reasons
+    assert "environment failure" in result.evidence.failure_reason
+    assert "PermissionError: unreadable-controller-path" in result.evidence.failure_reason
+    tests = result.evidence.tests
+    assert tests.counts.errors == 2 and tests.counts.passed == 0
+    assert tests.retention_manifest is not None
+    if oversize:
+        assert tests.retention_truncated and tests.retention_error == "junit_truncated"
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux factory supervisor")

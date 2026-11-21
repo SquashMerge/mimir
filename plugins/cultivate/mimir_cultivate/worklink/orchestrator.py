@@ -5662,7 +5662,7 @@ async def _verify_factory_completion(
         if tests.skipped_reason is not None:
             raise WorklinkError("factory completion tests were skipped")
         if tests.exit_code != 0:
-            raise WorklinkError("factory completion tests did not pass")
+            raise WorklinkError(evidence.failure_reason or "factory completion tests did not pass")
         if not validation.review_ready:
             raise WorklinkError("factory completion evidence was rejected")
         clean = _fixed_command(
