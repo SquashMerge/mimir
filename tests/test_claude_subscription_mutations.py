@@ -146,6 +146,8 @@ def run_control(repository: Path, mutation: Mutation, stage: str) -> subprocess.
     env.pop("MIMIR_ACCESS_CONTROL_ENFORCED", None)
     env.pop("PYTHONPATH", None)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Use a fixture-owned, non-symlinked base: inherited TMPDIR may have a
+    # symlinked session home, which the real issue-resource lock rightly refuses.
     result = subprocess.run(
         [sys.executable, "-S", "-c", """
 from pathlib import Path

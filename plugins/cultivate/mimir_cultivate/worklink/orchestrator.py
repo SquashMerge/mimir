@@ -1557,11 +1557,13 @@ class WorklinkRunner:
                         )
                         await compute.cancel(handle)
                         raise
-                    return await _heartbeat_while(
+                    observed = await _heartbeat_while(
                         compute.wait(handle, spec.timeout_s),
                         claims=claims,
                         record=record,
                     )
+                    _persist_leaf_retirement(self.home, issue.issue_id, handle, observed)
+                    return observed
                 except ComputeLaunchError as exc:
                     return ComputeResult(
                         exit_code=-1,
@@ -2270,6 +2272,7 @@ class WorklinkRunner:
                             test_env=spec.backend_config.get("test_env", {}),
                         )
                         repair_result = await compute.wait(handle, repair_spec.timeout_s)
+                        _persist_leaf_retirement(self.home, issue.issue_id, handle, repair_result)
                     finally:
                         if handle is not None:
                             if handle.substrate == "opencode_daemon":
@@ -6704,10 +6707,33 @@ def _persist_run_state(
             checkout=str(lease.path),
             process_start_ticks=handle.process_start_ticks,
             shim_pid=handle.shim_pid,
+            executor_instance_id=(
+                compute.worker_executor_instance_id(handle)
+                if hasattr(compute, "worker_executor_instance_id") else None
+            ),
+            executor_process_epoch=(
+                compute.worker_executor_process_epoch(handle)
+                if hasattr(compute, "worker_executor_process_epoch") else None
+            ),
             phase="admission_uncertain" if handle.substrate == "opencode_daemon" and handle.opencode_session_id is None else "spawned",
             test_env=dict(test_env or {}),
         ),
     )
+
+
+def _persist_leaf_retirement(
+    home: Path, issue_id: int, handle: LaunchHandle, result: ComputeResult,
+) -> None:
+    if not result.children_reaped or handle.shim_pid is None:
+        return
+    from .control import _claim_mutex
+
+    with _claim_mutex(home):
+        state = load_run_state(home, issue_id)
+        if (state is not None and state.handle_identifier == handle.identifier
+                and state.shim_pid == handle.shim_pid
+                and state.process_start_ticks == handle.process_start_ticks):
+            save_run_state(home, replace(state, children_reaped=True))
 
 
 def _create_observation_worktree(

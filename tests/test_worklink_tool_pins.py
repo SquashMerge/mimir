@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from importlib.metadata import PackageNotFoundError, version
+import json
 import re
 
 import pytest
@@ -15,6 +16,7 @@ from mimir_cultivate.worklink.tool_pins import (
 )
 from mimir.plugin_dockerfile import cultivate_scripts, select_plugins
 from mimir.scaffold_docker import render_dockerfile
+from mimir.scaffold_docker import merge_opencode_config
 from mimir.plugins.discovery import PluginDiscoveryError
 
 
@@ -124,6 +126,7 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     factory_arg = re.search(r"(?m)^ARG FACTORY_VERSION=([^\s]+)$", dockerfile)
     assert factory_arg is not None
     assert FACTORY_VERSION == pins["feature-factory"].pin == factory_arg.group(1)
+    assert FACTORY_VERSION == "0.14.2"
     cultivate = install_sources["plugins/cultivate/mimir_cultivate/docker/base.sh"]
     assert cultivate.splitlines()[1] == f"# factory-version: {FACTORY_VERSION}"
     assert "feature-factory@${FACTORY_VERSION}" in cultivate
@@ -161,3 +164,27 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     for retired in ("opencode-ai@", "opencode-feature-factory@", "opencode-project-memory@",
                     "opencode-openai-codex-auth@", "opencode-anthropic-auth@"):
         assert retired not in install_text
+
+
+def test_factory_daemon_scaffold_and_fixture_pins_match_installs(tmp_path: Path) -> None:
+    from mimir_cultivate.worklink.daemon_config import (
+        daemon_configuration,
+        resolve_daemon_credentials,
+    )
+    from tests.opencode_fixtures import seed_factory_install
+
+    pins = {pin.name: pin.pin for pin in default_tool_pins()}
+    assert pins["feature-factory"] == pins["opencode2-feature-factory"] == FACTORY_VERSION == "0.14.2"
+    expected = {"package": f"opencode2-feature-factory@{FACTORY_VERSION}"}
+    daemon = daemon_configuration({}, resolve_daemon_credentials({})).config
+    assert daemon["plugins"][0] == expected
+    # Creation and convergence use separate declarations; both must stay pinned.
+    for existing in (None, '{"plugins": [{"package": "opencode2-feature-factory@0.13.0"}]}'):
+        merged, _ = merge_opencode_config(existing)
+        assert json.loads(merged)["plugins"][0] == expected
+    entrypoint = seed_factory_install(tmp_path)
+    for package in ("feature-factory", "opencode2-feature-factory"):
+        manifest = json.loads((entrypoint.parents[2] / package / "package.json").read_text())
+        assert manifest["version"] == pins[package]
+        if package == "opencode2-feature-factory":
+            assert manifest["dependencies"]["feature-factory"] == FACTORY_VERSION

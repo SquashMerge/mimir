@@ -1219,14 +1219,14 @@ _OPENCODE_CONFIG_TEMPLATE = """\
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
-    {"package": "opencode2-feature-factory@0.14.1"},
+    {"package": "opencode2-feature-factory@0.14.2"},
     {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {"enabled": false}}
   ]
 }
 """
 
 _OPENCODE_REQUIRED_PLUGINS: tuple[object, ...] = (
-    {"package": "opencode2-feature-factory@0.14.1"},
+    {"package": "opencode2-feature-factory@0.14.2"},
     {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {"enabled": False}},
 )
 

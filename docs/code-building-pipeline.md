@@ -133,11 +133,16 @@ running agent can instead activate a newly installed poller through its
 
 Factory epics use the same repository declaration and isolated-checkout allocator,
 but have separate admission and concurrency. The image installs
-`feature-factory@0.14.1` and `opencode2-feature-factory@0.14.1` under
+`feature-factory@0.14.2` and `opencode2-feature-factory@0.14.2` under
 `/opt/mimir-opencode`; `MIMIR_FACTORY_ENTRYPOINT` names the absolute
 `feature-factory/bin/factory.js`. Set `MIMIR_FACTORY_EPICS_ENABLED=1` to let the
 poller dispatch `worklink:epic` issues. `MIMIR_FACTORY_MAX_CONCURRENT` defaults
 to `1`, independently of the leaf default `2`.
+
+In 0.14.2, slice builders run targeted slice tests; the full repository
+verification runs once per attempt in the factory's `observe` step, shared
+rather than duplicated when both name the same shell-free executable command.
+This does not replace Worklink's independent final repository gate below.
 
 The daemon receives command `feature` with exactly `--autonomous --max-retries 5
 chainlink-<id>`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII

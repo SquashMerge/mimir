@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Callable
 
 from mimir._rmtree import rmtree_missing_ok
@@ -33,7 +34,7 @@ from .worker_client import (
     _validate_identifier,
     worklink_checkout_root,
 )
-from .run_state import process_start_ticks
+from .run_state import process_start_ticks, valid_process_epoch
 
 HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
@@ -42,7 +43,10 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v22-claude-retained-recovery"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v23-leaf-retirement"
+# A launch records this nonce durably in the controller's leaf run state. It is
+# deliberately independent of image/protocol identity, which survives redeploys.
+EXECUTOR_INSTANCE_ID = str(uuid.uuid4())
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
@@ -71,6 +75,9 @@ _PATH_LAUNCH_FIELDS = frozenset({
     "executor_identity", "home_projection_profile", "retirement",
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
+_LEAF_RETIREMENT_FIELDS = _CANCEL_FIELDS | {
+    "executor_instance_id", "executor_process_epoch", "shim_pid", "process_start_ticks",
+}
 _FACTORY_CANCEL_FIELDS = frozenset({"version", "op", "executor_identity", "handle"})
 _FACTORY_HANDLE_FIELDS = frozenset({"substrate", "identifier", "process_start_ticks", "shim_pid"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
@@ -1101,6 +1108,95 @@ def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list
     _send(connection, {"id": identifier, "status": "cancelled"})
 
 
+def _executor_process_epoch() -> str | None:
+    """PID-namespace init death kills every process in that namespace (Linux).
+
+    Pair its birth marker with the kernel boot UUID to survive both container
+    and host restarts. Refuse this proof if procfs isn't our own PID namespace.
+    """
+    try:
+        if os.readlink("/proc/1/ns/pid") != os.readlink("/proc/self/ns/pid"):
+            return None
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        ticks = process_start_ticks(1)
+        epoch = f"{boot}:{ticks}"
+        return epoch if valid_process_epoch(epoch) else None
+    except OSError:
+        return None
+
+
+def _leaf_tree_verified_dead(
+    pid: int, ticks: int, executor_process_epoch: str | None = None, *, proc_root: Path = Path("/proc"),
+) -> bool:
+    """Conservative restart proof, including escaped/reparented descendants.
+
+    Workers cannot change UID after the irreversible privilege drop. Refuse if
+    *any* live Worklink-UID process remains, even an unrelated job. Never mistake
+    unreadable procfs for an empty tree. The caller is the privileged executor.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        try:
+            fields = (proc_root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+        except FileNotFoundError:
+            pass
+        else:
+            if int(fields[19]) == ticks and fields[0] not in {"Z", "X"}:
+                return False
+        if executor_process_epoch is not None:
+            current_epoch = _executor_process_epoch()
+            if current_epoch is not None and current_epoch != executor_process_epoch:
+                # A previous kernel/namespace cannot leave descendants in this
+                # namespace. New daemon/worker processes do not invalidate it.
+                return True
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                status = (entry / "status").read_text()
+                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            except FileNotFoundError:
+                # A vanished entry may have forked a reparented child after
+                # enumeration. Do not certify this unstable scan; retry later.
+                return False
+            uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+            uids = [int(value) for value in uid_line.split()[1:]]
+            if len(uids) != 4:
+                return False
+            if get_identities().worklink_uid in uids and fields[0] not in {"Z", "X"}:
+                return False
+        return True
+    except (OSError, ValueError, IndexError, StopIteration):
+        return False
+
+
+def _handle_verify_leaf_retired(
+    connection: socket.socket, request: dict[str, Any], fds: list[int],
+) -> None:
+    if fds or set(request) != _LEAF_RETIREMENT_FIELDS:
+        raise RuntimeError("invalid leaf retirement request")
+    _validate_executor_identity(request)
+    identifier = request["id"]
+    instance = request["executor_instance_id"]
+    epoch = request["executor_process_epoch"]
+    _validate_identifier(identifier)
+    _validate_identifier(instance)
+    if epoch is not None and not valid_process_epoch(epoch):
+        raise RuntimeError("invalid leaf executor process epoch")
+    pid = _positive_integer(request, "shim_pid")
+    ticks = _identity_integer(request, "process_start_ticks")
+    with _jobs_lock:
+        if identifier in _jobs or _launching:
+            raise RuntimeError("leaf retirement unverified: executor jobs are active")
+        # An unknown ID in the same instance is not proof of a restart.
+        if instance == EXECUTOR_INSTANCE_ID and identifier not in _exited:
+            raise RuntimeError("leaf retirement unverified: executor has not restarted")
+        if not _leaf_tree_verified_dead(pid, ticks, epoch):
+            raise RuntimeError("leaf retirement unverified: live or unreadable worker tree")
+    _send(connection, {"id": identifier, "status": "retired"})
+
+
 def _handle_cancel_factory_handle(
     connection: socket.socket, request: dict[str, Any], fds: list[int],
 ) -> None:
@@ -1461,6 +1557,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         _send(connection, {
             "id": identifier, "status": "started", "pid": proc.pid,
             "process_start_ticks": process_start_ticks(proc.pid),
+            "executor_instance_id": EXECUTOR_INSTANCE_ID,
+            "executor_process_epoch": _executor_process_epoch(),
         })
         exit_code, timed_out, output_overflow, stdout_bytes, stderr_bytes = _wait_with_output_limits(
             proc,
@@ -1659,6 +1757,8 @@ def handle_connection(connection: socket.socket) -> None:
             _handle_launch_factory(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)
+        elif request.get("op") == "verify_leaf_retired":
+            _handle_verify_leaf_retired(connection, request, fds)
         elif request.get("op") in {"cancel_factory_handle", "admit_factory_handle"}:
             _handle_cancel_factory_handle(connection, request, fds)
         elif request.get("op") == "identity":
