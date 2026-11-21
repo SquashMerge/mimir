@@ -1505,6 +1505,195 @@ def test_provider_checkout_handoff_and_live_result_observation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["factory", "cleanup", "config_refusal_cleanup"])
+async def test_repo_test_checkout_io_keeps_event_loop_progressing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    home = tmp_path / "home"
+    command = "/usr/bin/true"
+    if stage == "config_refusal_cleanup":
+        command += f" {lease.path}"
+    _configure_worklink_test(home, command)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    factory_arguments = []
+
+    def blocking_io():
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            # A finite guard lets the synchronous mutation fail without hanging.
+            assert release.wait(3), "checkout IO blocked the event-loop ticker"
+        finally:
+            finished.set()
+
+    def checkout(source, **kwargs):
+        factory_arguments.append((source, kwargs))
+        if stage == "factory":
+            blocking_io()
+        return SimpleNamespace(
+            path=source, capability=SimpleNamespace(path=source),
+            close=blocking_io if stage != "factory" else lambda: None,
+        )
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    task = asyncio.create_task(repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=checkout,
+    ).execute())
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        # This coroutine is the ticker: it must run while IO is still blocked,
+        # not merely after a queued callback finally runs on a stalled loop.
+        assert not finished.is_set()
+    finally:
+        release.set()
+        if stage == "config_refusal_cleanup":
+            with pytest.raises(repository.ProjectTestRefusal) as refusal:
+                await task
+            assert refusal.value.code == "test_config_invalid"
+        else:
+            assert (await task).ok
+    assert factory_arguments == [(lease.path, {
+        "scope_id": scope.scope_id, "pr_number": scope.pr_number, "known_sensitive": (),
+    })]
+    assert state.checkout_lease is lease
+    assert lease.path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during", ["factory", "runner", "cleanup"])
+async def test_repo_test_cancellation_settles_checkout_and_removes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, during: str,
+) -> None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    loop = asyncio.get_running_loop()
+    factory_entered = asyncio.Event()
+    runner_entered = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    release_factory = threading.Event()
+    release_cleanup = threading.Event()
+    path = tmp_path / "snapshots" / "attempt" / "checkout"
+    closed = []
+
+    def checkout(source, **kwargs):
+        path.mkdir(parents=True)
+        (path / "partial").write_text("half-created snapshot")
+        loop.call_soon_threadsafe(factory_entered.set)
+        assert release_factory.wait(5)
+        contained = repository.ContainedCheckout(
+            path, SimpleNamespace(close=lambda: closed.append(True)),
+            SimpleNamespace(destination=path),
+        )
+
+        def close():
+            loop.call_soon_threadsafe(cleanup_entered.set)
+            assert release_cleanup.wait(5)
+            contained.close()
+
+        return SimpleNamespace(path=path, capability=contained.capability, close=close)
+
+    async def runner(*args, **kwargs):
+        assert during != "factory", "cancelled snapshot must not launch a worker"
+        runner_entered.set()
+        if during == "runner":
+            await asyncio.Event().wait()
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    task = asyncio.create_task(repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=checkout,
+    ).execute())
+    try:
+        await asyncio.wait_for(factory_entered.wait(), 5)
+        assert path.exists()
+        if during == "factory":
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release_factory.set()
+        if during == "runner":
+            await asyncio.wait_for(runner_entered.wait(), 5)
+            task.cancel()
+        await asyncio.wait_for(cleanup_entered.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "cancellation must wait for checkout removal"
+        assert path.exists()
+    finally:
+        release_factory.set()
+        release_cleanup.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert closed == [True]
+    assert not path.parent.exists()
+    assert state.checkout_lease is lease
+    assert lease.path.exists()
+    assert state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure, code, reason, message", [
+    (repository.SnapshotCredentialsRefused(1), "test_snapshot_credentials_refused",
+     "snapshot_credentials", "project test snapshot contains credential-like material"),
+    (repository.SnapshotEmbeddedRepository(), "test_snapshot_embedded_repository",
+     "snapshot_embedded_repository", "project test snapshot source contains an embedded Git repository"),
+    (OSError("private path"), "test_snapshot_unavailable",
+     "snapshot_unavailable", "project test snapshot is unavailable"),
+])
+async def test_repo_test_threaded_factory_preserves_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    failure: Exception, code: str, reason: str, message: str,
+) -> None:
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    events = []
+
+    async def log_event(name, **fields):
+        events.append((name, fields))
+
+    monkeypatch.setattr(repository, "safe_log_event", log_event)
+
+    def refused(*args, **kwargs):
+        raise failure
+
+    async def runner(*args, **kwargs):
+        pytest.fail("refused snapshot must never launch a worker")
+
+    with pytest.raises(repository.ProjectTestRefusal) as refusal:
+        await repository.RepoProjectTests(
+            state, runner=runner, checkout_factory=refused,
+        ).execute()
+    assert refusal.value.code == code
+    assert str(refusal.value) == message
+    assert refusal.value.__cause__ is failure
+    assert refusal.value.execution_started and refusal.value.fixed_message
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": reason, "repository": scope.canonical_repo,
+        "pull_request": scope.pr_number,
+    })]
+
+
+@pytest.mark.asyncio
 async def test_provider_project_tests_run_fixed_command_in_contained_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
