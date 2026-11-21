@@ -54,10 +54,13 @@ class CollectedExecutionResult:
     output_overflow: bool
     stdout_dropped_bytes: int
     stderr_dropped_bytes: int
+    children_reaped: bool = False
 
 
 HEAVY_LOCK_ENV = "MIMIR_HEAVY_LOCK_FILE"
 HEAVY_LOCK_TIMEOUT_ENV = "MIMIR_HEAVY_LOCK_TIMEOUT"
+HEAVY_LOCK_TIER_ENV = "MIMIR_HEAVY_TIER"
+HEAVY_LOCK_TIERS = ("medium", "large")
 _HEAVY_LOCK_PATH = re.compile(r"/[A-Za-z0-9._/-]{1,1023}\Z")
 _CONTROLLER_HOME = "/home/mimir"
 
@@ -73,15 +76,23 @@ def validate_heavy_lock_timeout(value: str) -> str:
     return value
 
 
+def validate_heavy_lock_tier(value: str) -> str:
+    """Validate the lease tier: medium shares the host with one other medium job."""
+    if value not in HEAVY_LOCK_TIERS:
+        raise ValueError(f"{HEAVY_LOCK_TIER_ENV} must be medium or large")
+    return value
+
+
 def heavy_lock_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """The operator's shared heavy-run lease settings, for every Worklink command.
 
     scripts/heavy_run.sh serializes heavy commands across the host and its
     containers through a directory both can write. The controller's lease path
-    and optional timeout are not credentials. Without the path, builders and
-    gates cannot join the operator's lease. An unset or empty path means no
-    lease (and no forwarded timeout). A malformed or controller-home path, or
-    an invalid timeout for a configured lease, fails closed.
+    and optional timeout and tier are not credentials. Without the path,
+    builders and gates cannot join the operator's lease. An unset or empty path
+    means no lease (and no forwarded timeout or tier). A malformed or
+    controller-home path, or an invalid timeout or tier for a configured lease,
+    fails closed. An unset tier means large: the command runs alone.
     """
     environ = os.environ if environ is None else environ
     value = environ.get(HEAVY_LOCK_ENV, "")
@@ -94,6 +105,8 @@ def heavy_lock_environment(environ: Mapping[str, str] | None = None) -> dict[str
     result = {HEAVY_LOCK_ENV: value}
     if HEAVY_LOCK_TIMEOUT_ENV in environ:
         result[HEAVY_LOCK_TIMEOUT_ENV] = validate_heavy_lock_timeout(environ[HEAVY_LOCK_TIMEOUT_ENV])
+    if HEAVY_LOCK_TIER_ENV in environ:
+        result[HEAVY_LOCK_TIER_ENV] = validate_heavy_lock_tier(environ[HEAVY_LOCK_TIER_ENV])
     return result
 
 
@@ -338,6 +351,8 @@ async def execute_contained(
     projections: Sequence[WorkerProjection] = (),
     *,
     identifier: str,
+    home_projection_profile: str = "none",
+    retirement: str = "process",
     timeout_s: float,
     stdout_limit: int,
     stderr_limit: int,
@@ -351,12 +366,20 @@ async def execute_contained(
         raise ValueError("worker output limits must be positive")
     if timeout_s <= 0:
         raise ValueError("worker timeout must be positive")
-    if isinstance(argv, (str, bytes)) or not argv or any(
-        not isinstance(arg, str) or not arg or "\x00" in arg for arg in argv
+    if not isinstance(retirement, str) or retirement not in {"process", "contained_process_tree"}:
+        raise ValueError("unknown worker retirement policy")
+    if isinstance(argv, (str, bytes)) or not argv or not argv[0] or any(
+        not isinstance(arg, str) or "\x00" in arg for arg in argv
     ):
         raise ValueError("worker command must contain non-empty NUL-free strings")
     if "HOME" in worker_env:
         raise ValueError("worker HOME is assigned by the executor")
+    if "CLAUDE_CONFIG_DIR" in worker_env:
+        raise ValueError("worker Claude config is assigned by the executor")
+    if home_projection_profile == "claude_leaf" and {
+        "GH_TOKEN", "GITHUB_TOKEN", "FACTORY_PUBLISHING_IDENTITY",
+    }.intersection(worker_env):
+        raise ValueError("Claude leaf refuses epic credentials")
     client_class, projection_class = _worker_classes()
     try:
         checked_projections = tuple(
@@ -368,6 +391,23 @@ async def execute_contained(
         {item.path for item in checked_projections}
     ) != len(checked_projections):
         raise ValueError("worker projections must use at most two unique destinations")
+    profiles = {
+        "none": {},
+        "claude_leaf": {".claude/.claude.json": {"hasCompletedOnboarding": True},
+                        ".claude/settings.json": {"disableAllHooks": True}},
+        "claude_factory": {".claude/.claude.json": {"hasCompletedOnboarding": True}},
+    }
+    if not isinstance(home_projection_profile, str) or home_projection_profile not in profiles:
+        raise ValueError("unknown worker projection profile")
+    expected = profiles[home_projection_profile]
+    if {p.path for p in checked_projections} != set(expected):
+        raise ValueError("worker projections do not match selected profile")
+    for projection in checked_projections:
+        if len(projection.document) > 1024 * 1024:
+            raise ValueError("worker projection exceeds size limit")
+        parsed = json.loads(projection.document)
+        if parsed != expected[projection.path] or any(type(v) is not bool for v in parsed.values()):
+            raise ValueError("worker projection must use generated configuration")
 
     opened_here = stdout_sink is None and stderr_sink is None
     if (stdout_sink is None) != (stderr_sink is None):
@@ -385,6 +425,8 @@ async def execute_contained(
             argv=tuple(argv),
             env=dict(worker_env),
             projections=checked_projections,
+            **({"home_projection_profile": home_projection_profile} if home_projection_profile != "none" else {}),
+            **({"retirement": retirement} if retirement != "process" else {}),
             identifier=identifier,
             timeout_s=timeout_s,
             stdout_sink=stdout_sink,
@@ -494,6 +536,7 @@ async def execute_contained(
             output_overflow=output_overflow,
             stdout_dropped_bytes=stdout_dropped,
             stderr_dropped_bytes=stderr_dropped,
+            children_reaped=getattr(process, "children_reaped", False),
         )
     finally:
         try:

@@ -720,7 +720,7 @@ async def test_epic_terminal_recovery_stops_descendant_shells_before_finalizatio
         result = await WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._recover_factory_070(
             issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
             claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)), claims=object(),
-            backend=SimpleNamespace(status=lambda *a, **kw: completed), compute=compute,
+            backend=SimpleNamespace(host="opencode", status=lambda *a, **kw: completed), compute=compute,
             retained=record, launcher=Path(record.launcher), repo_slug=record.repository,
             base="main", test_cmd="pytest", runner=lambda *a, **kw: None, work_item_json="{}")
         assert result.status == "review_ready"
@@ -1099,6 +1099,7 @@ async def test_running_factory_reattaches_same_host_without_input(tmp_path, monk
         monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kwargs: Path(record.sandbox))
         calls = []
         class Factory:
+            host = "opencode"
             poll_interval_s = 0.001
             def status(self, *args, **kwargs):
                 calls.append("status")

@@ -101,14 +101,35 @@ def test_malformed_or_controller_home_path_fails_closed(monkeypatch, value):
         base_worker_environment(IDENTIFIER)
 
 
+@pytest.mark.parametrize("tier", ["medium", "large"])
+def test_heavy_lock_environment_forwards_a_valid_tier(tier):
+    assert heavy_lock_environment({"MIMIR_HEAVY_LOCK_FILE": LOCK, "MIMIR_HEAVY_TIER": tier}) == {
+        "MIMIR_HEAVY_LOCK_FILE": LOCK, "MIMIR_HEAVY_TIER": tier,
+    }
+
+
+@pytest.mark.parametrize("tier", ["", "MEDIUM", "small", " medium", "medium\n"])
+def test_heavy_lock_tier_fails_closed(tier):
+    with pytest.raises(ValueError, match="MIMIR_HEAVY_TIER"):
+        heavy_lock_environment({"MIMIR_HEAVY_LOCK_FILE": LOCK, "MIMIR_HEAVY_TIER": tier})
+
+
+def test_tier_without_lock_file_is_not_forwarded():
+    assert heavy_lock_environment({"MIMIR_HEAVY_TIER": "medium"}) == {}
+    assert heavy_lock_environment({"MIMIR_HEAVY_LOCK_FILE": "", "MIMIR_HEAVY_TIER": "bogus"}) == {}
+
+
 def test_factory_and_local_children_carry_the_lease(monkeypatch):
     monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", LOCK)
     monkeypatch.setenv("MIMIR_HEAVY_LOCK_TIMEOUT", TIMEOUT)
+    monkeypatch.setenv("MIMIR_HEAVY_TIER", "medium")
     assert compute._local_child_env()["MIMIR_HEAVY_LOCK_FILE"] == LOCK
     assert compute._local_child_env()["MIMIR_HEAVY_LOCK_TIMEOUT"] == TIMEOUT
+    assert compute._local_child_env()["MIMIR_HEAVY_TIER"] == "medium"
     monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE")
     assert "MIMIR_HEAVY_LOCK_FILE" not in compute._local_child_env()
     assert "MIMIR_HEAVY_LOCK_TIMEOUT" not in compute._local_child_env()
+    assert "MIMIR_HEAVY_TIER" not in compute._local_child_env()
 
 
 def test_local_child_refuses_a_malformed_lease_as_a_launch_error(monkeypatch):
@@ -144,10 +165,11 @@ def _prepare(tmp_path, monkeypatch, environ):
 
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="daemon directory preparation is Linux-only")
 def test_daemon_environment_carries_the_lease_to_builder_shells(tmp_path, monkeypatch):
-    _, env = _prepare(tmp_path, monkeypatch, {"MIMIR_HEAVY_LOCK_FILE": LOCK,
+    _, env = _prepare(tmp_path, monkeypatch, {"MIMIR_HEAVY_LOCK_FILE": LOCK, "MIMIR_HEAVY_TIER": "medium",
                                            "MIMIR_HEAVY_LOCK_TIMEOUT": TIMEOUT, "MIMIR_API_KEY": "secret"})
     assert env["MIMIR_HEAVY_LOCK_FILE"] == LOCK
     assert env["MIMIR_HEAVY_LOCK_TIMEOUT"] == TIMEOUT
+    assert env["MIMIR_HEAVY_TIER"] == "medium"
     assert "MIMIR_API_KEY" not in env
     _, env = _prepare(tmp_path / "unset", monkeypatch, {})
     assert "MIMIR_HEAVY_LOCK_FILE" not in env
@@ -213,15 +235,20 @@ def test_daemon_session_environment_carries_the_lease(monkeypatch, tmp_path):
 
     monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", LOCK)
     monkeypatch.setenv("MIMIR_HEAVY_LOCK_TIMEOUT", TIMEOUT)
+    monkeypatch.setenv("MIMIR_HEAVY_TIER", "medium")
     env = session_environment({}, home=tmp_path, git_settings=(), credentials={})
     assert env["MIMIR_HEAVY_LOCK_FILE"] == LOCK
     assert env["MIMIR_HEAVY_LOCK_TIMEOUT"] == TIMEOUT
+    assert env["MIMIR_HEAVY_TIER"] == "medium"
     # pass_env can neither supply nor override it.
     with pytest.raises(compute.ComputeLaunchError, match="MIMIR_HEAVY_LOCK_FILE.*denied"):
         session_environment({"MIMIR_HEAVY_LOCK_FILE": "/elsewhere/heavy.lock"}, home=tmp_path,
                             git_settings=(), credentials={})
     with pytest.raises(compute.ComputeLaunchError, match="MIMIR_HEAVY_LOCK_TIMEOUT.*denied"):
         session_environment({"MIMIR_HEAVY_LOCK_TIMEOUT": "60"}, home=tmp_path,
+                            git_settings=(), credentials={})
+    with pytest.raises(compute.ComputeLaunchError, match="MIMIR_HEAVY_TIER.*denied"):
+        session_environment({"MIMIR_HEAVY_TIER": "large"}, home=tmp_path,
                             git_settings=(), credentials={})
     monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE")
     assert "MIMIR_HEAVY_LOCK_FILE" not in session_environment({}, home=tmp_path, git_settings=(), credentials={})

@@ -86,6 +86,34 @@ key. The image includes the `codex-plus` extra and the agent receives the
 subscription spec as `MIMIR_MODEL_SPEC`; setup removes an obsolete
 `OPENAI_API_KEY` from `compose.env` when no selected model or embedding uses it.
 
+For a Claude subscription, choose `--model-spec claude-code:sonnet`. Run the
+official `claude setup-token` on the operator machine and supply its OAuth token
+with **either** `--claude-token-file /private/token` (mode 0600) **or**
+`--claude-token-stdin`; interactive setup uses a hidden prompt. Never put a token
+value in argv. Setup stores only `CLAUDE_CODE_OAUTH_TOKEN` in mode-0600
+`compose.env` and removes stale `ANTHROPIC_API_KEY` entries. The default Saga
+model is `claude-code:sonnet:low`; local embeddings need no API key.
+
+This route installs the official Claude CLI **2.1.326** and
+`claude-code-feature-factory` **0.14.1** under `/opt/mimir-claude`, using that
+plugin's vendored factory **0.14.1** for every epic control. Worklink YAML selects
+`claude_code` and `feature_factory.host: claude_code`. Leaves use restricted,
+contained subprocesses; factory drivers use the plugin's upstream tool policy
+in a contained foreground subprocess. There is no OpenCode daemon, telemetry
+plugin, config generation or login/readiness gate on this route.
+
+`MIMIR_WORKLINK_HOST=claude_code`, `MIMIR_ENABLE_CLAUDE_CODE=1` and
+`MIMIR_ENABLE_OPENCODE=0` select the matching root-image toolchain; inconsistent
+switches refuse before installation. Workspace scaffolding accepts
+`--worklink-host claude_code`. Existing deployments cannot switch routes, even
+with `--force`: use a **fresh deployment directory**. Same-route model changes
+are supported. Legacy OpenCode/Codex and API-backed setup output is preserved;
+an absent manifest `worklink_toolchain` means OpenCode.
+
+Offline verification does not prove live subscription access. After merge, the
+operator owns live agent/Saga/leaf/epic/MCP/spawn checks and deployed token-grep
+checks. See [credentials](credentials.md) for the leaf versus epic boundary.
+
 To trace the Cultivate agent, pass `--otlp-endpoint https://collector.example.com`
 (the HTTP(S) **base URL**, without `/v1/traces`). Setup rejects URL userinfo;
 Mimir appends `/v1/traces`. `--otel-service-name` defaults to
@@ -102,7 +130,7 @@ Reruns preserve tracing settings. Use `--otlp-endpoint none` to remove tracing
 and its image extra, or an empty headers file/stdin (or empty
 `MIMIR_CULTIVATE_OTLP_HEADERS`) to clear saved headers.
 
-Setup creates a private `<deploy>/codex` directory and mounts it at
+On the Codex subscription route, setup creates a private `<deploy>/codex` directory and mounts it at
 `/home/mimir/.codex` in the agent. From the deployment directory, run the
 **exact one-line login command printed by setup**:
 `docker compose run --rm --no-deps --user 1001:1001 --entrypoint codex agent login --device-auth`.
@@ -115,7 +143,7 @@ tokens are single-use, and sharing one login across deployments can revoke
 the entire token family. Log in separately for **each** deployment. This is the
 agent's login: the controller also seeds the Worklink daemon's credential store.
 
-Worklink uses a separate OpenCode 2.3.0 daemon, supervised by the
+On legacy routes, Worklink uses a separate OpenCode 2.3.0 daemon, supervised by the
 `worklink-opencode` s6 longrun as `worklink` (uid 1002). Setup starts the container
 and waits at most 60 seconds for local daemon readiness. The Mimir workload is
 gated, but the daemon remains available when login is missing. As `mimir`, the
@@ -238,6 +266,15 @@ umask, so participants need no shared group. `none`
 for `--heavy-lock-dir` clears both settings; omitting the flags on a rerun
 preserves them. Without a shared directory, no timeout is written. Outside setup,
 an unset timeout is not forwarded, so `heavy_run`'s own default applies.
+The lease has two slots. A command run with `MIMIR_HEAVY_TIER=medium` holds one,
+so two medium commands can share the host; `large` (the default) holds both and
+runs alone, and a waiting large command blocks new medium ones. Worklink forwards
+a `medium` or `large` tier set in the agent's environment the same way as the
+timeout (anything else fails closed); setup does not write one. Keep anything
+whose timing or footprint is measured on `large`. Set `medium` only once every
+participant on the shared directory runs this `heavy_run` version: an older
+helper waiting on the lease sees only the first slot, so it can start beside a
+medium command.
 
 `--embedding local` (the default) selects `voyageai/voyage-4-nano` at 1024
 dimensions on CPU. Its query and document vectors share Voyage 4's embedding
@@ -607,8 +644,9 @@ Unsupported architecture fails the image build.
 The repository-root production `Dockerfile` has s6 and the core `mimir` and
 `watchdog` services. With `MIMIR_PLUGIN_SELECTION=cultivate` (or `all`) and
 `CHAINLINK_ARTIFACT_STAGE=chainlink-build` at build time it also assembles the
-trusted first-party fragment: pinned OpenCode and factory adapters, UID 1002 Worklink user, data directories,
-the exact `worklink-execd` and `worklink-opencode` s6 services (not a generic
+trusted first-party fragment: route-selected pinned coding and factory adapters, UID 1002 Worklink user, data directories,
+the exact `worklink-execd` s6 service and, on OpenCode routes only,
+`worklink-opencode` (not a generic
 prefixed plugin service). In explicit source mode both venvs run Cultivate built
 from the verified source commit: the root executor venv overlays core and
 `plugins/cultivate` from `MIMIR_EXECUTOR_COMMIT` with `--no-deps` (so the

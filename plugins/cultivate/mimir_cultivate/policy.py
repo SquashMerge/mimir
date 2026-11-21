@@ -1105,8 +1105,10 @@ def _factory(module: str, name: str) -> Callable[[], object]:
         from importlib import import_module
 
         source = import_module(module)
-        if name == "spawn_open_code":
-            return source.spawn_open_code
+        if module.endswith("repository") and name == "repo_test":
+            return source.build_repo_test_tool()
+        if name in {"spawn_open_code", "spawn_claude_code"}:
+            return getattr(source, name)
         if name in _BUILDS:
             return getattr(source, name)
         if module.endswith("tracker.tools"):
@@ -1123,6 +1125,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
     from mimir.plugins.registry import PolicyConsumerHooks
     from . import forge, opencode, repository, review_guard
     from .worklink.retained_scope import derive_retained_factory_scope
+    claude_route = os.environ.get("MIMIR_MODEL_SPEC", "").startswith("claude-code:")
 
     def retained_checkout_root() -> Path:
         from .worklink.worker_client import worklink_checkout_root
@@ -1187,6 +1190,9 @@ def register_tools(registrar: PolicyRegistrar) -> None:
         shell_environment=review_guard.github_shell_environment,
     ))
     for name, declaration in sorted(_TOOL_DECLARATIONS.items()):
+        # Keep the historical declaration; substitute only the current route.
+        if name == "spawn_open_code" and claude_route:
+            name = "spawn_claude_code"
         descriptor = declaration.descriptor
         module = (
             "mimir_cultivate.forge" if name.startswith(("pr_", "ci_", "issue_"))
@@ -1194,6 +1200,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
             "mimir_cultivate.repository" if name.startswith("repo_") else
             "mimir_cultivate.tracker.tools" if name in TRACKER_TOOL_NAMES else
             "mimir_cultivate.registration" if name in _BUILDS else
+            "mimir_cultivate.claude_code" if name == "spawn_claude_code" else
             "mimir_cultivate.opencode"
         )
         action = declaration.typed_action

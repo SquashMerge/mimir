@@ -2136,7 +2136,7 @@ def _request_with_resolved_spawn_paths(
     auth_context: AuthContext | None,
 ) -> ToolCallRequest:
     """Bind service spawn execution to the paths checked by authorization."""
-    if tool_name != "spawn_open_code":
+    if tool_name not in {"spawn_open_code", "spawn_claude_code"}:
         return request
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for(tool_name) if service is not None else None
@@ -2148,7 +2148,7 @@ def _request_with_resolved_spawn_paths(
 
     args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
     paths = ["cwd"]
-    if tool_name == "spawn_open_code":
+    if tool_name in {"spawn_open_code", "spawn_claude_code"}:
         paths.append("artifact_root")
     try:
         for name in paths:
@@ -2924,7 +2924,7 @@ def _returned_value_is_error(tool_name: str, content: Any, *, policy: Any = None
     )):
         return True
 
-    if tool_name == "spawn_open_code":
+    if tool_name in {"spawn_open_code", "spawn_claude_code"}:
         try:
             value = json.loads(text)
         except (TypeError, ValueError):

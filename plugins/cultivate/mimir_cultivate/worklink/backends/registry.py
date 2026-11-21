@@ -28,6 +28,7 @@ from .opencode import (
     validate_extra_args,
     validate_test_env,
 )
+from .claude_code import ClaudeCodeBackend
 
 
 log = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ def valid_repository_slug(value: object) -> bool:
     return validate(value)
 
 WORKLINK_MERGED_LABEL = "worklink:merged"
-SHIPPING_BACKENDS = frozenset({"feature_factory", "opencode"})
+SHIPPING_BACKENDS = frozenset({"feature_factory", "opencode", "claude_code"})
 SHIPPING_COMPUTE_BACKENDS = frozenset({"local_subprocess", "opencode_daemon"})
 DEFAULT_FACTORY_RUN_TIMEOUT_S = 43200.0
 _PUBLICATION_REFERENCE = re.compile(r"#\d+|https?://\S+|(?<!\w)/(?:[\w.-]+/)+[\w.-]+", re.I)
@@ -721,6 +722,8 @@ class BackendRegistry:
             name = sorted(unknown_backend_configs)[0]
             raise ValueError(f"unknown Worklink backend config: {name}")
         self._backends: dict[str, ToolBackend] = {
+            "claude_code": self._build_claude_code(self.config.backend_settings.get("claude_code", {}),
+                                                   test_command=self.config.defaults.test_command),
             "feature_factory": self._build_feature_factory(
                 self.config.backend_settings.get("feature_factory", {})
             ),
@@ -795,6 +798,26 @@ class BackendRegistry:
         raise ValueError(f"unknown Worklink compute backend config: {name}")
 
     @staticmethod
+    def _build_claude_code(settings: Mapping[str, Any], *, test_command: str) -> ClaudeCodeBackend:
+        from ...claude_code import bash_rules
+        unknown = settings.keys() - {"model", "bash_allowlist", "pass_env"}
+        if unknown:
+            raise ValueError(f"unknown worklink claude_code setting: {sorted(unknown)[0]}")
+        model = settings.get("model")
+        if model is not None and not isinstance(model, str):
+            raise ValueError("worklink claude_code model must be a string")
+        requested = settings.get("bash_allowlist")
+        if requested is not None and (not isinstance(requested, list) or not all(isinstance(r, str) for r in requested)):
+            raise ValueError("worklink claude_code bash_allowlist must be a list of strings")
+        # An unused Claude backend must not constrain another route's gate grammar.
+        if requested is not None:
+            bash_rules(test_command, requested)
+        passed = settings.get("pass_env", ())
+        if isinstance(passed, (str, bytes)) or not isinstance(passed, (list, tuple)) or not all(isinstance(n, str) for n in passed):
+            raise ValueError("worklink claude_code pass_env must be a list of names")
+        return ClaudeCodeBackend(model=model, bash_allowlist=requested, pass_env=tuple(passed))
+
+    @staticmethod
     def _build_opencode(
         settings: Mapping[str, Any], *, test_command: str
     ) -> OpenCodeBackend:
@@ -843,19 +866,25 @@ class BackendRegistry:
                 f"{', '.join(repr(key) for key in retired)}; configure one "
                 "absolute 'entrypoint' ending in feature-factory/bin/factory.js"
             )
-        unknown = sorted(set(settings) - {"entrypoint"})
+        unknown = sorted(set(settings) - {"entrypoint", "host", "model"})
         if unknown:
             raise ValueError(
                 f"unknown worklink feature_factory setting: {unknown[0]}"
             )
+        host = settings.get("host", "opencode")
+        if not isinstance(host, str) or host not in {"opencode", "claude_code"}:
+            raise ValueError("worklink feature_factory host must be opencode or claude_code")
+        if settings.get("model") is not None and host != "claude_code":
+            raise ValueError("worklink feature_factory model requires claude_code host")
+        from ..claude_factory_host import DEFAULT_ENTRYPOINT
         entrypoint = str(
             settings.get("entrypoint")
             or os.environ.get("MIMIR_FACTORY_ENTRYPOINT")
-            or DEFAULT_FACTORY_ENTRYPOINT
+            or (DEFAULT_ENTRYPOINT if host == "claude_code" else DEFAULT_FACTORY_ENTRYPOINT)
         )
         if not Path(entrypoint).is_absolute():
             raise ValueError("worklink feature_factory entrypoint must be an absolute path")
-        return FeatureFactoryBackend(entrypoint=entrypoint)
+        return FeatureFactoryBackend(entrypoint=entrypoint, host=host, model=settings.get("model"))
 
 
 def _derive_bash_allowlist(test_command: str) -> tuple[str, ...]:

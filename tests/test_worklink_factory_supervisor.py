@@ -25,6 +25,68 @@ supervisor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(supervisor)
 
 
+def test_held_supervisor_does_not_start_payload_without_admission(monkeypatch):
+    launches = []
+    received = []
+
+    class Channel:
+        def set_inheritable(self, value):
+            pass
+
+        def setblocking(self, value):
+            pass
+
+        def recv(self, size):
+            assert launches == []
+            received.append(True)
+            return b"stop"
+
+    channel = Channel()
+    monkeypatch.setattr(supervisor, "_enable_subreaper", lambda: None)
+    monkeypatch.setattr(supervisor, "_send", lambda *args, **kwargs: True)
+    monkeypatch.setattr(supervisor.select, "select", lambda *args: ([channel], [], []))
+
+    def launch(*args, **kwargs):
+        launches.append(args)
+        raise RuntimeError("unadmitted payload was started")
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", launch)
+    assert supervisor.supervise(channel, ["/bin/true"], await_admission=True) == 0
+    assert received == [True]
+    assert launches == []
+
+
+@pytest.mark.parametrize("packet", [b"admit", b"stop", b"", b"not admission"])
+def test_real_supervisor_admission_is_opt_in_and_fail_closed(tmp_path, packet):
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    marker = tmp_path / "payload-started"
+    proc = subprocess.Popen([sys.executable, "-I", str(SOURCE), str(child.fileno()),
+        "--await-admission", sys.executable, "-I", "-c",
+        "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('started')", str(marker)],
+        pass_fds=(child.fileno(),), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    child.close()
+    parent.settimeout(10)
+    try:
+        assert json.loads(parent.recv(4096)) == {"kind": "ready"}
+        assert not marker.exists()
+        if packet:
+            parent.send(packet)
+            terminal = json.loads(parent.recv(4096))
+            assert terminal == {"kind": "terminal", "exit_code": 0 if packet == b"admit" else 125}
+        else:
+            parent.close()
+        proc.wait(timeout=10)
+        assert marker.exists() == (packet == b"admit")
+        if packet:
+            assert proc.returncode == 0, proc.stderr.read().decode()
+    finally:
+        parent.close()
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=10)
+        proc.stderr.close()
+
+
 # The outer process owns all fixture descendants, even with prctl mutated out
 # in the supervisor. No subreaper state or process-wide waits touch pytest.
 HARNESS = r'''

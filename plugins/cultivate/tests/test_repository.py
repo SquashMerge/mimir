@@ -98,6 +98,117 @@ def test_repository_config_and_parity_are_provider_owned(tmp_path: Path) -> None
     assert report["counts"]["operations_total"] > 0
 
 
+def _suite_declarations(*names: str, default: bool = False) -> list[dict]:
+    return [
+        {"name": name, "command": "/usr/bin/true", "default": default and index == 0}
+        for index, name in enumerate(names)
+    ]
+
+
+def test_repo_test_rendered_suite_guidance(tmp_path, monkeypatch) -> None:
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_test_suites(
+        home, state, test_suites=_suite_declarations("python", "cultivate", "frontend"),
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    selected = load_plugins(enable="cultivate").policy
+    factory = selected.tools["repo_test"].factory
+    tool = factory()
+    rendered = convert_to_openai_tool(tool)["function"]
+    assert "more than one test suite, pass exactly one" in rendered["description"]
+    assert f"{scope.canonical_repo}: python, cultivate, frontend" in rendered["description"]
+    parameter = rendered["parameters"]["properties"]["suite"]
+    assert "more than one test suite, pass exactly one" in parameter["description"]
+    assert "$MIMIR_HOME/repositories.yaml" in parameter["description"]
+    assert "test_suites" in parameter["description"]
+    assert "suite" not in rendered["parameters"].get("required", [])
+    assert "runtime" not in rendered["parameters"]["properties"]
+
+    # Materialization reads current declarations, not an import-time snapshot,
+    # and never leaks the first deployment's hints into the shared tool.
+    _configure_test_suites(home, state, test_suites=_suite_declarations("unit", default=True))
+    assert f"{scope.canonical_repo}: unit" in factory().description
+    assert "python, cultivate, frontend" not in factory().description
+    assert "Configured suites by repository" not in repository.repo_test.description
+
+
+@pytest.mark.parametrize("configuration", ["missing", "invalid", "no_home"])
+def test_repo_test_unknown_suites_keep_generic_guidance(tmp_path, monkeypatch, configuration):
+    home = tmp_path / "home"
+    home.mkdir()
+    if configuration == "invalid":
+        (home / "repositories.yaml").write_text("repositories: not-a-list\n")
+    monkeypatch.setenv("MIMIR_HOME", str(home) if configuration != "no_home" else "")
+    tool = repository.build_repo_test_tool()
+    assert "more than one test suite, pass exactly one" in tool.description
+    assert "$MIMIR_HOME/repositories.yaml" in tool.description
+    assert "Configured suites by repository" not in tool.description
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_repo_test_single_suite_can_be_omitted(tmp_path, monkeypatch, legacy):
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_test_suites(
+        home, state,
+        test_suites=[] if legacy else _suite_declarations("unit", default=True),
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    command, _, _, suite, _ = repository._configured_command(scope.canonical_repo)
+    assert command[0] == "/usr/bin/true"
+    assert suite == ("default" if legacy else "unit")
+    assert f"{scope.canonical_repo}: {suite}" in repository.build_repo_test_tool().description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scoped", [False, True])
+async def test_repo_test_suite_refusal_logging_has_no_publication_verdict(
+    tmp_path, monkeypatch, scoped,
+):
+    from mimir.tools import budget_gate
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_test_suites(
+        home, state, test_suites=_suite_declarations("python", "cultivate", "frontend"),
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("suite selection refusal must precede snapshot creation")
+
+    real_runner = repository.RepoProjectTests
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real_runner(
+        state, checkout_factory=forbidden,
+    ))
+    events = []
+    monkeypatch.setattr(
+        budget_gate, "_emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    selectors = ("unmatched/",) if scoped else ()
+    with pytest.raises(ToolPolicyRefusal, match="test_suite_selection_refused") as raised:
+        await repository.repo_test.coroutine(
+            scope.canonical_repo, scope.pr_number, selectors,
+        )
+    assert raised.value.__cause__.execution_started is False
+    assert "python, cultivate, frontend" in str(raised.value)
+    assert "No tests ran. Retry with exactly one declared suite" in str(raised.value)
+    assert "Hold publication" not in str(raised.value)
+    assert state.full_tested_head is None
+    # Exercise the real event formatter used by the tool exception middleware.
+    budget_gate._record_tool_outcome("repo_test", refused_reason=str(raised.value))
+    hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+    assert "test_suite_selection_refused" in hard["reason"]
+    assert "No tests ran" in hard["reason"]
+    assert "Hold publication" not in json.dumps(events)
+
+
 def test_repository_git_path_validation_stays_closed() -> None:
     with pytest.raises(repository.GitRefusal, match="repository-relative"):
         repository._validated_paths(("../outside",), required=True)
@@ -1502,6 +1613,195 @@ def test_provider_checkout_handoff_and_live_result_observation(
         assert completed.wait(10)
         assert rebound[0].recovery_id != state.checkout_lease.recovery_id
         threads[0].join(timeout=10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["factory", "cleanup", "config_refusal_cleanup"])
+async def test_repo_test_checkout_io_keeps_event_loop_progressing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    home = tmp_path / "home"
+    command = "/usr/bin/true"
+    if stage == "config_refusal_cleanup":
+        command += f" {lease.path}"
+    _configure_worklink_test(home, command)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    factory_arguments = []
+
+    def blocking_io():
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            # A finite guard lets the synchronous mutation fail without hanging.
+            assert release.wait(3), "checkout IO blocked the event-loop ticker"
+        finally:
+            finished.set()
+
+    def checkout(source, **kwargs):
+        factory_arguments.append((source, kwargs))
+        if stage == "factory":
+            blocking_io()
+        return SimpleNamespace(
+            path=source, capability=SimpleNamespace(path=source),
+            close=blocking_io if stage != "factory" else lambda: None,
+        )
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    task = asyncio.create_task(repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=checkout,
+    ).execute())
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        # This coroutine is the ticker: it must run while IO is still blocked,
+        # not merely after a queued callback finally runs on a stalled loop.
+        assert not finished.is_set()
+    finally:
+        release.set()
+        if stage == "config_refusal_cleanup":
+            with pytest.raises(repository.ProjectTestRefusal) as refusal:
+                await task
+            assert refusal.value.code == "test_config_invalid"
+        else:
+            assert (await task).ok
+    assert factory_arguments == [(lease.path, {
+        "scope_id": scope.scope_id, "pr_number": scope.pr_number, "known_sensitive": (),
+    })]
+    assert state.checkout_lease is lease
+    assert lease.path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during", ["factory", "runner", "cleanup"])
+async def test_repo_test_cancellation_settles_checkout_and_removes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, during: str,
+) -> None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    loop = asyncio.get_running_loop()
+    factory_entered = asyncio.Event()
+    runner_entered = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    release_factory = threading.Event()
+    release_cleanup = threading.Event()
+    path = tmp_path / "snapshots" / "attempt" / "checkout"
+    closed = []
+
+    def checkout(source, **kwargs):
+        path.mkdir(parents=True)
+        (path / "partial").write_text("half-created snapshot")
+        loop.call_soon_threadsafe(factory_entered.set)
+        assert release_factory.wait(5)
+        contained = repository.ContainedCheckout(
+            path, SimpleNamespace(close=lambda: closed.append(True)),
+            SimpleNamespace(destination=path),
+        )
+
+        def close():
+            loop.call_soon_threadsafe(cleanup_entered.set)
+            assert release_cleanup.wait(5)
+            contained.close()
+
+        return SimpleNamespace(path=path, capability=contained.capability, close=close)
+
+    async def runner(*args, **kwargs):
+        assert during != "factory", "cancelled snapshot must not launch a worker"
+        runner_entered.set()
+        if during == "runner":
+            await asyncio.Event().wait()
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    task = asyncio.create_task(repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=checkout,
+    ).execute())
+    try:
+        await asyncio.wait_for(factory_entered.wait(), 5)
+        assert path.exists()
+        if during == "factory":
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release_factory.set()
+        if during == "runner":
+            await asyncio.wait_for(runner_entered.wait(), 5)
+            task.cancel()
+        await asyncio.wait_for(cleanup_entered.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "cancellation must wait for checkout removal"
+        assert path.exists()
+    finally:
+        release_factory.set()
+        release_cleanup.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert closed == [True]
+    assert not path.parent.exists()
+    assert state.checkout_lease is lease
+    assert lease.path.exists()
+    assert state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure, code, reason, message", [
+    (repository.SnapshotCredentialsRefused(1), "test_snapshot_credentials_refused",
+     "snapshot_credentials", "project test snapshot contains credential-like material"),
+    (repository.SnapshotEmbeddedRepository(), "test_snapshot_embedded_repository",
+     "snapshot_embedded_repository", "project test snapshot source contains an embedded Git repository"),
+    (OSError("private path"), "test_snapshot_unavailable",
+     "snapshot_unavailable", "project test snapshot is unavailable"),
+])
+async def test_repo_test_threaded_factory_preserves_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    failure: Exception, code: str, reason: str, message: str,
+) -> None:
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    events = []
+
+    async def log_event(name, **fields):
+        events.append((name, fields))
+
+    monkeypatch.setattr(repository, "safe_log_event", log_event)
+
+    def refused(*args, **kwargs):
+        raise failure
+
+    async def runner(*args, **kwargs):
+        pytest.fail("refused snapshot must never launch a worker")
+
+    with pytest.raises(repository.ProjectTestRefusal) as refusal:
+        await repository.RepoProjectTests(
+            state, runner=runner, checkout_factory=refused,
+        ).execute()
+    assert refusal.value.code == code
+    assert str(refusal.value) == message
+    assert refusal.value.__cause__ is failure
+    assert refusal.value.execution_started and refusal.value.fixed_message
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": reason, "repository": scope.canonical_repo,
+        "pull_request": scope.pr_number,
+    })]
 
 
 @pytest.mark.asyncio

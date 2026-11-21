@@ -183,14 +183,24 @@ def _coding_cli_path(original: str):
         sanitized = []
         for index, directory in enumerate(original.split(os.pathsep)):
             source = Path(directory or os.curdir)
-            if not any((source / name).is_file() and os.access(source / name, os.X_OK)
-                       for name in _HOST_CODING_CLIS):
+            try:
+                contains_cli = any(
+                    (source / name).is_file() and os.access(source / name, os.X_OK)
+                    for name in _HOST_CODING_CLIS
+                )
+                entries = tuple(source.iterdir()) if contains_cli else ()
+            except OSError:
+                # Inherited PATH may name another uid's private directory.
+                # Preserve entries we cannot inspect rather than failing setup.
+                sanitized.append(directory)
+                continue
+            if not contains_cli:
                 sanitized.append(directory)
                 continue
             mirror = hidden / str(index)
             mirror.mkdir()
             mirror.chmod(0o755)
-            for entry in source.iterdir():
+            for entry in entries:
                 if entry.name not in _HOST_CODING_CLIS:
                     (mirror / entry.name).symlink_to(entry.absolute())
             sanitized.append(str(mirror))
@@ -377,6 +387,7 @@ _HOST_ONLY_ENV = frozenset(
         "MIMIR_HEAVY_LOCK_FILE",
         "MIMIR_HEAVY_LOCK_TIMEOUT",
         "MIMIR_HEAVY_LOCK_HELD",
+        "MIMIR_HEAVY_TIER",
         "MIMIR_TRACING_ENABLED",
         "MIMIR_OTLP_ENDPOINT",
         "MIMIR_OTEL_SERVICE_NAME",
@@ -518,8 +529,8 @@ def _clear_host_mimir_environment():
     ``MIMIR_MALLOC_TRIM_CRON`` must not let a deployment override change the
     suite's default-registration assertions.
 
-    ``MIMIR_HEAVY_LOCK_FILE``/``MIMIR_HEAVY_LOCK_TIMEOUT``/``MIMIR_HEAVY_LOCK_HELD``
-    are set when the suite itself runs under scripts/heavy_run.sh (Worklink gates,
+    ``MIMIR_HEAVY_LOCK_FILE``/``MIMIR_HEAVY_LOCK_TIMEOUT``/``MIMIR_HEAVY_LOCK_HELD``/
+    ``MIMIR_HEAVY_TIER`` are set when the suite itself runs under scripts/heavy_run.sh (Worklink gates,
     factory verify). Left
     set, every Worklink worker environment gains the lease path and exact-env
     assertions fail only on a deployment. Tests that exercise them set them.

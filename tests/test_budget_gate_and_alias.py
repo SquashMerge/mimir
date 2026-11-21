@@ -7668,7 +7668,7 @@ def test_converted_tool_prose_is_not_classified_as_error(
     assert not _returned_value_is_error(tool_name, legacy_text)
 
 
-@pytest.mark.parametrize("tool_name", ["repo_test", "repo_status", "spawn_open_code"])
+@pytest.mark.parametrize("tool_name", ["repo_test", "repo_status", "spawn_open_code", "spawn_claude_code"])
 @pytest.mark.parametrize("added_fields", [False, True])
 @pytest.mark.usefixtures("selected_repository_policy")
 def test_returned_typed_errors_allow_added_producer_fields(tool_name, added_fields):
@@ -7682,7 +7682,7 @@ def test_returned_typed_errors_allow_added_producer_fields(tool_name, added_fiel
     else:
         producer = SpawnTerminalResult("failed", 1, "process_failed", "spawn_failed")
     payload = {field.name: getattr(producer, field.name) for field in fields(producer)}
-    if tool_name == "spawn_open_code":
+    if tool_name in {"spawn_open_code", "spawn_claude_code"}:
         # The registry wraps the terminal dataclass in this public JSON envelope.
         payload.pop("event_type")
         payload.update(run_id="run-1", stdout="", result="", stderr="", artifact_dir=None, name=None)
@@ -7697,12 +7697,12 @@ def test_returned_typed_errors_allow_added_producer_fields(tool_name, added_fiel
     if tool_name == "repo_test":
         minimal = {key: payload[key] for key in required_fields}
         assert _returned_value_is_error(tool_name, json.dumps(minimal))
-    if tool_name == "spawn_open_code":
+    if tool_name in {"spawn_open_code", "spawn_claude_code"}:
         payload["status"] = "success"
     else:
         payload["ok"] = True
     assert not _returned_value_is_error(tool_name, json.dumps(payload))
-    if tool_name != "spawn_open_code":
+    if tool_name not in {"spawn_open_code", "spawn_claude_code"}:
         payload["ok"] = 0
         assert not _returned_value_is_error(tool_name, json.dumps(payload))
 

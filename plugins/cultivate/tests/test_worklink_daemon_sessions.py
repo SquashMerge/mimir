@@ -477,7 +477,206 @@ async def test_shared_session_tree_narrows_pages_and_keeps_archived_descendants(
         assert all(set(page) == {"cursor", "limit"} for page in pages if "cursor" in page)
 
 
-@pytest.mark.parametrize("boundary", ["root", "child", "form", "timestamp", "duplicate", "cursor", "page"])
+def session_page(daemon, children, next_cursor=None):
+    daemon.faults[("GET", "/api/session")].append(SyntheticFault(body=json.dumps({
+        "data": children, "cursor": {"previous": None, "next": next_cursor},
+    }).encode()))
+
+
+@pytest.mark.parametrize("operation", ["children", "observe"])
+async def test_active_child_relisted_across_pages_keeps_latest_state(tmp_path, operation):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path, "epic")
+        root = controller.record.opencode_session_id
+        ids = [daemon.child(root, updated_ms=2000 + i) for i in range(3)]
+        await client.prompt(ids[-1], "test-owned active child")
+        first = [deepcopy(daemon.sessions[sid].info) for sid in ids]
+        newer = deepcopy(first[-1])
+        newer["time"]["updated"] += 1000
+        newer["title"] = "Build acceptance mutation coverage"
+        session_page(daemon, first, "updated-anchor")
+        session_page(daemon, [newer])
+        before = len(daemon.requests)
+        if operation == "children":
+            result = await client.children(root)
+            assert [child["id"] for child in result] == ids
+            assert result == [*first[:-1], newer]
+        else:
+            outcome = await controller.observe()
+            assert outcome.error is None
+            assert outcome.execution_state == "started"
+            assert controller.record.execution_state == "started"
+            assert controller.path.exists()
+            assert daemon.sessions[ids[-1]].active
+            # A duplicate must not enter the tree or cause repeated descendant reads.
+            for sid in ids:
+                assert sum(params.get("parentID") == sid for method, route, params, _
+                           in daemon.requests[before:] if route == "/api/session") == 1
+        pages = [params for method, route, params, _ in daemon.requests[before:]
+                 if route == "/api/session"]
+        assert pages[:2] == [
+            {"parentID": root, "order": "asc", "limit": "100"},
+            {"cursor": "updated-anchor", "limit": "100"},
+        ]
+
+
+async def test_relisted_child_with_foreign_parent_is_rejected(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        child = daemon.child(root, updated_ms=2000)
+        info = deepcopy(daemon.sessions[child].info)
+        session_page(daemon, [info], "next")
+        session_page(daemon, [{**info, "parentID": "ses_foreign"}])
+        with pytest.raises(DaemonClientError, match="foreign child session"):
+            await client.children(root)
+
+
+async def test_descendant_id_under_two_parents_is_rejected(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        parents = [daemon.child(root, updated_ms=2000 + i) for i in range(2)]
+        child = daemon.child(parents[0], updated_ms=3000)
+        info = deepcopy(daemon.sessions[child].info)
+        session_page(daemon, [daemon.sessions[sid].info for sid in parents])
+        session_page(daemon, [info])
+        session_page(daemon, [{**info, "parentID": parents[1]}])
+        with pytest.raises(DaemonClientError, match="invalid session descendant tree"):
+            await client.session_tree(root)
+
+
+@pytest.mark.parametrize("identity", [None, "", "../ses_bad", "msg_wrong", 17, []])
+async def test_child_identity_is_validated(tmp_path, identity):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        session_page(daemon, [{"id": identity, "parentID": root}])
+        with pytest.raises(DaemonClientError, match="invalid child session identity"):
+            await client.children(root)
+
+
+@pytest.mark.parametrize("page", [
+    None, [], {}, {"data": {}}, {"data": [None]}, {"data": []},
+    {"data": [], "cursor": []},
+    {"data": [], "cursor": {"next": None}},
+    {"data": [], "cursor": {"previous": None, "next": None, "extra": None}},
+    {"data": [], "cursor": {"previous": 17, "next": None}},
+    {"data": [], "cursor": {"previous": None, "next": "é" * 2049}},
+])
+async def test_malformed_child_page_is_rejected(tmp_path, monkeypatch, page):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        async def request(*args, **kwargs):
+            return page
+        monkeypatch.setattr(client, "_request", request)
+        with pytest.raises(DaemonClientError, match="invalid session page"):
+            await client.children(controller.record.opencode_session_id)
+
+
+async def test_child_count_bound_counts_unique_latest_entries(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        children = [{"id": f"ses_child{i}", "parentID": root}
+                    for i in range(4096)]
+        newer = {**children[-1], "title": "new"}
+        pages = iter([
+            {"data": children, "cursor": {"previous": None, "next": "next"}},
+            {"data": [newer], "cursor": {"previous": None, "next": None}},
+        ])
+        async def request(*args, **kwargs):
+            return next(pages)
+        monkeypatch.setattr(client, "_request", request)
+        result = await client.children(root)
+        assert result == [*children[:-1], newer]
+
+
+@pytest.mark.parametrize("entries_per_page", [0, 1, 2])
+async def test_child_pagination_work_is_bounded_with_fresh_cursors(
+    tmp_path, monkeypatch, entries_per_page,
+):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        child = {"id": "ses_relisted", "parentID": root}
+        calls = 0
+        expected_calls = 8192 // max(1, entries_per_page) + 1
+
+        async def request(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            # A removed work bound must fail promptly, not hang the test runner.
+            assert calls <= expected_calls, "pagination escaped its work bound"
+            return {"data": [child] * entries_per_page,
+                    "cursor": {"previous": None, "next": f"cur{calls}"}}
+
+        monkeypatch.setattr(client, "_request", request)
+        with pytest.raises(DaemonClientError, match="session children exceed bound"):
+            await client.children(root)
+        assert calls == expected_calls
+
+
+@pytest.mark.parametrize("payload", ["child", "metadata"])
+async def test_child_pagination_counts_bytes_across_all_pages(tmp_path, monkeypatch, payload):
+    from mimir_cultivate.worklink import daemon_client
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        monkeypatch.setattr(daemon_client, "MAX_ITEM_BYTES", 64)
+        calls = 0
+
+        async def request(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            assert calls <= 2, "pagination escaped its cumulative byte bound"
+            child = {"id": "ses_relisted", "parentID": root}
+            result = {"data": [child], "cursor": {"previous": None, "next": f"cur{calls}"}}
+            if payload == "child":
+                child["title"] = "x" * 600
+            else:
+                result["padding"] = "x" * 600
+            # A single full page fits; two exceed the read budget. Unique
+            # retained state, occurrences, and page count remain below bounds.
+            assert 512 < len(json.dumps(result).encode()) < 16 * daemon_client.MAX_ITEM_BYTES
+            return result
+
+        monkeypatch.setattr(client, "_request", request)
+        with pytest.raises(DaemonClientError, match="session children exceed bound"):
+            await client.children(root)
+        assert calls == 2
+
+
+@pytest.mark.parametrize("level", ["children", "replacement", "tree"])
+async def test_session_enumeration_size_bounds(tmp_path, monkeypatch, level):
+    from mimir_cultivate.worklink import daemon_client
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        controller = await create(client, tmp_path)
+        root = controller.record.opencode_session_id
+        monkeypatch.setattr(daemon_client, "MAX_ITEM_BYTES", 16)
+        if level == "tree":
+            async def info(sid):
+                return {"id": sid, "title": "x" * 150}
+            async def children(sid):
+                return [{"id": "ses_child", "title": "x" * 150}] if sid == root else []
+            monkeypatch.setattr(client, "session_info", info)
+            monkeypatch.setattr(client, "children", children)
+            operation = client.session_tree(root)
+            reason = "session tree exceeds bound"
+        else:
+            child = {"id": "ses_child", "parentID": root}
+            if level == "replacement":
+                session_page(daemon, [child], "next")
+            session_page(daemon, [{**child, "title": "x" * 300}])
+            operation = client.children(root)
+            reason = "session children exceed bound"
+        with pytest.raises(DaemonClientError, match=reason):
+            await operation
+
+
+@pytest.mark.parametrize("boundary", ["root", "child", "form", "timestamp", "cursor", "page"])
 async def test_tree_activity_rejects_foreign_or_incomplete_witness(tmp_path, boundary):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         controller = await create(client, tmp_path)
@@ -500,8 +699,6 @@ async def test_tree_activity_rejects_foreign_or_incomplete_witness(tmp_path, bou
         elif boundary == "timestamp":
             daemon.sessions[child].info["time"]["updated"] = True
             route, body, reason = "/api/session", {"data": [daemon.sessions[child].info], "cursor": {"previous": None, "next": None}}, "invalid session activity"
-        elif boundary == "duplicate":
-            route, body, reason = "/api/session", {"data": [daemon.sessions[child].info] * 2, "cursor": {"previous": None, "next": None}}, "invalid child session binding"
         elif boundary == "cursor":
             route, body, reason = "/api/session", {"data": [], "cursor": {"previous": None, "next": "same"}}, "repeated session cursor"
         else:
@@ -521,7 +718,8 @@ async def test_tree_activity_bounds_session_enumeration(tmp_path, monkeypatch, b
         root = controller.record.opencode_session_id
         if bound == "page":
             async def request(*args, **kwargs):
-                return {"data": [{"parentID": root}] * 4097, "cursor": {"previous": None, "next": None}}
+                return {"data": [{"id": f"ses_child{i}", "parentID": root} for i in range(4097)],
+                        "cursor": {"previous": None, "next": None}}
             monkeypatch.setattr(client, "_request", request)
             operation = client.children(root)
             reason = "session children exceed bound"

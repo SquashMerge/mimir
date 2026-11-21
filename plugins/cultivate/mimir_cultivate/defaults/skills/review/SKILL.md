@@ -67,8 +67,8 @@ different reviewer is needed for formal approval.
 
 When the trigger is `poller:github-activity`, perform the review in the current
 turn. Do not call `approve_declassification`: the poller is subject to the taint
-gate and cannot approve release of its own inputs. Do not call
-`spawn_open_code` or another spawn tool: a review turn does not delegate into a
+gate and cannot approve release of its own inputs. Do not call any coding
+spawn tool: a review turn does not delegate into a
 coding process. A denied attempt is a working security boundary, not a reason to
 request either capability.
 

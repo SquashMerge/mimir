@@ -829,5 +829,11 @@
       "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
       "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
     }
+  },
+  "2126-claude-subscription": {
+    "review": {"SKILL.md": "3e3c21aece2e5b6f61a8444f709e5ed06232903bf9ff3a423de530353183ffbf"}
+  },
+  "2126-claude-subscription-main-integration": {
+    "review": {"SKILL.md": "df96be0c131e321fb236ac511b8363f7ab52f3b805e606fd4b5e0922bd98ad16"}
   }
 }

@@ -42,6 +42,7 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
     expected = {
         "chainlink", "mermaid-cli", "osv-scanner", "gogcli",
         "opencode", "codex", "feature-factory", "opencode2-feature-factory", "opencode-plugin-otel",
+        "claude-code", "claude-code-feature-factory",
     }
     assert set(pins) == expected
     assert pins["chainlink"].category == "issue-cli"
@@ -50,6 +51,9 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
     assert pins["osv-scanner"].category == "security-scanner"
     assert pins["opencode"].category == "coding-cli"
     assert pins["opencode"].pin == OPENCODE_VERSION
+    assert pins["claude-code"].pin == "2.1.326"
+    assert pins["claude-code"].package == "@anthropic-ai/claude-code"
+    assert pins["claude-code-feature-factory"].pin == FACTORY_VERSION
     assert pins["feature-factory"].pin == FACTORY_VERSION
     assert pins["opencode2-feature-factory"].pin == FACTORY_VERSION
     assert pins["opencode2-feature-factory"].category == "coding-plugin"
@@ -112,6 +116,8 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
     assert pins["osv-scanner"].pin in install_text
     assert f"@opencode/cli@{pins['opencode'].pin}" in install_text
+    assert f"@anthropic-ai/claude-code@{pins['claude-code'].pin}" in install_text
+    assert '"claude-code-feature-factory@${FACTORY_VERSION}"' in install_text
     assert pins["codex"].source == "npm"
     assert pins["codex"].package == "@openai/codex"
     assert f"{pins['codex'].package}@{pins['codex'].pin}" in install_text

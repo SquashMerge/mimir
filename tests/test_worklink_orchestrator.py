@@ -371,7 +371,7 @@ class FakeBackend:
         self.orders: list[WorkOrder] = []
 
     def capabilities(self) -> Caps:
-        return Caps("fake", False, False, False, True, None)
+        return Caps("fake", False, False, False, None)
 
     def work_spec(
         self,
@@ -396,6 +396,7 @@ class FakeBackend:
             timeout_s=order.timeout_s,
             env=order.env,
             local_checkout=order.checkout,
+            execution=self.capabilities().execution,
         )
 
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
@@ -2866,6 +2867,10 @@ def test_worker_attempt_removes_private_basetemp_via_worker_command(
     class WorkerBackend(FakeBackend):
         name = "opencode"
 
+        def capabilities(self):
+            from mimir_cultivate.worklink.execution_policy import OPENCODE_LEAF
+            return Caps("coding-cli", False, False, False, "opencode", OPENCODE_LEAF)
+
         async def invoke_with_startup_retry(self, invoke: Any, **kwargs: Any) -> ComputeResult:
             return await invoke()
 
@@ -3274,6 +3279,7 @@ def test_deadline_before_worker_collection_records_timeout(
 ) -> None:
     """Real executor/client/compute race, with terminal delivery held by a barrier."""
     import socket
+    import time
     from mimir_cultivate.worklink import compute, worker_client, worker_exec
 
     repo = tmp_path / "repo"
@@ -3291,7 +3297,7 @@ def test_deadline_before_worker_collection_records_timeout(
     threads: list[threading.Thread] = []
     cancellations: list[str] = []
     identifiers: list[str] = []
-    processes: list[subprocess.Popen] = []
+    processes: list[worker_exec._FactoryProcess] = []
     results: list[ComputeResult] = []
     monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "worker-homes")
     worker_exec.HOME_ROOT.mkdir()
@@ -3311,10 +3317,17 @@ def test_deadline_before_worker_collection_records_timeout(
     cancel = worker_exec._handle_cancel
 
     def wait(proc, *args):
+        assert isinstance(proc, worker_exec._FactoryProcess)
         processes.append(proc)
         if worker_state == "live":
+            # The contained policy now supervises this leaf. Let its real
+            # monitor run during cancellation; stop() waits for that monitor's
+            # ECHILD proof rather than reaping Popen directly.
+            deadline_at = time.monotonic() + 10
+            while not (worktree / "changed.txt").exists():
+                assert time.monotonic() < deadline_at, "payload did not enter its live state"
+                time.sleep(0.01)
             ready.set()
-            assert release.wait(10), "controller did not cancel the live worker"
         return monitor(proc, *args)
 
     def cleanup(home):
@@ -3419,7 +3432,7 @@ def test_deadline_before_worker_collection_records_timeout(
     finally:
         release.set()
         for proc in processes:
-            if proc.poll() is None:
+            if not proc.done.is_set():
                 worker_exec._terminate_process_group(proc)
         for thread in threads:
             thread.join(10)
@@ -11650,24 +11663,41 @@ def factory_completion_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.parametrize("truncated", [False, True])
+@pytest.mark.parametrize("host", ["opencode", "claude_code"])
 def test_factory_completion_with_real_evidence_and_wrapped_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_completion_sandbox: Path,
-    truncated: bool,
+    truncated: bool, host: str,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
     import mimir_cultivate.worklink.worker_client as worker_client
+    from mimir_cultivate.worklink.execution_policy import CLAUDE_FACTORY, OPENCODE_FACTORY
 
     sandbox = factory_completion_sandbox
     completion_runner = _completion_runner(sandbox, case="success")
     gate_calls = []
+    credentials = ("CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+    for name in credentials:
+        monkeypatch.setenv(name, "factory-gate-secret-sentinel")
+    original_observe = orchestrator.observe_evidence
+    observed_policies = []
 
-    def worker_gate(checkout, argv, *, env, timeout=30, output_limit=1024 * 1024, allow_output_truncation=False):
+    async def observe(**kwargs):
+        observed_policies.append(kwargs["work_spec"].execution)
+        assert kwargs["work_spec"].execution == (CLAUDE_FACTORY if host == "claude_code" else OPENCODE_FACTORY)
+        return await original_observe(**kwargs)
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observe)
+
+    def worker_gate(checkout, argv, *, env, timeout=30, output_limit=1024 * 1024, allow_output_truncation=False, identifier=None):
         if argv[:1] == ["git"]:
             assert checkout == sandbox.parents[1]
             result = controller(argv)
             return cp(argv, result.returncode, result.stdout.encode(), result.stderr.encode())
         assert checkout == sandbox
         assert argv == ("/bin/sh", "-c", f"cd {sandbox} && make test")
+        assert not set(credentials) & env.keys()
+        assert env["MIMIR_WORKLINK_GATE"] == "1"
+        assert env["HOME"].endswith(identifier)
         assert allow_output_truncation is True
         gate_calls.append(("make test", checkout, True))
         result = cp(argv, stdout=b"all tests passed\n", stderr=b"")
@@ -11692,15 +11722,21 @@ def test_factory_completion_with_real_evidence_and_wrapped_runner(
         orchestrator._verify_factory_completion(
             home=tmp_path,
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
-            record=_completion_record(sandbox),
+            record=(replace(_completion_record(sandbox), host=host,
+                            session="claude-code:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            lock_session="claude-code:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            launch_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                    if host == "claude_code" else _completion_record(sandbox)),
             test_command="make test",
             started_at=datetime.now(UTC),
             runner=orchestrator._factory_git_runner(controller),
         )
     )
 
+    assert observed_policies == [CLAUDE_FACTORY if host == "claude_code" else OPENCODE_FACTORY]
     assert gate_calls == [("make test", sandbox, True)]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert "factory-gate-secret-sentinel" not in evidence_path.read_text(encoding="utf-8")
     assert pr_url == "https://github.com/owner/repo/pull/42"
     assert evidence["status"] == "completed"
     assert evidence["files_changed"] == ["changed.py"]
@@ -12899,6 +12935,8 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
     events: list[str] = []
 
     class Backend:
+        host = "opencode"
+
         def status(self, *args: object, **kwargs: object) -> Any:
             events.append("status")
             return terminal
@@ -14046,6 +14084,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     bound = BoundCompute(_worker_uid=worker_uid)
     daemon = BoundCompute(_worker_uid=worker_uid)
     daemon.name = "opencode_daemon"
+    # A daemon double must not advertise the contained gate-launch capability.
+    daemon._launch_contained = None
     monkeypatch.setattr("mimir_cultivate.worklink.compute.OpenCodeDaemonComputeBackend", lambda: daemon)
 
     class WorkerBackend(FakeBackend):
@@ -14071,7 +14111,12 @@ def test_authorized_runner_closes_real_attempt_capabilities(
                 local_checkout=order.checkout,
                 local_argv=("opencode", "run"),
                 session_request=SessionRequest("leaf", {"providerID": "openai", "id": "test"}, order.prompt),
+                execution=self.capabilities().execution,
             )
+
+        def capabilities(self):
+            from mimir_cultivate.worklink.execution_policy import OPENCODE_LEAF
+            return Caps("coding-cli", False, False, False, "opencode", OPENCODE_LEAF)
 
         async def invoke_with_startup_retry(self, invoke, **kwargs):
             return await invoke()
@@ -14686,3 +14731,276 @@ def test_dispatch_sweep_applies_retention_to_swept_attempts(tmp_path: Path) -> N
     assert subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", "refs/worklink/441/1"],
                           capture_output=True).returncode != 0
     assert any(text.startswith("WORKLINK_PRESERVED_PRUNED issue=441 attempts=[1]") for text in comments)
+
+
+def _claude_selection_case(tmp_path, monkeypatch, *, dry_run):
+    import mimir_cultivate.worklink.orchestrator as orch
+    from mimir_cultivate.worklink.backends.claude_code import ClaudeCodeBackend
+    from mimir_cultivate.worklink import compute, identities
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / "checkout"
+    calls, runner = _orchestrator_runner(repo, checkout)
+    registry = BackendRegistry()
+    backend = ClaudeCodeBackend(name="renamed-subscription-leaf")
+    registry.register(backend)
+    registry.select_compute = lambda **_: FakeCompute()
+    requested_uids = []
+    checkout_requests = []
+    bound = FakeCompute()
+    bound.name = "renamed-contained-substrate"
+
+    def bind(cls, uid, **kwargs):
+        requested_uids.append(uid)
+        return bound
+
+    def issue_checkout(*args, **kwargs):
+        checkout_requests.append(kwargs)
+        raise compute.ComputeLaunchError("owned checkout admission stop")
+
+    monkeypatch.setattr(identities, "get_identities", lambda: SimpleNamespace(
+        worklink_uid=4242, worklink_gid=os.getgid(), mimir_uid=os.getuid()))
+    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "for_path_checkout", classmethod(bind))
+    monkeypatch.setattr(orch, "_create_backend_checkout", issue_checkout)
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+        441, backend_name=backend.name, test_command="uv run pytest -q", dry_run=dry_run))
+    assert requested_uids == [4242]
+    assert not any(isinstance(call, list) and call[:2] == ["claude", "-p"] for call in calls)
+    return result, checkout_requests
+
+
+def test_claude_compute_selection_uses_capabilities(tmp_path, monkeypatch):
+    result, checkout_requests = _claude_selection_case(tmp_path, monkeypatch, dry_run=True)
+    assert result.status == "dry_run"
+    assert checkout_requests == []
+
+
+def test_claude_uid_drop_uses_capabilities(tmp_path, monkeypatch):
+    result, checkout_requests = _claude_selection_case(tmp_path, monkeypatch, dry_run=False)
+    assert result.status == "failed"
+    assert result.reason == "owned checkout admission stop"
+    assert len(checkout_requests) == 1
+    assert checkout_requests[0]["worker_eligible"] is True
+
+
+def test_claude_quota_result_uses_common_hold_and_claim_forgiveness(tmp_path, monkeypatch):
+    import time
+    import mimir_cultivate.worklink.orchestrator as orch
+    from mimir_cultivate.worklink.backends.claude_code import ClaudeCodeBackend
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    backend = ClaudeCodeBackend(name="renamed-subscription-leaf")
+    order = WorkOrder(441, checkout, "build", None, 30,
+                      {"CLAUDE_CODE_OAUTH_TOKEN": "unit-" + "subscription", "MIMIR_MODEL_SPEC": "claude-code:sonnet"},
+                      tmp_path / "transcripts")
+    spec = backend.work_spec(order, attempt=1, repo_url="repo", base_ref="main", branch="issue/441-a1",
+                             test_command="uv run pytest -q")
+    fixture = Path(__file__).parent / "fixtures/worklink/claude_code_2_1_326/quota_exhausted.jsonl"
+    events = [json.loads(line) for line in fixture.read_text().splitlines()]
+    events[0]["rate_limit_info"]["resetsAt"] = time.time() + 60
+    output = "\n".join(json.dumps(event) for event in events) + "\n"
+    calls, runner = _orchestrator_runner(tmp_path / "repo", checkout)
+    claims = ChainlinkClaims(chainlink_bin="chainlink", agent_id="agent", runner=runner, home_path=tmp_path)
+    claim = ClaimRecord(441, 1, "agent", datetime.now(UTC))
+    terminal = orch._TerminalClaimRelease(claims, tmp_path, 441, 1)
+    lease = CheckoutLease(441, 1, tmp_path / "repo", checkout, "issue/441-a1", "main", isolated_checkout=True)
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path / "repo", runner=runner)._finalize(
+        issue=IssueContext(441, "build", "body", set()), claims=claims, claim_record=claim, attempt=1,
+        config=WorklinkConfig(), backend=backend, compute=FakeCompute(),
+        compute_result=ComputeResult(1, output, ""), order=order, lease=lease, spec=spec,
+        started=datetime.now(UTC), test_cmd="uv run pytest -q", root_dirty_before=(), runner=runner,
+        terminal_release=terminal,
+    ))
+    assert result.status == "quota_hold", result.reason
+    comments = [args[-1] for args in calls if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]]
+    hold = next(comment for comment in comments if comment.startswith("WORKLINK_QUOTA_HOLD"))
+    assert "Claude Code quota hold" in hold
+    assert "OpenCode" not in hold
+    # The same typed hold marker is what the claim budget's forgiveness reader consumes.
+    assert claims.attempts_used([claim.to_comment(), hold]) == 0
+    assert claims.next_attempt([claim.to_comment(), hold]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["initial", "repair"])
+@pytest.mark.parametrize("failure", ["cancel", "lost", "refused", "success"])
+async def test_contained_leaf_and_ci_repair_retirement_boundaries(tmp_path, monkeypatch, phase, failure):
+    from mimir_cultivate.worklink import compute, control, orchestrator as orch, worker_client
+    from mimir_cultivate.worklink.execution_policy import CLAUDE_LEAF
+
+    repo, checkout = tmp_path / "repo", tmp_path / "checkout"
+    checkout.mkdir()
+    calls, runner = _orchestrator_runner(repo, checkout)
+    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    launches, cancellations = [], []
+    target = 1 if phase == "initial" else 2
+
+    class Process:
+        pid = os.getpid()
+
+        def __init__(self, index):
+            self.index = index
+
+        async def wait(self):
+            if self.index == target:
+                entered.set()
+                await release.wait()
+                if failure in {"lost", "refused"}:
+                    raise RuntimeError(f"supervisor terminal report {failure}")
+            return 0
+
+    class Client:
+        async def launch(self, **kwargs):
+            launches.append(kwargs["identifier"])
+            return Process(len(launches))
+
+        async def cancel(self, identifier):
+            cancellations.append(identifier)
+            cancelled.set()
+
+    class Backend(FakeBackend):
+        def capabilities(self):
+            return Caps("contained", False, False, False, None, CLAUDE_LEAF)
+
+        def work_spec(self, *args, **kwargs):
+            return replace(super().work_spec(*args, **kwargs), env={}, local_argv=("/bin/true",))
+
+    backend = Backend()
+    bound = compute.LocalSubprocessComputeBackend(_worker_uid=os.getuid(), _worker_client=Client())
+    registry = BackendRegistry()
+    registry.register(backend)
+    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "for_path_checkout",
+                        classmethod(lambda cls, *args, **kwargs: bound))
+    monkeypatch.setattr("mimir_cultivate.worklink.identities.get_identities",
+                        lambda: SimpleNamespace(worklink_uid=os.getuid()))
+    monkeypatch.setattr(orch.ControllerGitPublication, "capture", lambda *args: None)
+    monkeypatch.setattr(orch, "_create_backend_checkout", lambda *args, **kwargs:
+                        CheckoutLease(441, 1, repo, checkout, "issue/441-a1", "main", isolated_checkout=True))
+    monkeypatch.setattr(WorklinkRunner, "_preserve_unpublished_attempt", lambda *args: None)
+    monkeypatch.setattr(orch, "_make_executor_report_dir", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch.RepositoryInventory, "load", lambda *args: SimpleNamespace(
+        declared=True, repository=lambda slug: SimpleNamespace(
+            worklink_gate="ci", quick_gate_command="echo ok", base_branch="main")))
+    monkeypatch.setattr(orch, "_gate_checkout_snapshot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "_with_outside_checkout_detection", lambda validation, **kwargs: validation)
+    for name in ("_commit_checkout_changes", "_ensure_clean_checkout", "_git_push"):
+        monkeypatch.setattr(orch, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "_open_pr", lambda *args, **kwargs: "https://github.com/owner/repo/pull/1")
+    monkeypatch.setattr(orch, "_repo_slug", lambda *args, **kwargs: "owner/repo")
+    monkeypatch.setattr(orch, "_with_head_sha", lambda validation, *args, **kwargs: validation)
+    monkeypatch.setattr(orch, "_update_ci_pr_body", lambda *args: None)
+    monkeypatch.setattr("mimir_cultivate.worklink.ci_gate._head", lambda *args: "abc123")
+
+    async def ready(*args):
+        pass
+
+    async def observe(**kwargs):
+        return EvidenceValidation("completed", True, (), WorklinkEvidence(
+            issue=441, attempt=1, backend=backend.name, branch="issue/441-a1", checkout=str(checkout),
+            started_at="2026-11-18T00:00:00+00:00", finished_at="2026-11-18T00:00:01+00:00",
+            files_changed=["changed.txt"], diff_stat="changed", commands=[], tests=None,
+            pr_url=None, status="completed", head_sha="abc123"))
+
+    async def ci(*args, **kwargs):
+        return SimpleNamespace(outcome="red" if len(launches) < 2 and phase == "repair" else "green",
+                               reason="test failed", excerpt="bounded log", checks=())
+
+    monkeypatch.setattr(orch, "ready_pr", ready)
+    monkeypatch.setattr(orch, "observe_evidence", observe)
+    monkeypatch.setattr(orch, "wait_for_ci", ci)
+    controller = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry)
+    task = asyncio.create_task(controller.run(441, backend_name=backend.name))
+    waiting = asyncio.create_task(entered.wait())
+    try:
+        await asyncio.wait((task, waiting), timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        assert not task.done(), task.result()
+        assert entered.is_set()
+        handle = bound._handles[launches[-1]]
+        startup_state = load_run_state(tmp_path, 441)
+        assert startup_state is not None
+        if failure == "cancel":
+            task.cancel()
+            await asyncio.wait_for(cancelled.wait(), 5)
+            assert cancellations == [handle.identifier]
+            assert handle.identifier in bound._jobs
+            assert ["chainlink", "locks", "release", "441"] not in calls
+            assert not task.done()
+        release.set()
+        if failure == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        else:
+            result = await asyncio.wait_for(task, 10)
+            assert result.status == ("completed" if failure == "success" else "failed"), result.reason
+        state = load_run_state(tmp_path, 441)
+        if failure in {"lost", "refused"}:
+            assert state is not None and state.handle_identifier == handle.identifier
+            assert handle.identifier in bound._jobs
+            assert ["chainlink", "locks", "release", "441"] not in calls
+            # A dead shim does not prove retirement of its separately sessioned payload.
+            monkeypatch.setattr(orch, "process_is_alive", lambda state: False)
+            monkeypatch.setattr(control, "process_is_alive", lambda state: False)
+
+            async def unverified_retirement(self, identifier):
+                assert identifier == handle.identifier
+                raise RuntimeError("unknown worker id" if failure == "lost" else "reap refused")
+
+            monkeypatch.setattr(worker_client.WorkerClient, "cancel", unverified_retirement)
+            prior_calls = list(calls)
+            stopped = await asyncio.to_thread(control.stop_worklink, tmp_path, 441, runner=runner)
+            assert not stopped.stopped and not stopped.state_cleared and not stopped.claim_released
+            assert "retirement is unverified" in stopped.reason
+            assert load_run_state(tmp_path, 441) == state
+            assert calls == prior_calls
+            remaining = await asyncio.to_thread(control.reconcile_run_states, tmp_path, runner=runner)
+            assert remaining == [state]
+            assert load_run_state(tmp_path, 441) == state
+            assert calls == prior_calls
+            refused = await controller.run(441, backend_name=backend.name)
+            assert refused.status == "refused"
+            assert "retirement is unverified" in refused.reason
+            assert load_run_state(tmp_path, 441) == state
+            assert len(launches) == target
+        elif failure == "success":
+            assert state is None
+            assert not bound._jobs
+            assert ["chainlink", "locks", "release", "441"] in calls
+            # Simulate startup with the old correlation pointer but an executor
+            # that can prove that exact worker's descendants have been reaped.
+            save_run_state(tmp_path, startup_state)
+            monkeypatch.setattr(control, "process_is_alive", lambda state: False)
+            monkeypatch.setattr(control, "_checkout_has_unpublished_commits",
+                                lambda *args: ("determined-clean", "published"))
+            retired = []
+
+            async def verified_retirement(self, identifier):
+                retired.append(identifier)
+
+            monkeypatch.setattr(worker_client.WorkerClient, "cancel", verified_retirement)
+            stopped = await asyncio.to_thread(control.stop_worklink, tmp_path, 441, runner=runner)
+            assert stopped.stopped and stopped.state_cleared and stopped.claim_released
+            assert retired == [startup_state.handle_identifier]
+            assert load_run_state(tmp_path, 441) is None
+            save_run_state(tmp_path, startup_state)
+            remaining = await asyncio.to_thread(control.reconcile_run_states, tmp_path, runner=runner)
+            assert remaining == []
+            assert retired == [startup_state.handle_identifier] * 2
+            assert load_run_state(tmp_path, 441) is None
+            # Verified retirement and terminal release permit a new admission.
+            monkeypatch.setattr(ChainlinkClaims, "review_ready_evidence", lambda *args, **kwargs: None)
+            checkout.mkdir()
+            result = await controller.run(441, backend_name=backend.name)
+            assert result.status == "completed", result.reason
+        else:
+            assert state is not None
+            assert handle.identifier not in bound._jobs
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.gather(*(entry[0] for entry in bound._jobs.values()), return_exceptions=True)

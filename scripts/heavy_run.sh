@@ -1,8 +1,16 @@
 #!/bin/sh
 # Serialize heavy commands across hosts/containers sharing a writable directory.
-# MIMIR_HEAVY_LOCK_FILE=/shared/heavy.lock uses /shared/heavy.lock.lease, acquired
-# by atomic mkdir. All participants must use this protocol: old lockf callers
-# don't interoperate, and kernel locks don't cross a VM bind mount.
+# MIMIR_HEAVY_LOCK_FILE=/shared/heavy.lock uses two slots, /shared/heavy.lock.lease
+# and /shared/heavy.lock.lease2, plus /shared/heavy.lock.intent, each acquired by
+# atomic mkdir. All participants must use this protocol: old lockf callers don't
+# interoperate, and kernel locks don't cross a VM bind mount.
+#
+# MIMIR_HEAVY_TIER=medium holds one slot, so two medium commands can share the
+# machine. large (the default) holds both and runs alone; a waiting large command
+# blocks new medium ones. Use large for anything whose timing is measured. A
+# holder without a recorded tier (an older helper) counts as large, but an older
+# helper still WAITING sees only slot 1 and can start beside a medium: set medium
+# only once every participant on the lease runs this version. See heavy_run.py.
 #
 # The Python helper records host, pid, start time and timeout for humans. Only
 # its heartbeat counter determines staleness: waiters measure unchanged counters
@@ -31,6 +39,7 @@
 # Environment:
 #   MIMIR_HEAVY_LOCK_FILE       shared path (parent must exist and be writable)
 #   MIMIR_HEAVY_LOCK_TIMEOUT    overall timeout seconds (default 7200)
+#   MIMIR_HEAVY_TIER            medium or large (default large)
 #   MIMIR_HEAVY_STALE_SECONDS   unchanged-counter threshold (default 600)
 #   MIMIR_HEAVY_HEARTBEAT_SECONDS  heartbeat interval (default 1, < stale)
 #   MIMIR_HEAVY_TIMEOUT_TOOL    override gtimeout (macOS) / timeout (Linux)

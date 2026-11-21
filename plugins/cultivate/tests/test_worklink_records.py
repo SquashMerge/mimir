@@ -32,6 +32,7 @@ from mimir_cultivate.worklink.factory_state import (
     save_factory_record,
 )
 from mimir_cultivate.worklink import identities
+from mimir_cultivate.worklink.execution_policy import OPENCODE_FACTORY
 from mimir_cultivate.worklink.planning import target_branch_from_description
 from mimir_cultivate.worklink.run_state import WorklinkRunState
 from mimir_cultivate.worklink.safe_git import (
@@ -56,6 +57,8 @@ def test_factory_record_round_trips_v2_and_reads_v1(tmp_path: Path) -> None:
     legacy = record.to_json()
     legacy["version"] = 1
     del legacy["transcript"]
+    for key in ("host", "lock_session", "launch_generation"):
+        del legacy[key]
     assert FactoryRunRecord.from_json(legacy) == record
     with pytest.raises(FactoryRecordError, match="fields are invalid"):
         FactoryRunRecord.from_json({**legacy, "untrusted": True})
@@ -72,13 +75,15 @@ def test_factory_record_adds_session_checkout_and_mcp_without_changing_version(t
         "branch", "launcher", "sandbox", "session", "handle", "status",
         "observed_at", "controller_phase", "controller_error", "transcript",
         "children_reaped", "opencode_session_id", "mcp_servers", "session_checkout",
+        "host", "lock_session", "launch_generation",
     }
     assert FactoryRunRecord.from_json(payload) == record
     assert payload["opencode_session_id"] is None
     assert payload["session_checkout"] is None
     assert payload["mcp_servers"] == []
     historical = {key: value for key, value in payload.items()
-                  if key not in {"opencode_session_id", "mcp_servers", "session_checkout"}}
+                  if key not in {"opencode_session_id", "mcp_servers", "session_checkout",
+                                 "host", "lock_session", "launch_generation"}}
     assert FactoryRunRecord.from_json(historical) == record
     with pytest.raises(FactoryRecordError, match="fields are invalid"):
         FactoryRunRecord.from_json({**payload, "issue_title": "Display only"})
@@ -93,7 +98,7 @@ def test_factory_session_and_mcp_record_roundtrip(tmp_path: Path) -> None:
     save_factory_record(tmp_path, record)
     assert load_factory_record(tmp_path, record.run_id) == record
     assert record.to_json()["mcp_servers"] == ["alpha", "beta", "alpha"]
-    with pytest.raises(FactoryRecordError, match="session handle mismatch"):
+    with pytest.raises(FactoryRecordError, match="lock identity does not match the OpenCode host"):
         replace(record, opencode_session_id="ses_foreign")
 
 
@@ -173,6 +178,8 @@ def test_populated_factory_record_recovers_legacy_status_and_handle(tmp_path: Pa
     legacy = populated.to_json()
     legacy["version"] = 1
     del legacy["transcript"]
+    for key in ("host", "lock_session", "launch_generation"):
+        del legacy[key]
     assert FactoryRunRecord.from_json(legacy) == populated
     assert FactoryRunRecord.from_json(populated.to_json()).handle == populated.handle
     with pytest.raises(FactoryRecordError, match="status identity mismatch"):
@@ -434,6 +441,7 @@ async def test_factory_completion_records_observed_gate_evidence(
         issue_id=1949, attempt=1, repo_url="repo", base_ref="main",
         branch="feature/1949", prompt="", rules=None, test_command="check-gate",
         backend="feature_factory", timeout_s=30, local_checkout=checkout,
+        execution=OPENCODE_FACTORY,
     )
     arguments = dict(
         issue=1949, attempt=1, backend="feature_factory", branch="feature/1949",

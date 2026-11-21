@@ -28,6 +28,24 @@ from mimir.models import AuthContext, InformationFlowLabels
 from mimir import _langchain_claude_code_patches as patches
 
 
+def test_locked_adapter_uses_official_sdk_bundled_cli(monkeypatch):
+    from pathlib import Path
+    claude_agent_sdk = pytest.importorskip("claude_agent_sdk")
+    pytest.importorskip("langchain_claude_code")
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+    from langchain_claude_code import ChatClaudeCode
+
+    options = ChatClaudeCode(model="sonnet")._build_options()
+    assert options.cli_path is None
+    monkeypatch.setattr("claude_agent_sdk._internal.transport.subprocess_cli.shutil.which",
+                        lambda name: pytest.fail("official bundled CLI should precede PATH"))
+    transport = SubprocessCLITransport(prompt="offline transport construction", options=options)
+    package = Path(claude_agent_sdk.__file__).parent
+    selected = Path(transport._find_cli())
+    assert selected == package / "_bundled/claude"
+    assert selected.is_file()
+
+
 _OUTBOUND_CREDENTIAL = "sk-" + "Z" * 24
 
 

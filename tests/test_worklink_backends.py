@@ -601,6 +601,8 @@ def test_config_rejects_every_referenced_unknown_backend_with_path_and_fix(
 async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    # This exercises the legacy core subprocess API, not Cultivate containment.
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     calls: list[dict[str, Any]] = []
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
@@ -670,6 +672,7 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
 async def test_local_subprocess_compute_omits_parent_death_hook_off_linux(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     calls: list[dict[str, Any]] = []
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:

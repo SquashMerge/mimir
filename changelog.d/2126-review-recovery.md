@@ -1,0 +1,1 @@
+- Run Worklink startup reconciliation outside the server event loop; verify Claude factory status and ownership around operator stop, preserve concurrent/terminal records and recorded retirement proof, and document the shared-uid credential exposure.

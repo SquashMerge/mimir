@@ -16892,11 +16892,62 @@ def test_non_repo_poller_keeps_scheduler_read_only_shell_profile() -> None:
     ).allowed is False
 
 
+@pytest.fixture(params=[
+    ("claude-code:sonnet", "spawn_claude_code"), ("codex-plus:test", "spawn_open_code"),
+])
+def selected_spawn_route_policy(request, monkeypatch):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    model, name = request.param
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", model)
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        yield name, selected
+
+
+@pytest.mark.parametrize("profile", ["custom", "github"])
+@pytest.mark.parametrize("tier", [
+    CapabilityTier.SCOPE_CONTAINED, CapabilityTier.SCOPED_WITH_PROVENANCE, CapabilityTier.CODE_EXECUTION,
+])
+@pytest.mark.parametrize("grant", [False, True])
+def test_selected_spawn_manifest_profile_and_tier(
+    tmp_path, selected_spawn_route_policy, profile, tier, grant,
+):
+    from mimir.pollers import _parse_poller_authority
+
+    name, selected = selected_spawn_route_policy
+    raw = {"profile": profile, "tier": tier.value, "capabilities": [name] if grant else [],
+           "scoped_roots": []}
+    kwargs = dict(name="spawn-test", persist_dir=tmp_path / "state", state_root=None,
+                  manifest_path=tmp_path / "pollers.json", policy=selected)
+    if grant and profile == "github":
+        with pytest.raises(ValueError, match="outside 'github' profile"):
+            _parse_poller_authority(raw, **kwargs)
+    elif grant and tier != CapabilityTier.CODE_EXECUTION:
+        with pytest.raises(ValueError, match="capability exceeds declared tier"):
+            _parse_poller_authority(raw, **kwargs)
+    else:
+        service = _parse_poller_authority(raw, **kwargs)
+        assert service.has_capability(name) is grant
+        assert service.capability_tier is tier
+        assert access_control.service_can_invoke_operation(service, name, policy=selected) is grant
+        if not grant:
+            decision = ToolRegistry().authorize_tool(
+                name, _service_auth(service, InformationFlowLabels()), enforce=True,
+                target_channel=str(tmp_path), arguments={"cwd": str(tmp_path)},
+            )
+            assert decision.allowed is False
+            assert decision.reason == "admin_required"
+
+
 def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    selected_repository_policy,
+    selected_spawn_route_policy,
 ) -> None:
+    spawn_name, _ = selected_spawn_route_policy
     repo = tmp_path / "repo"
     repo.mkdir()
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
@@ -16904,7 +16955,7 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
     service = ServicePrincipal(
         canonical="poller:factory",
         trigger="poller",
-        capabilities=("worklink_run", "spawn_open_code"),
+        capabilities=("worklink_run", spawn_name),
         readable_domains=("poller_payload",),
         sink_destinations=("worklink", "spawn_process"),
         sink_policies=(
@@ -16912,7 +16963,7 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
                 "worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO",
             ),
             ServiceSinkPolicy(
-                "spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                spawn_name, "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
             ),
         ),
         capability_tier=CapabilityTier.CODE_EXECUTION,
@@ -16942,7 +16993,7 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
         target_channel=str(repo),
     )
     spawn = registry.authorize_tool(
-        "spawn_open_code", _service_auth(service, trusted), enforce=True,
+        spawn_name, _service_auth(service, trusted), enforce=True,
         target_channel=str(repo), arguments={"cwd": str(repo)},
     )
 

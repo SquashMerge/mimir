@@ -587,6 +587,38 @@ def test_current_request_inventory_is_filtered_not_widened():
         assert f"Available tools: {listed}." in filtered.system_message.text
 
 
+@pytest.mark.parametrize("model,name", [
+    ("claude-code:sonnet", "spawn_claude_code"),
+    ("codex-plus:test", "spawn_open_code"),
+])
+def test_selected_spawn_binds_authorized_workspace_and_artifact_paths(monkeypatch, tmp_path, model, name):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir.tools.budget_gate import _request_with_resolved_spawn_paths
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", model)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    for entry in ("repos", "artifacts"):
+        (tmp_path / entry).mkdir()
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        service = build_trigger_service_principal(
+            canonical="poller:spawn-paths", trigger="poller", profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION, capabilities=(name,), creation_path="test",
+        )
+        assert service.sink_policy_for(name).adapter == "spawn_workspace"
+        request = ToolCallRequest(
+            tool_call={"name": name, "args": {"cwd": "repos", "artifact_root": "artifacts"},
+                       "id": "paths", "type": "tool_call"},
+            tool=None, state=None, runtime=Runtime(context=auth(service)),
+        )
+        resolved = _request_with_resolved_spawn_paths(request, name, auth(service))
+    assert resolved.tool_call["args"] == {
+        "cwd": str(tmp_path / "repos"), "artifact_root": str(tmp_path / "artifacts"),
+    }
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 async def test_registered_hidden_tool_still_reaches_handler(asynchronous):
     middleware = ServiceToolSurfaceMiddleware()
@@ -609,6 +641,165 @@ async def test_registered_hidden_tool_still_reaches_handler(asynchronous):
                 else middleware.wrap_tool_call(request, handler))
     assert called == [request]
     assert response.content == "gate response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("middleware_event_logger")
+@pytest.mark.parametrize("model,name", [
+    ("claude-code:sonnet", "spawn_claude_code"), ("codex-plus:test", "spawn_open_code"),
+])
+@pytest.mark.parametrize("field", ["cwd", "artifact_root"])
+@pytest.mark.parametrize("destination,root_allowed", [
+    ("home", True), ("writable", True), ("readonly", False), ("escape", False),
+])
+async def test_selected_spawn_root_authorization_does_not_grant_service_execution(
+    tmp_path, monkeypatch, model, name, field, destination, root_allowed,
+):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir.access_control import _SERVICE_SINK_ADAPTERS, _sink_adapter_admits
+
+    roots = {key: tmp_path / key for key in ("home", "writable", "readonly", "outside")}
+    for root in roots.values():
+        root.mkdir()
+    roots["escape"] = roots["home"] / "escape"
+    roots["escape"].symlink_to(roots["outside"], target_is_directory=True)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", model)
+    monkeypatch.setenv("MIMIR_HOME", str(roots["home"]))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{roots['writable']}:rw,{roots['readonly']}:ro")
+    selected = load_plugins(enable="cultivate").policy
+    executed = []
+    decisions = []
+    registry = ToolRegistry()
+    authorize = registry.authorize_tool
+
+    def record_authorization(*args, **kwargs):
+        decision = authorize(*args, **kwargs)
+        decisions.append(decision)
+        return decision
+
+    monkeypatch.setattr(registry, "authorize_tool", record_authorization)
+    monkeypatch.setattr("mimir.tools.budget_gate.get_tool_registry", lambda: registry)
+    with policy_scope(selected):
+        service = build_trigger_service_principal(
+            canonical="poller:spawn-destinations", trigger="poller", profile="custom",
+            tier=CapabilityTier.CODE_EXECUTION, capabilities=(name,), creation_path="test",
+            policy=selected,
+        )
+        arguments = {"prompt": "implement", "cwd": str(roots["home"]),
+                     "artifact_root": str(roots["home"] / "artifacts")}
+        arguments[field] = str(roots[destination])
+        labels = InformationFlowLabels()
+        context = auth(
+            service, enforcement_enabled=True, ifc_labels=labels,
+            ifc_state=InformationFlowState(labels=labels),
+        )
+        bound = service.sink_policy_for(name)
+        assert bound.adapter == "spawn_workspace"
+        targets = selected.tools[name].descriptor.sink_target_extractor(name, arguments, context)
+        assert len(targets) == 2
+        admitted = [
+            _sink_adapter_admits(
+                _SERVICE_SINK_ADAPTERS[bound.adapter], target, bound.destination,
+                service, auth_context=context,
+            )
+            for target in targets
+        ]
+        assert all(admitted) is root_allowed
+        assert admitted[0 if field == "cwd" else 1] is root_allowed
+        request = ToolCallRequest(
+            tool_call={"name": name, "args": arguments, "id": "spawn-roots", "type": "tool_call"},
+            tool=None, state=None,
+            runtime=Runtime(context=context),
+        )
+
+        async def handler(actual):
+            executed.append(actual.tool_call["args"])
+            return ToolMessage(content="accepted", tool_call_id="spawn-roots", name=name)
+
+        response = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    # A writable root is not service execution authority. Preserve the strict
+    # multi-target admission refusal even when both bound roots are writable.
+    assert executed == []
+    assert response.status == "error"
+    assert decisions[-1].allowed is False
+    assert decisions[-1].reason == "sink_target_required"
+
+
+@pytest.mark.parametrize("model,name", [
+    ("claude-code:sonnet", "spawn_claude_code"), ("codex-plus:test", "spawn_open_code"),
+])
+@pytest.mark.parametrize("profile,grant", [("custom", True), ("custom", False), ("github", False)])
+def test_selected_spawn_service_surface_requires_explicit_nonreview_grant(
+    monkeypatch, model, name, profile, grant,
+):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", model)
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        service = build_trigger_service_principal(
+            canonical="poller:spawn-surface", trigger="poller", profile=profile,
+            tier=CapabilityTier.CODE_EXECUTION, capabilities=(name,) if grant else (),
+            creation_path="test", policy=selected,
+        )
+        request = ModelRequest(
+            model=RecordingModel(), messages=[], tools=[selected.tools[name].factory()],
+            runtime=Runtime(context=auth(service)),
+        )
+        filtered = ServiceToolSurfaceMiddleware(policy=selected)._filter_request(request)
+    assert [tool.name for tool in filtered.tools] == ([name] if grant else [])
+    assert f"Available tools: {name if grant else '(none)'}." in filtered.system_message.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("middleware_event_logger")
+@pytest.mark.parametrize("model,name", [
+    ("claude-code:sonnet", "spawn_claude_code"), ("codex-plus:test", "spawn_open_code"),
+])
+@pytest.mark.parametrize("role,tainted,allowed", [
+    ("admin", False, True), ("user", False, False), ("admin", True, False),
+])
+async def test_selected_spawn_gate_enforces_admin_and_write_integrity(
+    tmp_path, monkeypatch, model, name, role, tainted, allowed,
+):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from tests.test_plugin_policy_parity import _context
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", model)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    selected = load_plugins(enable="cultivate").policy
+    arguments = {"prompt": "implement", "cwd": str(tmp_path)}
+    context = replace(_context(role, tainted), enforcement_enabled=True)
+    request = ToolCallRequest(
+        tool_call={"name": name, "args": arguments, "id": "spawn-admin", "type": "tool_call"},
+        tool=None, state=None, runtime=Runtime(context=context),
+    )
+    executed = []
+
+    async def handler(actual):
+        executed.append(actual.tool_call["args"])
+        return ToolMessage(content="accepted", tool_call_id="spawn-admin", name=name)
+
+    with policy_scope(selected):
+        response = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    assert bool(executed) is allowed
+    if allowed:
+        assert executed == [arguments]
+        assert response.content == "accepted"
+    else:
+        assert response.status == "error"
+        if tainted:
+            from mimir.access_control import _TAINTED_WRITE_REFUSAL
+
+            assert str(response.content).startswith(_TAINTED_WRITE_REFUSAL)
+        else:
+            assert "admin identity" in str(response.content)
 
 
 @pytest.mark.usefixtures("middleware_event_logger")

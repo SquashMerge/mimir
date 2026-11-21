@@ -89,6 +89,7 @@ class TestResult:
     output_truncated: bool = False
     stdout_bytes: int = 0
     stderr_bytes: int = 0
+    environment_failure: str | None = None
 
 
 @dataclass(frozen=True)
@@ -244,7 +245,7 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
                 failure_reason="test gate command was not found (exit 127)",
             )
     else:
-        reasons.append("tests_failed")
+        reasons.append("gate_environment_failure" if evidence.tests.environment_failure else "tests_failed")
         if status == "completed":
             status = "failed"
         if not evidence.failure_reason:
@@ -553,7 +554,16 @@ async def _retain_gate_failure(
 
         def copy(name: str, source: Path) -> None:
             try:
-                data = _gate_read(source, remaining)
+                if name == "junit.xml":
+                    # Leave room for output and the manifest. A large repeated
+                    # setup traceback is useful as a prefix, not a retention error.
+                    data, truncated = _gate_read_prefix(
+                        source, min(_PYTEST_REPORT_MAX_BYTES, remaining - min(4096, remaining // 10)),
+                    )
+                    if truncated:
+                        reasons.append("junit_truncated")
+                else:
+                    data = _gate_read(source, remaining)
             except (OSError, ValueError) as exc:
                 reasons.append(f"{name}:{type(exc).__name__}")
                 return
@@ -696,8 +706,20 @@ async def _observe_evidence_from_ref(
     factory_run_id: str | None = None,
 ) -> EvidenceValidation:
     runner = runner or _run
-    worker_uid_drop = backend != "feature_factory" or compute is not None
-    if backend == "feature_factory" and factory_run_id is not None and test_command and not skip_test_reason:
+    if work_spec is not None:
+        execution = work_spec.execution
+    else:
+        # Historical read-only evidence calls have no launch spec. Resolve their
+        # registered tool's capabilities, never a compute-name containment gate.
+        from .backends.registry import BackendRegistry
+        from .execution_policy import ExecutionPolicy, execution_for_backend
+        try:
+            execution = execution_for_backend(BackendRegistry().get(backend))
+        except KeyError:
+            execution = ExecutionPolicy()
+    factory = execution.checkout_protocol == "factory_worker"
+    worker_uid_drop = not factory or compute is not None
+    if factory and factory_run_id is not None and test_command and not skip_test_reason:
         from .worker_client import factory_checkout_for_path
 
         binding = factory_checkout_for_path(checkout)
@@ -705,7 +727,6 @@ async def _observe_evidence_from_ref(
             binding is None
             or checkout != binding[0] / ".factory-sandboxes" / factory_run_id
             or binding[1:] != (issue, attempt)
-            or getattr(compute, "name", None) != "local_subprocess"
             or not callable(getattr(compute, "_launch_contained", None))
             or work_spec is None
             or work_spec.local_checkout != checkout
@@ -716,8 +737,9 @@ async def _observe_evidence_from_ref(
             or work_spec.test_command != test_command
         ):
             raise ComputeLaunchError("Cultivate factory evidence gate requires the recorded worker sandbox")
-    if backend != "feature_factory" and worker_uid_drop and test_command and not skip_test_reason:
-        if getattr(compute, "name", None) == "opencode_daemon":
+    if not factory and worker_uid_drop and test_command and not skip_test_reason:
+        if (work_spec is not None and work_spec.execution.substrate == "opencode_daemon"
+                and not callable(getattr(compute, "_launch_contained", None))):
             from .compute import LocalSubprocessComputeBackend
             from .identities import get_identities
             if work_spec is None or work_spec.session_request is None or work_spec.session_request.kind != "leaf":
@@ -725,8 +747,7 @@ async def _observe_evidence_from_ref(
             compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
         authorization = getattr(compute, "_authorized_checkout", None)
         worker_bound = (
-            getattr(compute, "name", None) != "local_subprocess"
-            or not callable(getattr(compute, "_launch_contained", None))
+            not callable(getattr(compute, "_launch_contained", None))
             or work_spec is None
             or work_spec.local_checkout != checkout
             or work_spec.issue_id != issue
@@ -1022,11 +1043,33 @@ async def _run_compute_gate(
     # the worker-side timeout must agree with that supervisor too.
     gate_spec = replace(
         work_spec,
+        execution=replace(work_spec.execution, substrate="contained_subprocess",
+                          retirement="contained_process_tree", home_projection_profile="none"),
+        backend_config={key: value for key, value in work_spec.backend_config.items()
+                        if key not in {"worker_identifier", "worker_projections"}},
         session_request=None,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
         timeout_s=min(work_spec.timeout_s, 60) if diagnostic else work_spec.timeout_s,
     )
+    if work_spec.execution.home_projection_profile == "claude_leaf":
+        # Deterministic gates need the test environment, not the model's OAuth
+        # credential. Their ordinary retained output must not acquire it.
+        from ..claude_code import OAUTH_ENV
+        gate_spec = replace(
+            gate_spec,
+            env={key: value for key, value in gate_spec.env.items() if key != OAUTH_ENV},
+            backend_config={**gate_spec.backend_config, "pass_env": tuple(
+                name for name in gate_spec.backend_config.get("pass_env", ()) if name != OAUTH_ENV
+            )},
+        )
+    if work_spec.backend == "feature_factory":
+        # Completion tests use the leaf's closed environment contract, not the
+        # factory control/CLI environment. Report injections must be requested too.
+        gate_spec = replace(gate_spec, backend_config={
+            **gate_spec.backend_config,
+            "pass_env": gate_spec.backend_config.get("pass_env", tuple(filter_otlp_env(gate_spec.env))),
+        })
     if report_dir is not None:
         report_option_dir = report_dir
         try:
@@ -1046,21 +1089,24 @@ async def _run_compute_gate(
             ),
         )
     gate_spec = replace(gate_spec, env=filter_otlp_env(gate_spec.env))
-    if getattr(compute, "name", None) == "opencode_daemon":
+    if (work_spec.execution.substrate == "opencode_daemon"
+            and not callable(getattr(compute, "_launch_contained", None))):
         from .compute import LocalSubprocessComputeBackend
         from .identities import get_identities
         compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
-    if work_spec.backend == "feature_factory":
-        from .compute import _local_child_env
+    if work_spec.backend == "feature_factory" or work_spec.execution.checkout_protocol == "factory_worker":
+        from .compute import _enabled_child_env
         from .worker_client import run_factory_control
 
         # The executor authenticates the controller-owned checkout by FD; the
         # sandbox is the factory's nested clone, not a separate issued checkout.
         command_in_sandbox = f"cd {shlex.quote(str(checkout))} && {command}"
+        identifier = str(uuid.uuid4())
         try:
             observed = await asyncio.to_thread(
                 run_factory_control, checkout, ("/bin/sh", "-c", command_in_sandbox),
-                env=filter_otlp_env({**_local_child_env(), **gate_spec.env}),
+                env=_enabled_child_env(gate_spec, identifier),
+                identifier=identifier,
                 timeout=gate_spec.timeout_s, output_limit=20_000_000,
                 allow_output_truncation=True,
             )
@@ -1134,6 +1180,17 @@ def _gate_read(path: Path, max_bytes: int) -> bytes:
         if len(data) > max_bytes or len(data) != before.st_size or after.st_size != len(data):
             raise ValueError("gate report changed or exceeds byte limit")
         return data
+
+
+def _gate_read_prefix(path: Path, max_bytes: int) -> tuple[bytes, bool]:
+    """Read a bounded diagnostic prefix, retaining the report's safety checks."""
+    with _gate_open(path) as source:
+        before = os.fstat(source.fileno())
+        data = source.read(max_bytes)
+        after = os.fstat(source.fileno())
+        if after.st_size != before.st_size or len(data) != min(before.st_size, max_bytes):
+            raise ValueError("gate report changed while reading prefix")
+        return data, before.st_size > max_bytes
 
 
 def _pytest_cache_ids(report_dir: Path, name: str) -> tuple[str, ...]:
@@ -1251,12 +1308,25 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
         return None
     junit_path = report_dir / "junit.xml"
     lastfailed_path = report_dir / "cache" / "v" / "cache" / "lastfailed"
+    report_error = None
     try:
         try:
-            document = _gate_read(junit_path, _PYTEST_REPORT_MAX_BYTES)
+            document, truncated = _gate_read_prefix(junit_path, _PYTEST_REPORT_MAX_BYTES)
         except ValueError:
             return TestResult(command, report_error="junit_oversize")
-        root = ET.fromstring(document)
+        if truncated:
+            report_error = "junit_oversize"
+            # Suite counts and the first setup error precede the repeated
+            # tracebacks. Recover diagnostics without trusting a partial report
+            # as a passing gate or reading the entire oversized file.
+            parser = ET.XMLPullParser(events=("start",))
+            parser.feed(document)
+            elements = [element for _, element in parser.read_events()]
+            if not elements:
+                return TestResult(command, report_error=report_error)
+            root = elements[0]
+        else:
+            root = ET.fromstring(document)
         suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
         total = sum(_xml_count(suite, "tests") for suite in suites)
         failed = sum(_xml_count(suite, "failures") for suite in suites)
@@ -1265,7 +1335,7 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
     except FileNotFoundError:
         return TestResult(command, report_error="junit_missing")
     except ET.ParseError:
-        return TestResult(command, report_error="junit_parse_error")
+        return TestResult(command, report_error=report_error or "junit_parse_error")
     except ValueError:
         return TestResult(command, report_error="junit_invalid_counts")
     except OSError:
@@ -1295,7 +1365,27 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
         exit_code=0 if failed == 0 and errors == 0 else 1,
         counts=counts,
         failed_tests=failed_tests,
+        report_error=report_error,
+        environment_failure=_setup_environment_failure(root, counts),
     )
+
+
+def _setup_environment_failure(root: ET.Element, counts: TestCounts) -> str | None:
+    """A session-wide setup fault is an environment failure, not an assertion."""
+    errors = list(root.iter("error"))
+    setup = [
+        error.attrib.get("message", "")
+        for error in errors
+        if error.attrib.get("message", "").startswith("failed on setup with ")
+    ]
+    # For oversized reports, the bounded prefix is a sample of error phases;
+    # the suite header still supplies whole-run counts. Ordinary assertion or
+    # teardown failures must not be relabelled as environment failures.
+    if (counts.total > 0 and counts.errors * 100 >= counts.total * 95
+            and setup and len(setup) * 100 >= len(errors) * 95):
+        first = setup[0].removeprefix("failed on setup with ").strip('"')
+        return terminal_error(f"test gate environment failure: {first}")
+    return None
 
 
 def _xml_count(suite: ET.Element, name: str) -> int:
@@ -1321,6 +1411,8 @@ def _command_with_pytest_report(command: str, report_dir: Path) -> str:
 
 
 def _gate_failure_reason(tests: TestResult) -> str:
+    if tests.environment_failure:
+        return tests.environment_failure
     counts = tests.counts
     if counts is None:
         detail = terminal_error(tests.summary) if tests.summary else None
