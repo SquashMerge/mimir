@@ -1,0 +1,1 @@
+- Pin Worklink's feature-factory and OpenCode 2 adapter to exactly 0.14.2 across container installs, daemon plugin configuration and admission checks. Slice builders now run targeted tests, with shared full verification in the factory's observe step instead of duplicate runs per attempt.

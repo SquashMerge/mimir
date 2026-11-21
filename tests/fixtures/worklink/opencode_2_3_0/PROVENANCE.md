@@ -2,7 +2,7 @@
 
 Captured afresh on 2026-11-17 using npm `@opencode/cli@2.3.0` and its native
 `@opencode/cli-linux-arm64@2.3.0` binary. No provider login, deployment access
-or Docker was used. Factory remains pinned at 0.14.1. These results were
+or Docker was used. Factory was pinned at 0.14.1 for this historical capture. These results were
 regenerated in this checkout, not copied from a prior attempt.
 
 ## Reproduction
@@ -146,3 +146,25 @@ Form injection/replies and child trees in tests are **synthetic**, schema-valida
 scenarios, not claims of an executed provider or factory run. No new live probe
 was run for #2164. Worklink exposes only read methods for forms; a fixture-only
 manual reply verifies that its reply recorder would catch auto-answer regressions.
+
+## #2181: published factory 0.14.2 metadata refresh
+
+Only `factory-result.json`'s `package` version and exact core dependency were
+refreshed from the published `opencode2-feature-factory@0.14.2/package.json`.
+Its engines and peer dependencies are unchanged. The agent/permission/registration
+observations above remain the historical 0.14.1 capture, not a new daemon run.
+Comparing the published adapter tarballs confirms that `plugin/`, `observe/`,
+`tui/dist/` and `skills/feature/SKILL.md` are byte-identical; only the package
+manifest and staged `WORKFLOW.md` changed. No provider, Docker or deployment ran.
+
+Reproduce the package-level comparison with `npm pack feature-factory@0.14.2
+opencode2-feature-factory@0.14.2 feature-factory@0.14.1
+opencode2-feature-factory@0.14.1`, then extract each into separate scratch roots.
+Tarball SHA-256 values:
+
+| Package | Version | SHA-256 |
+| --- | --- | --- |
+| feature-factory | 0.14.1 | `eb6419b5929eb5ac4de50d212c07807f54f9a31acbf8adb1a439ab8182bbb846` |
+| feature-factory | 0.14.2 | `941b516adbf383c40b466efffa6c90e139307d690859e0cc2f7dee8a23ba15dc` |
+| opencode2-feature-factory | 0.14.1 | `1753d5c0301a341a1be3a723fc73907a8fd673c9959eac26d0c2869e83ff6489` |
+| opencode2-feature-factory | 0.14.2 | `1d331778da20af163f5e2db5c7a1ab6c1baf27c1e69c634771aba7023d79a0ec` |
