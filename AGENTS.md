@@ -22,11 +22,12 @@ Use them unmodified: never recolour, trace, crop or retype the logos or wordmark
 **Run both suites, and require both green.** A scoped run is not evidence:
 
 ```bash
-uv run pytest -q tests/test_<file>.py                  # the file you touched
+sh scripts/heavy_run.sh uv run pytest -q tests/test_<file>.py  # the file you touched
 sh scripts/heavy_run.sh uv run pytest -q               # the whole suite
 ```
 
-Run whole-suite and other heavy commands through `scripts/heavy_run.sh`. When the
+Run any pytest invocation beyond a single test (several files, `-n`, or loops),
+and every heavy command, through `scripts/heavy_run.sh`. When the
 host shares a heavy-run lease (`MIMIR_HEAVY_LOCK_FILE` is set; Worklink passes it
 to builders and gates), it waits for other agents' heavy runs instead of competing
 with them for CPU; when it is unset, it runs the command directly.
