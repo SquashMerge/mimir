@@ -74,6 +74,9 @@ class WorklinkRunState:
     test_env: dict[str, str] = field(default_factory=dict)
     opencode_session_id: str | None = None
     launch_generation: str | None = None
+    executor_instance_id: str | None = None
+    executor_process_epoch: str | None = None
+    children_reaped: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -90,6 +93,19 @@ class WorklinkRunState:
         ticks = int(data["process_start_ticks"]) if data.get("process_start_ticks") is not None else None
         phase = str(data.get("phase") or "spawned")
         local_handle = str(data["handle_substrate"]) == "local_subprocess"
+        instance = data.get("executor_instance_id")
+        epoch = data.get("executor_process_epoch")
+        reaped = data.get("children_reaped", False)
+        if type(reaped) is not bool:
+            raise ValueError("invalid leaf retirement proof")
+        if instance is not None:
+            from .worker_client import _validate_identifier
+
+            _validate_identifier(instance)
+            if not local_handle or shim_pid is None or ticks is None or ticks < 0:
+                raise ValueError("executor instance requires a recorded worker identity")
+        if epoch is not None and (instance is None or not valid_process_epoch(epoch)):
+            raise ValueError("invalid executor process epoch")
         sid, generation = data.get("opencode_session_id"), data.get("launch_generation")
         if data["handle_substrate"] == "opencode_daemon":
             uncertain = phase == "admission_uncertain" and sid is None and identifier == "admission"
@@ -147,7 +163,17 @@ class WorklinkRunState:
             test_env=dict(data.get("test_env", {})),
             opencode_session_id=sid,
             launch_generation=generation,
+            executor_instance_id=instance,
+            executor_process_epoch=epoch,
+            children_reaped=reaped,
         )
+
+
+def valid_process_epoch(value: object) -> bool:
+    """Kernel boot UUID plus the birth of PID 1 in the worker's PID namespace."""
+    return isinstance(value, str) and re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:[0-9]+", value
+    ) is not None
 
 
 def runs_dir(home: Path) -> Path:

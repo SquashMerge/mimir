@@ -715,6 +715,8 @@ class LocalSubprocessComputeBackend:
         self._jobs: dict[str, tuple[object, WorkSpec, tuple[str, ...]]] = {}
         self._handles: dict[str, LaunchHandle] = {}
         self._worker_clients: dict[str, object] = {}
+        self._executor_instances: dict[str, str | None] = {}
+        self._executor_process_epochs: dict[str, str | None] = {}
         self._output_files: dict[str, tuple[Path | None, Path | None]] = {}
         self._direct_captures: dict[str, _DirectCapture] = {}
 
@@ -725,6 +727,12 @@ class LocalSubprocessComputeBackend:
             handle_cancel=True,
             persistent_after_disconnect=False,
         )
+
+    def worker_executor_instance_id(self, handle: LaunchHandle) -> str | None:
+        return self._executor_instances.get(handle.identifier)
+
+    def worker_executor_process_epoch(self, handle: LaunchHandle) -> str | None:
+        return self._executor_process_epochs.get(handle.identifier)
 
     async def launch(self, spec: WorkSpec) -> LaunchHandle:
         if spec.local_checkout is None:
@@ -999,6 +1007,8 @@ class LocalSubprocessComputeBackend:
         self._jobs[identifier] = (task, spec, command)
         self._handles[identifier] = handle
         self._worker_clients[identifier] = client
+        self._executor_instances[identifier] = getattr(process, "executor_instance_id", None)
+        self._executor_process_epochs[identifier] = getattr(process, "executor_process_epoch", None)
         self._output_files[identifier] = (stdout_path, stderr_path)
         if interrupted:
             await self.cleanup(handle)
@@ -1192,6 +1202,8 @@ class LocalSubprocessComputeBackend:
         self._jobs.pop(handle.identifier, None)
         self._handles.pop(handle.identifier)
         self._worker_clients.pop(handle.identifier, None)
+        self._executor_instances.pop(handle.identifier, None)
+        self._executor_process_epochs.pop(handle.identifier, None)
         self._output_files.pop(handle.identifier, None)
         capture = self._direct_captures.pop(handle.identifier, None)
         if capture is not None:

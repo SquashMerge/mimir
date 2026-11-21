@@ -37,6 +37,7 @@ from .run_state import (
     process_is_alive,
     runs_dir,
     save_orphan_block_record,
+    save_run_state,
 )
 from mimir._atomic import atomic_write_json
 
@@ -352,6 +353,56 @@ def _archive_worklink_factory_records_locked(
     return archived
 
 
+def _retire_leaf(home: Path, state: WorklinkRunState) -> WorklinkRunState:
+    """Persist the executor's proof before any fallible claim/label cleanup."""
+    if state.children_reaped:
+        return state
+    from .worker_client import WorkerClient
+
+    client = WorkerClient(None)
+    try:
+        asyncio.run(client.cancel(state.handle_identifier))
+    except (RuntimeError, OSError, ValueError):
+        _verify_leaf_dead(state)
+    retired = replace(state, children_reaped=True)
+    save_run_state(home, retired)
+    return retired
+
+
+def _verify_leaf_dead(state: WorklinkRunState) -> None:
+    from .worker_client import WorkerClient
+
+    if state.executor_instance_id is None or state.shim_pid is None or state.process_start_ticks is None:
+        raise RuntimeError("leaf has no executor restart identity; retirement unverified")
+    asyncio.run(WorkerClient(None).verify_leaf_retired(
+        state.handle_identifier, state.executor_instance_id, state.shim_pid, state.process_start_ticks,
+        state.executor_process_epoch))
+
+
+def clear_worklink_leaf_state(
+    home: Path, issue_id: int, *, worker_id: str, event_logger: EventLogger,
+) -> None:
+    """Clear only an exact, verified-dead local leaf; do not change remote labels."""
+    with _claim_mutex(home):
+        state = load_run_state(home, issue_id)
+        if (state is None or state.backend == "feature_factory"
+                or state.compute_name != "local_subprocess"
+                or state.handle_substrate != "local_subprocess"
+                or state.shim_pid is None or state.opencode_session_id is not None):
+            raise RuntimeError("no supported local leaf worker state")
+        if worker_id != state.handle_identifier:
+            raise RuntimeError("worker identifier does not match retained leaf")
+        # The privileged read-only RPC checks both the recorded PID and escaped
+        # descendants. This command never cancels a worker to make clearing safe.
+        _verify_leaf_dead(state)
+        event_logger("worklink_leaf_state_cleared", issue_id=issue_id,
+                     attempt=state.attempt, worker_id=worker_id,
+                     executor_instance_id=state.executor_instance_id)
+        from .run_state import run_state_path
+
+        run_state_path(home, issue_id).unlink()
+
+
 def stop_worklink(
     home: Path,
     issue_id: int,
@@ -370,10 +421,8 @@ def stop_worklink(
                 return WorklinkStopResult(issue_id, True,
                     reason="recorded gate or CI waiter has exited; session terminal recovery via reattach is required")
             if state.compute_name == "local_subprocess" and state.shim_pid is not None:
-                from .worker_client import WorkerClient
-
                 try:
-                    asyncio.run(WorkerClient(None).cancel(state.handle_identifier))
+                    _retire_leaf(home, state)
                 except (RuntimeError, OSError, ValueError):
                     return WorklinkStopResult(issue_id, False,
                         reason="contained worker retirement is unverified; recovery state and claim retained")
@@ -570,6 +619,9 @@ def stop_worklink(
             # Finalization (or explicit reattach) releases it and routes the claim.
             return WorklinkStopResult(issue_id, True,
                 reason="session cancelled; controller finalization or reattach is required")
+        if state.children_reaped and state.shim_pid is not None:
+            return WorklinkStopResult(issue_id, False,
+                reason="durable retirement proof conflicts with a live PID; state and claim retained")
         if not process_identity_verified(state):
             return WorklinkStopResult(
                 issue_id, False, reason="live PID could not be verified; refusing to signal it"
@@ -653,13 +705,15 @@ def reconcile_run_states(
             alive.append(state)
             continue
         with _claim_mutex(home):
+            # Do not retire a stale snapshot over a newly claimed worker.
+            current = load_run_state(home, state.issue_id)
+            if current != state:
+                if current is not None:
+                    alive.append(current)
+                continue
             if state.shim_pid is not None:
-                from .worker_client import WorkerClient
-
                 try:
-                    # A missing supervisor does not prove that its descendants
-                    # exited. Only the executor can retire this exact worker.
-                    asyncio.run(WorkerClient(None).cancel(state.handle_identifier))
+                    state = _retire_leaf(home, state)
                 except (RuntimeError, OSError, ValueError) as exc:
                     alive.append(state)
                     _emit_reconcile_event(

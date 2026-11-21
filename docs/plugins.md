@@ -395,6 +395,27 @@ Labels, claims, worktrees and `refs/worklink/<id>/<n>` are untouched. If the iss
 is still `worklink:ready`, the next autonomous scan can dispatch it under normal
 admission rules, with its previous attempt available to the retry.
 
+For a retained local leaf, use:
+
+```sh
+mimir worklink clear-leaf-state <issue-id> --worker-id <exact-recorded-worker-UUID> --home <agent-home>
+```
+
+This read-only retirement check never signals a live worker. It requires the
+recorded executor instance, supervisor PID and process birth identity, refuses
+live or unverifiable trees, and durably logs `worklink_leaf_state_cleared` before
+removing state. Claims, labels, publication intents and checkouts are unchanged.
+After an executor restart, startup reconciliation and `worklink stop` can also
+recover dead leaves automatically. A changed kernel boot/PID-namespace-init birth
+proves the previous namespace's tree exited, without confusing the newly started
+daemon with stale descendants. For executor-only restarts in the same namespace,
+the privileged proof conservatively refuses while **any** live Worklink-UID process
+remains (including unrelated workers); stop those processes or retry after they
+finish. Legacy records without an instance
+identity still fail closed unless executor cancellation or an existing durable
+retirement proof establishes cleanup. This protocol update requires an executor
+image rebuild/redeploy.
+
 For retained factory records, `mimir worklink archive-factory-run <issue-id>
 --home <agent-home>` archives factory control-plane state. For a quiescent legacy
 factory store, `mimir worklink clear-factory-runtime <exact-attempt-directory>

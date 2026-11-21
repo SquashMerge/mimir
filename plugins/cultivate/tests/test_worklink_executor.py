@@ -227,7 +227,7 @@ def test_contained_ingress_drops_sensitive_endpoint_without_safe_override(name: 
 
 
 def test_worker_protocol_matches_executor_image_contract() -> None:
-    expected_protocol = "worklink-executor-v22-claude-retained-recovery"
+    expected_protocol = "worklink-executor-v23-leaf-retirement"
     assert worker_client.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_exec.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_client.MAX_REQUEST_BYTES == worker_exec.MAX_REQUEST_BYTES == 256 * 1024
@@ -242,8 +242,8 @@ def test_worker_protocol_matches_executor_image_contract() -> None:
 def test_retained_recovery_rejects_stale_executor_protocol_before_dispatch(
     operation: str, stale_side: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    current_identity = "worklink-executor-v22-claude-retained-recovery"
-    old_identity = "worklink-executor-v21-controller-busy-retained-recovery"
+    current_identity = "worklink-executor-v23-leaf-retirement"
+    old_identity = "worklink-executor-v22-claude-retained-recovery"
     request = {
         "version": 1, "op": operation, "executor_identity": current_identity,
         "issue": 2173, "attempt": 1, "device": 1, "inode": 2,
