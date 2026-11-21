@@ -20,11 +20,14 @@ looks at slot 2 or the queue) can take slot 1 and run beside the slot-2
 medium. v2 large jobs are not affected; they wait for both slots. Use the
 medium tier only once every participant on the lease runs this helper.
 
-Jobs start in arrival order (owner design, 2026-11-21). Each waiter takes a
-FIFO ticket in ``<file>.queue/``; only the oldest live ticket may take slots. A
+Jobs start in ticket order (owner design, 2026-11-21). Each waiter takes a
+FIFO ticket in ``<file>.queue/``; only the lowest live ticket may take slots. A
 large job at the head takes whichever slot is free and holds it while waiting for
-the other, so nothing behind it overtakes and nothing is starved. The cost is
-that a slot can sit idle while a large job waits for the second one.
+the other, so later medium jobs cannot starve it. The cost is that a slot can sit
+idle while a large job waits for the second one. Ticket order is best-effort
+arrival order (see ``Queue``): a delayed enqueuer can land ahead of an earlier
+waiter, and a waiter that loses the head gives back any reserved slot, so the
+lease can be reordered but never wedged.
 """
 from __future__ import annotations
 
@@ -278,7 +281,7 @@ class Queue:
     Each waiter creates a ticket directory ``<file>.queue/<n>`` (atomic mkdir,
     n = highest waiting ticket + 1) and heartbeats it like a lease. Only the
     lowest live ticket may take slots; once a job holds what it needs it drops
-    its ticket. So jobs start in arrival order: a large job at the head takes
+    its ticket. So jobs start in ticket order: a large job at the head takes
     one free slot and holds it while it waits for the other, and nobody behind
     it can overtake. A ticket whose heartbeat stops goes stale and is broken
     exactly like a lease, so a crashed waiter cannot block the queue.
