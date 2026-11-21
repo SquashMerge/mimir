@@ -98,6 +98,117 @@ def test_repository_config_and_parity_are_provider_owned(tmp_path: Path) -> None
     assert report["counts"]["operations_total"] > 0
 
 
+def _suite_declarations(*names: str, default: bool = False) -> list[dict]:
+    return [
+        {"name": name, "command": "/usr/bin/true", "default": default and index == 0}
+        for index, name in enumerate(names)
+    ]
+
+
+def test_repo_test_rendered_suite_guidance(tmp_path, monkeypatch) -> None:
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_test_suites(
+        home, state, test_suites=_suite_declarations("python", "cultivate", "frontend"),
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    selected = load_plugins(enable="cultivate").policy
+    factory = selected.tools["repo_test"].factory
+    tool = factory()
+    rendered = convert_to_openai_tool(tool)["function"]
+    assert "more than one test suite, pass exactly one" in rendered["description"]
+    assert f"{scope.canonical_repo}: python, cultivate, frontend" in rendered["description"]
+    parameter = rendered["parameters"]["properties"]["suite"]
+    assert "more than one test suite, pass exactly one" in parameter["description"]
+    assert "$MIMIR_HOME/repositories.yaml" in parameter["description"]
+    assert "test_suites" in parameter["description"]
+    assert "suite" not in rendered["parameters"].get("required", [])
+    assert "runtime" not in rendered["parameters"]["properties"]
+
+    # Materialization reads current declarations, not an import-time snapshot,
+    # and never leaks the first deployment's hints into the shared tool.
+    _configure_test_suites(home, state, test_suites=_suite_declarations("unit", default=True))
+    assert f"{scope.canonical_repo}: unit" in factory().description
+    assert "python, cultivate, frontend" not in factory().description
+    assert "Configured suites by repository" not in repository.repo_test.description
+
+
+@pytest.mark.parametrize("configuration", ["missing", "invalid", "no_home"])
+def test_repo_test_unknown_suites_keep_generic_guidance(tmp_path, monkeypatch, configuration):
+    home = tmp_path / "home"
+    home.mkdir()
+    if configuration == "invalid":
+        (home / "repositories.yaml").write_text("repositories: not-a-list\n")
+    monkeypatch.setenv("MIMIR_HOME", str(home) if configuration != "no_home" else "")
+    tool = repository.build_repo_test_tool()
+    assert "more than one test suite, pass exactly one" in tool.description
+    assert "$MIMIR_HOME/repositories.yaml" in tool.description
+    assert "Configured suites by repository" not in tool.description
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_repo_test_single_suite_can_be_omitted(tmp_path, monkeypatch, legacy):
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_test_suites(
+        home, state,
+        test_suites=[] if legacy else _suite_declarations("unit", default=True),
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    command, _, _, suite, _ = repository._configured_command(scope.canonical_repo)
+    assert command[0] == "/usr/bin/true"
+    assert suite == ("default" if legacy else "unit")
+    assert f"{scope.canonical_repo}: {suite}" in repository.build_repo_test_tool().description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scoped", [False, True])
+async def test_repo_test_suite_refusal_logging_has_no_publication_verdict(
+    tmp_path, monkeypatch, scoped,
+):
+    from mimir.tools import budget_gate
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    _configure_test_suites(
+        home, state, test_suites=_suite_declarations("python", "cultivate", "frontend"),
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("suite selection refusal must precede snapshot creation")
+
+    real_runner = repository.RepoProjectTests
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real_runner(
+        state, checkout_factory=forbidden,
+    ))
+    events = []
+    monkeypatch.setattr(
+        budget_gate, "_emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    selectors = ("unmatched/",) if scoped else ()
+    with pytest.raises(ToolPolicyRefusal, match="test_suite_selection_refused") as raised:
+        await repository.repo_test.coroutine(
+            scope.canonical_repo, scope.pr_number, selectors,
+        )
+    assert raised.value.__cause__.execution_started is False
+    assert "python, cultivate, frontend" in str(raised.value)
+    assert "No tests ran. Retry with exactly one declared suite" in str(raised.value)
+    assert "Hold publication" not in str(raised.value)
+    assert state.full_tested_head is None
+    # Exercise the real event formatter used by the tool exception middleware.
+    budget_gate._record_tool_outcome("repo_test", refused_reason=str(raised.value))
+    hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+    assert "test_suite_selection_refused" in hard["reason"]
+    assert "No tests ran" in hard["reason"]
+    assert "Hold publication" not in json.dumps(events)
+
+
 def test_repository_git_path_validation_stays_closed() -> None:
     with pytest.raises(repository.GitRefusal, match="repository-relative"):
         repository._validated_paths(("../outside",), required=True)
