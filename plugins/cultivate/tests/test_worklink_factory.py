@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -30,6 +31,32 @@ from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state,
 from tests.opencode_fixtures import seed_codex_subscription
 
 
+@pytest.fixture
+def worker_toolchain(tmp_path, monkeypatch):
+    """Model the provisioned worker tools, not the CI runner's PATH layout."""
+    from mimir_cultivate import contained_execution
+    from mimir_cultivate.worklink import compute
+
+    uv = shutil.which("uv")
+    assert uv is not None, "the test suite requires an installed uv"
+    tools = tmp_path / "worker-tools"
+    tools.mkdir()
+    (tools / "uv").symlink_to(Path(uv).resolve(strict=True))
+    original = contained_execution.base_worker_environment
+    assert original("worker-layout")["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+
+    def environment(identifier):
+        env = original(identifier)
+        env["PATH"] = str(tools) + os.pathsep + env["PATH"]
+        return env
+
+    # Only the installation layout is injected. Keep the real closed builder,
+    # request validation, FD transfer, subprocess and gate-result handling.
+    monkeypatch.setattr(contained_execution, "base_worker_environment", environment)
+    monkeypatch.setattr(compute, "base_worker_environment", environment)
+    return tools
+
+
 @contextmanager
 def _executor_in_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root: Path, socket_dir: Path,
@@ -45,6 +72,8 @@ def _executor_in_process(
     monkeypatch.setattr(worker_exec, "get_identities", lambda: identities)
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
+    from mimir_cultivate import contained_execution
+    monkeypatch.setattr(contained_execution, "_RUNTIME_HOME_ROOT", homes)
     monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
 
     # The test has no root-owned socket or uid-changing privileges. Keep the
@@ -113,6 +142,39 @@ def test_provider_renders_default_work_order_without_override(tmp_path: Path) ->
     _assert_publication_rule(rendered)
 
 
+@pytest.mark.asyncio
+async def test_factory_completion_gate_spawns_with_leaf_worker_environment(tmp_path, monkeypatch, worker_toolchain):
+    from mimir_cultivate.worklink.compute import _enabled_child_env
+
+    monkeypatch.setenv("PATH", "/home/mimir/.cargo/bin:/home/mimir/bin:/usr/bin")
+    monkeypatch.setenv("GITHUB_TOKEN", "controller-token")
+    command = "uv --version >/dev/null && printf '%s' \"$PATH\""
+    spec = WorkSpec(2183, 1, "", "main", "branch", "", None, command,
+                    "feature_factory", 30, local_checkout=tmp_path)
+    report_dir = tmp_path / "reports"
+    captured = {}
+
+    def spawn(checkout, argv, *, env, **kwargs):
+        captured.update(env)
+        assert Path(env["XDG_CACHE_HOME"]).parent.name == kwargs["identifier"]
+        return subprocess.run(argv, env=env, capture_output=True)
+
+    monkeypatch.setattr(worker_client, "run_factory_control", spawn)
+    result = await evidence._run_compute_gate(
+        command, checkout=tmp_path, work_spec=spec,
+        compute=LocalSubprocessComputeBackend(), report_dir=report_dir,
+    )
+    leaf = replace(spec, backend_config={"pass_env": ()})
+    expected = _enabled_child_env(leaf, "leaf")
+    assert result.exit_code == 0
+    assert result.stdout == expected["PATH"] == captured["PATH"]
+    assert shutil.which("uv", path=captured["PATH"]) == str(worker_toolchain / "uv")
+    assert "/home/mimir" not in captured["PATH"]
+    assert "GITHUB_TOKEN" not in captured
+    for name in ("USER", "LOGNAME", "SHELL", "LANG", "LC_ALL"):
+        assert captured[name] == expected[name]
+
+
 def _assert_publication_rule(order: str) -> None:
     rule = next((line for line in order.splitlines() if line.startswith("- Worklink commits,")), "")
     for phrase in (
@@ -179,6 +241,7 @@ def test_provider_runner_dry_run_uses_default_work_order(tmp_path: Path, capsys:
 ])
 async def test_provider_completion_uses_emitted_record_and_worker_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, short_socket_dir: Path, reaped: bool, pr_head: str,
+    worker_toolchain: Path,
 ) -> None:
     root = tmp_path / "worklink"
     checkout = root / "repository" / "1949-1" / "checkout"
@@ -454,6 +517,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         return replace(current, status="running")
     monkeypatch.setattr(FeatureFactoryBackend, "initialize", initialize)
     sandbox = checkout / ".factory-sandboxes" / "chainlink-1949"
+    monkeypatch.setenv("PATH", "/home/mimir/.cargo/bin:" + os.environ["PATH"])
     with _executor_in_process(tmp_path, monkeypatch, root, short_socket_dir) as requests:
         result = await orchestrator.WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(1949)
         record = load_factory_record(tmp_path, "chainlink-1949")
@@ -549,6 +613,16 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         assert any(request["argv"] == [
             "/bin/sh", "-c", f"cd {result.checkout} && {gate_command}",
         ] for request in requests)
+        from mimir_cultivate.contained_execution import base_worker_environment
+
+        gate_requests = [request for request in requests if request["argv"] == [
+            "/bin/sh", "-c", f"cd {result.checkout} && {gate_command}",
+        ]]
+        for request in gate_requests:
+            assert request["env"]["PATH"] == base_worker_environment("gate")["PATH"]
+            assert shutil.which("uv", path=request["env"]["PATH"]) == str(worker_toolchain / "uv")
+            assert "/home/mimir" not in request["env"]["PATH"]
+            assert "GITHUB_TOKEN" not in request["env"]
     evidence_path = result.evidence_path or next((tmp_path / "state" / "worklink" / "evidence").rglob("*.json"))
     payload = json.loads(evidence_path.read_text())
     assert payload["checkout"] == str(result.checkout)

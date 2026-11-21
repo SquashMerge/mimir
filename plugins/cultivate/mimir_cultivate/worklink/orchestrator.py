@@ -5826,7 +5826,7 @@ async def _verify_factory_completion(
                 repo_url="", base_ref=record.base_ref, branch=record.branch,
                 prompt="", rules=None, test_command=test_command,
                 backend="feature_factory", timeout_s=1800,
-                execution=FeatureFactoryBackend().capabilities().execution,
+                execution=FeatureFactoryBackend(host=record.host).capabilities().execution,
                 local_checkout=sandbox,
             ),
         )
@@ -5853,7 +5853,7 @@ async def _verify_factory_completion(
         if tests.skipped_reason is not None:
             raise WorklinkError("factory completion tests were skipped")
         if tests.exit_code != 0:
-            raise WorklinkError("factory completion tests did not pass")
+            raise WorklinkError(evidence.failure_reason or "factory completion tests did not pass")
         if not validation.review_ready:
             raise WorklinkError("factory completion evidence was rejected")
         clean = _fixed_command(

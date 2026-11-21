@@ -11663,24 +11663,41 @@ def factory_completion_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.parametrize("truncated", [False, True])
+@pytest.mark.parametrize("host", ["opencode", "claude_code"])
 def test_factory_completion_with_real_evidence_and_wrapped_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_completion_sandbox: Path,
-    truncated: bool,
+    truncated: bool, host: str,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
     import mimir_cultivate.worklink.worker_client as worker_client
+    from mimir_cultivate.worklink.execution_policy import CLAUDE_FACTORY, OPENCODE_FACTORY
 
     sandbox = factory_completion_sandbox
     completion_runner = _completion_runner(sandbox, case="success")
     gate_calls = []
+    credentials = ("CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+    for name in credentials:
+        monkeypatch.setenv(name, "factory-gate-secret-sentinel")
+    original_observe = orchestrator.observe_evidence
+    observed_policies = []
 
-    def worker_gate(checkout, argv, *, env, timeout=30, output_limit=1024 * 1024, allow_output_truncation=False):
+    async def observe(**kwargs):
+        observed_policies.append(kwargs["work_spec"].execution)
+        assert kwargs["work_spec"].execution == (CLAUDE_FACTORY if host == "claude_code" else OPENCODE_FACTORY)
+        return await original_observe(**kwargs)
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observe)
+
+    def worker_gate(checkout, argv, *, env, timeout=30, output_limit=1024 * 1024, allow_output_truncation=False, identifier=None):
         if argv[:1] == ["git"]:
             assert checkout == sandbox.parents[1]
             result = controller(argv)
             return cp(argv, result.returncode, result.stdout.encode(), result.stderr.encode())
         assert checkout == sandbox
         assert argv == ("/bin/sh", "-c", f"cd {sandbox} && make test")
+        assert not set(credentials) & env.keys()
+        assert env["MIMIR_WORKLINK_GATE"] == "1"
+        assert env["HOME"].endswith(identifier)
         assert allow_output_truncation is True
         gate_calls.append(("make test", checkout, True))
         result = cp(argv, stdout=b"all tests passed\n", stderr=b"")
@@ -11705,15 +11722,21 @@ def test_factory_completion_with_real_evidence_and_wrapped_runner(
         orchestrator._verify_factory_completion(
             home=tmp_path,
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
-            record=_completion_record(sandbox),
+            record=(replace(_completion_record(sandbox), host=host,
+                            session="claude-code:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            lock_session="claude-code:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            launch_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                    if host == "claude_code" else _completion_record(sandbox)),
             test_command="make test",
             started_at=datetime.now(UTC),
             runner=orchestrator._factory_git_runner(controller),
         )
     )
 
+    assert observed_policies == [CLAUDE_FACTORY if host == "claude_code" else OPENCODE_FACTORY]
     assert gate_calls == [("make test", sandbox, True)]
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert "factory-gate-secret-sentinel" not in evidence_path.read_text(encoding="utf-8")
     assert pr_url == "https://github.com/owner/repo/pull/42"
     assert evidence["status"] == "completed"
     assert evidence["files_changed"] == ["changed.py"]

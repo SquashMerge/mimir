@@ -139,6 +139,21 @@ async def test_missing_tmp_is_known_empty(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_oversized_junit_retains_prefix_and_manifest(tmp_path, monkeypatch):
+    reports = tmp_path / "reports"
+    original = report(reports)
+    monkeypatch.setattr(ev, "_PYTEST_REPORT_MAX_BYTES", 256)
+    result = await retain(tmp_path)
+    assert result.exit_code == 1
+    assert result.retention_manifest is not None
+    assert result.retention_truncated
+    assert result.retention_error == "junit_truncated"
+    assert retained(result)["junit.xml"] == original[:256]
+    manifest = json.loads(Path(result.retention_manifest).read_text())
+    assert manifest["truncated"] and manifest["reasons"] == ["junit_truncated"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("exception", [PermissionError, OSError, RuntimeError])
 async def test_tmp_probe_failure_does_not_change_verdict(tmp_path, monkeypatch, exception, caplog):
     original = Path.lstat

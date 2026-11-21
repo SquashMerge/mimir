@@ -183,14 +183,24 @@ def _coding_cli_path(original: str):
         sanitized = []
         for index, directory in enumerate(original.split(os.pathsep)):
             source = Path(directory or os.curdir)
-            if not any((source / name).is_file() and os.access(source / name, os.X_OK)
-                       for name in _HOST_CODING_CLIS):
+            try:
+                contains_cli = any(
+                    (source / name).is_file() and os.access(source / name, os.X_OK)
+                    for name in _HOST_CODING_CLIS
+                )
+                entries = tuple(source.iterdir()) if contains_cli else ()
+            except OSError:
+                # Inherited PATH may name another uid's private directory.
+                # Preserve entries we cannot inspect rather than failing setup.
+                sanitized.append(directory)
+                continue
+            if not contains_cli:
                 sanitized.append(directory)
                 continue
             mirror = hidden / str(index)
             mirror.mkdir()
             mirror.chmod(0o755)
-            for entry in source.iterdir():
+            for entry in entries:
                 if entry.name not in _HOST_CODING_CLIS:
                     (mirror / entry.name).symlink_to(entry.absolute())
             sanitized.append(str(mirror))
