@@ -4405,6 +4405,7 @@ import shlex
 import shutil
 import stat
 from collections.abc import Awaitable, Callable
+from typing import TypeVar
 import uuid
 
 from .contained_checkout import ContainedCheckout, create_repo_test_checkout
@@ -4721,6 +4722,36 @@ class _ResolvedTestLeg:
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
 CheckoutFactory = Callable[..., ContainedCheckout]
+_CheckoutIOResult = TypeVar("_CheckoutIOResult")
+
+
+async def _checkout_io(
+    operation: Callable[[], _CheckoutIOResult],
+    *,
+    discard: Callable[[_CheckoutIOResult], None] | None = None,
+) -> _CheckoutIOResult:
+    """Settle checkout IO before propagating cancellation.
+
+    A thread cannot be cancelled: losing its result could leak a newly minted
+    checkout. Shield it (including against repeated cancellation), then dispose
+    of a cancelled creation's result off-loop before releasing the caller's lease.
+    Factory failures still use the factory's own partial-checkout cleanup.
+    """
+    pending = asyncio.create_task(asyncio.to_thread(operation))
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(pending)
+            break
+        except asyncio.CancelledError:
+            if pending.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        if discard is not None:
+            await _checkout_io(lambda: discard(result))
+        raise asyncio.CancelledError
+    return result
 
 
 def _selector_matches(path: str, suite: RepositoryTestSuite) -> bool:
@@ -5274,7 +5305,10 @@ class RepoProjectTests:
                     source_git_runner=retained_factory_subprocess_runner,
                     bundle_provider=retained_factory_snapshot_bundle,
                 )
-            checkout = self._checkout_factory(root, **checkout_arguments)
+            checkout = await _checkout_io(
+                lambda: self._checkout_factory(root, **checkout_arguments),
+                discard=lambda created: created.close(),
+            )
         except SnapshotCredentialsRefused as exc:
             await safe_log_event(
                 "repo_test_containment_refused",
@@ -5341,7 +5375,7 @@ class RepoProjectTests:
                 environment["UV_CACHE_DIR"] = f'{environment["XDG_CACHE_HOME"]}/uv'
             if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
                 try:
-                    checkout.close()
+                    await _checkout_io(checkout.close)
                 except (OSError, RuntimeError, ValueError) as exc:
                     await safe_log_event(
                         "repo_test_containment_refused", reason_code="cleanup_failed",
@@ -5433,7 +5467,7 @@ class RepoProjectTests:
                         _remove_live_output(stdout_path, stderr_path)
         finally:
             try:
-                checkout.close()
+                await _checkout_io(checkout.close)
             except (OSError, RuntimeError, ValueError) as exc:
                 await safe_log_event(
                     "repo_test_containment_refused",
