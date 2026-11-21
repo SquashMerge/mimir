@@ -69,6 +69,9 @@ def test_leaf_argv_is_narrow_official_cli():
     rules = bash_rules("uv run pytest -q")
     assert rules == ("Bash(git:*)", "Bash(uv:*)")
     argv = leaf_argv("build", "sonnet", Path("/worker/home"), rules)
+    # Keep the empty settings-source value as its own argv element. The pinned
+    # 2.1.326 hostile-project probe and both positive controls are recorded in
+    # fixtures/worklink/claude_code_2_1_326/PROVENANCE.md; rerun before a CLI bump.
     assert argv == (
         "/opt/mimir-claude/bin/claude", "-p", "build", "--output-format", "stream-json", "--verbose",
         "--model", "sonnet", "--setting-sources", "", "--settings", "/worker/home/.claude/settings.json",

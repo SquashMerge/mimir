@@ -18,6 +18,45 @@ Original operator command:
 It ran in an empty Git repository; the operator replaced only `cwd`,
 `original_cwd`, and `memory_paths.auto`. The builder ran no live Claude session.
 
+## Operator settings-source isolation probe (2026-11-21)
+
+Source: [operator report on PR #150, item 7](https://github.com/SquashMerge/mimir/pull/150#issuecomment-7057681916).
+This is a separate operator-run probe, not the source of `success.jsonl`,
+not a builder rerun, and not a successful authenticated subscription session.
+
+The operator used a throwaway `node:22-slim` container and installed
+`@anthropic-ai/claude-code@2.1.326`; the CLI reported `2.1.326 (Claude Code)`.
+The empty Git repository contained a hostile `.claude/settings.json` whose
+`env` set `ANTHROPIC_BASE_URL` to `http://127.0.0.1:9999`, with a listener on
+that port. Runs used `HOME=/worker`, `CLAUDE_CONFIG_DIR=/worker/.claude`,
+and a **fake** `CLAUDE_CODE_OAUTH_TOKEN`.
+
+The common command was `claude -p "Reply with exactly: ok" --output-format
+stream-json --verbose … --strict-mcp-config --max-turns 1`. The operator
+reported these discriminating results:
+
+| Settings arguments | Hostile listener | Reported outcome |
+|---|---|---|
+| `--setting-sources "" --settings /worker/.claude/settings.json` (leaf shape) | No connection | First-party API request: `api_error_status 401 authentication_error`, `api_error_origin first_party` |
+| `--setting-sources project` (control) | Connected: `POST /v1/messages?beta=true` | Hostile project base URL honoured |
+| No `--setting-sources` (default control) | Connected: `POST /v1/messages?beta=true` | Hostile project base URL honoured |
+
+This supports the specific claim that CLI **2.1.326** treats the explicit
+empty settings-source value as disabling project settings. The positive
+controls distinguish that behaviour from an inert listener or a CLI that
+never issues a request. Raw probe logs are not stored in this fixture set;
+the linked operator report is the evidence of record.
+
+`tests/test_claude_code.py::test_leaf_argv_is_narrow_official_cli` asserts
+the complete leaf argv, including exactly one `--setting-sources` followed
+by a separate empty-string argument and the explicit private `--settings`
+path. **Do not bump the Claude CLI pin without re-running this probe** with
+the new pinned version, both positive controls, and the exact leaf settings
+arguments, then recording the new evidence. This probe does not establish
+same-UID credential isolation or executor-restart recovery.
+
+## Derived stream fixtures
+
 The quota and warning fixtures are **derived**, not observed subscription failures.
 Their source is this capture plus the locked `claude-agent-sdk==0.2.180`
 `types.py` (`RateLimitInfo`, `RateLimitStatus`, `ResultMessage`) and
