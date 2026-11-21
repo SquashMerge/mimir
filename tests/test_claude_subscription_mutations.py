@@ -166,7 +166,10 @@ assert Path(candidates[0].entry_point.dist.locate_file("")).is_relative_to(repos
 assert metadata.version("mimir-cultivate") == candidates[0].version
 sys.argv[0] = "pytest"
 runpy.run_module("pytest", run_name="__main__")
-""", str(repository), "-q", "--tb=short", "-o", "addopts=", mutation.test],
+""", str(repository), "-q", "--tb=short", "-o", "addopts=",
+         # Stay under the fixture-owned canonical test root, not an inherited
+         # private TMPDIR whose ancestors the no-follow resource lock cannot open.
+         "--basetemp", str(repository.parent / f"pytest-{stage}"), mutation.test],
         cwd=repository, env=env, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=180,
     )
