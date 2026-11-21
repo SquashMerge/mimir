@@ -18,6 +18,35 @@ from mimir import viability_metrics as vm
 # ── fixtures ─────────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _no_real_embedder(monkeypatch: pytest.MonkeyPatch):
+    """Fail before model loading, even inside the production Exception handler."""
+    from fastembed import TextEmbedding
+    from mimir.search import FastEmbedder
+
+    def forbidden(*args, **kwargs):
+        # pytest.fail raises BaseException, not Exception: the graceful
+        # embedder_unavailable fallback must not hide an unstubbed test.
+        pytest.fail(
+            "Real embedder construction is forbidden in test_viability_metrics; "
+            "use stub_embedder or a fixed-vector fake."
+        )
+
+    monkeypatch.setattr(FastEmbedder, "__init__", forbidden)
+    monkeypatch.setattr(TextEmbedding, "__init__", forbidden)
+
+
+class _StubEmbedder:
+    def embed(self, texts):
+        """Non-cosine tests need no vectors (and never need model weights)."""
+        return []
+
+
+@pytest.fixture
+def stub_embedder(monkeypatch: pytest.MonkeyPatch, _no_real_embedder):
+    monkeypatch.setattr("mimir.search.FastEmbedder", _StubEmbedder)
+
+
 def _write_turn(
     home: Path,
     *,
@@ -119,6 +148,57 @@ def test_cosine_zero_vector_returns_zero():
 # ── collapse metrics ─────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("constructor", ["FastEmbedder", "TextEmbedding"])
+def test_real_embedder_construction_is_forbidden(constructor):
+    from fastembed import TextEmbedding
+    from mimir.search import FastEmbedder
+
+    constructors = {"FastEmbedder": FastEmbedder, "TextEmbedding": TextEmbedding}
+    with pytest.raises(pytest.fail.Exception, match="Real embedder construction is forbidden"):
+        constructors[constructor]()
+
+
+def test_unstubbed_metrics_fail_instead_of_degrading(tmp_path: Path):
+    """The no-network guard must escape compute_collapse_metrics' fallback."""
+    _write_turn(tmp_path, output="first output")
+    _write_turn(tmp_path, output="second output")
+
+    with pytest.raises(pytest.fail.Exception, match="use stub_embedder or a fixed-vector fake"):
+        vm.compute_collapse_metrics(tmp_path)
+
+
+@pytest.mark.parametrize(("vectors", "mean", "maximum"), [
+    ([[2.0, 0.0], [0.0, 3.0]], 0.0, 0.0),
+    ([[2.0, 0.0], [3.0, 0.0]], 1.0, 1.0),
+    ([[2.0, 0.0], [0.0, 3.0], [0.0, 4.0], [0.0, -5.0]], 0.0, 1.0),
+    ([[0.0, 0.0], [3.0, 4.0]], 0.0, 0.0),
+])
+def test_collapse_cosine_metrics_use_consecutive_pairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vectors, mean, maximum,
+):
+    """Fixed, non-unit vectors check normalization, aggregation and pair count."""
+    now = datetime.now(tz=timezone.utc)
+    outputs = [f"output {i}" for i in range(len(vectors))]
+    for output in outputs:
+        _write_turn(tmp_path, output=output, ts=now)
+    embedded = []
+
+    class FixedEmbedder:
+        def embed(self, texts):
+            embedded.append(texts)
+            return vectors
+
+    monkeypatch.setattr("mimir.search.FastEmbedder", FixedEmbedder)
+    metrics = vm.compute_collapse_metrics(tmp_path, now=now)
+
+    assert embedded == [outputs]
+    assert not metrics.embedder_unavailable
+    assert metrics.cosine_sim_sample_size == len(vectors) - 1
+    assert metrics.cosine_sim_mean == pytest.approx(mean)
+    assert metrics.cosine_sim_max == pytest.approx(maximum)
+
+
+@pytest.mark.usefixtures("stub_embedder")
 def test_collapse_metrics_empty_home(tmp_path: Path):
     """No turns.jsonl yet → all fields safely None / 0."""
     metrics = vm.compute_collapse_metrics(tmp_path, window_days=7)
@@ -128,6 +208,7 @@ def test_collapse_metrics_empty_home(tmp_path: Path):
     assert metrics.topic_diversity_ratio is None
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_collapse_metrics_filters_by_window(tmp_path: Path):
     """Turns outside the window are excluded."""
     now = datetime.now(tz=timezone.utc)
@@ -138,6 +219,7 @@ def test_collapse_metrics_filters_by_window(tmp_path: Path):
     assert metrics.window_turns == 1
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_collapse_metrics_filters_errored_turns(tmp_path: Path):
     """Errored turns (no real output) are excluded — they don't
     represent actual model behavior worth measuring."""
@@ -148,6 +230,7 @@ def test_collapse_metrics_filters_errored_turns(tmp_path: Path):
     assert metrics.window_turns == 1
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_atom_citation_gini_high_concentration(tmp_path: Path):
     """All citations land on one atom → Gini close to (n-1)/n.
     With one cited atom out of one, Gini = 0 (no concentration to
@@ -167,6 +250,7 @@ def test_atom_citation_gini_high_concentration(tmp_path: Path):
     assert 0.4 < metrics.atom_citation_gini < 0.5
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_atom_citation_gini_uniform_distribution(tmp_path: Path):
     """Equal citation across atoms → Gini = 0."""
     now = datetime.now(tz=timezone.utc)
@@ -176,6 +260,7 @@ def test_atom_citation_gini_uniform_distribution(tmp_path: Path):
     assert metrics.atom_citation_gini == pytest.approx(0.0, abs=0.01)
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_topic_diversity_calculated_correctly(tmp_path: Path):
     """Topic diversity = distinct (channel, trigger, top-token) tuples / total turns."""
     now = datetime.now(tz=timezone.utc)
@@ -196,6 +281,7 @@ def test_topic_diversity_calculated_correctly(tmp_path: Path):
     assert metrics.topic_diversity_ratio == pytest.approx(0.75)
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_silent_turns_are_excluded_from_topic_diversity(tmp_path: Path):
     now = datetime.now(tz=timezone.utc)
     for topic in ("alpha", "bravo", "charlie", "delta", "echoes"):
@@ -283,6 +369,7 @@ def test_curation_counts_feedback_and_forget_events(tmp_path: Path):
 # ── threshold warnings ──────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_report_flags_low_reflection_rate(tmp_path: Path):
     """Below-threshold reflection output → curation_below_threshold_reflection warning."""
     now = datetime.now(tz=timezone.utc)
@@ -292,6 +379,7 @@ def test_report_flags_low_reflection_rate(tmp_path: Path):
     assert any("curation_below_threshold_reflection" in w for w in report.warnings)
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_report_flags_low_feedback_rate(tmp_path: Path):
     """No saga_feedback events → curation_below_threshold_feedback warning."""
     now = datetime.now(tz=timezone.utc)
@@ -304,6 +392,7 @@ def test_report_flags_low_feedback_rate(tmp_path: Path):
     assert not any("curation_below_threshold_reflection" in w for w in report.warnings)
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_report_flags_low_topic_diversity(tmp_path: Path):
     """All turns on the same (channel, trigger, top-token) → ratio < threshold."""
     now = datetime.now(tz=timezone.utc)
@@ -316,6 +405,7 @@ def test_report_flags_low_topic_diversity(tmp_path: Path):
     assert any("collapse_risk_topic_lock" in w for w in report.warnings)
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_report_clean_when_metrics_healthy(tmp_path: Path):
     """A healthy home (diverse topics + adequate curation) produces no warnings."""
     now = datetime.now(tz=timezone.utc)
@@ -331,8 +421,7 @@ def test_report_clean_when_metrics_healthy(tmp_path: Path):
     report = vm.build_report(tmp_path, now=now)
     # No CURATION warnings (forget=1, feedback=10/wk, reflection=5000/4=1250/wk).
     # Topic diversity = 5/5 = 1.0, above 0.2 threshold.
-    # Cosine sim and Gini may not trigger because the data is too small
-    # / fastembed-dependent — but the ones we tested should be clean.
+    # Cosine is deliberately uncomputed by the stub; there are no citations.
     curation_warnings = [w for w in report.warnings if "curation" in w]
     topic_warnings = [w for w in report.warnings if "topic_lock" in w]
     assert curation_warnings == []
@@ -342,6 +431,7 @@ def test_report_clean_when_metrics_healthy(tmp_path: Path):
 # ── report rendering ────────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_render_produces_markdown_with_sections(tmp_path: Path):
     now = datetime.now(tz=timezone.utc)
     _write_turn(tmp_path, output="some content", ts=now)
@@ -352,6 +442,7 @@ def test_render_produces_markdown_with_sections(tmp_path: Path):
     assert "## Write-side curation" in rendered
 
 
+@pytest.mark.usefixtures("stub_embedder")
 def test_write_report_to_disk(tmp_path: Path):
     now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
     _write_turn(tmp_path, output="content", ts=now)
@@ -366,6 +457,7 @@ def test_write_report_to_disk(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("stub_embedder")
 async def test_scheduled_run_emits_warnings_and_ok(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
