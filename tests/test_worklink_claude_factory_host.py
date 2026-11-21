@@ -683,6 +683,64 @@ async def test_claude_factory_containment_preserves_only_explicit_epic_inputs(re
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("environment_case", [
+    "valid", "extra-base-url", "extra-api-key", "missing-oauth", "blank-oauth",
+])
+async def test_claude_factory_launch_environment_refuses_before_worker_start(
+    tmp_path, environment_case,
+):
+    from mimir_cultivate.claude_code import OAUTH_ENV
+
+    environment = {OAUTH_ENV: "unit-oauth", "MIMIR_WORK_ITEM_JSON": "{}"}
+    if environment_case == "extra-base-url":
+        environment["ANTHROPIC_BASE_URL"] = "https://invalid.example"
+    elif environment_case == "extra-api-key":
+        environment["MIMIR_API_KEY"] = "unit-not-admitted"
+    elif environment_case == "missing-oauth":
+        del environment[OAUTH_ENV]
+    elif environment_case == "blank-oauth":
+        environment[OAUTH_ENV] = " \t\n"
+    spec = compute.WorkSpec(
+        issue_id=2126, attempt=1, repo_url="repo", base_ref="main", branch="test",
+        prompt="", rules=None, test_command="true", backend="feature_factory",
+        timeout_s=10, local_checkout=tmp_path, local_argv=("fixture-factory",),
+        env=environment, execution=CLAUDE_FACTORY,
+    )
+    launches = []
+
+    class Process:
+        pid = os.getpid()
+        process_start_ticks = 42
+        timed_out = output_overflow = False
+        children_reaped = True
+
+        async def wait(self):
+            return 0
+
+    class Client:
+        async def launch(self, **kwargs):
+            launches.append(kwargs)
+            return Process()
+
+        async def cancel(self, identifier):
+            pass
+
+    backend = compute.LocalSubprocessComputeBackend(_worker_client=Client())
+    if environment_case == "valid":
+        handle = await backend.launch(spec)
+        result = await backend.wait(handle, 10)
+        await backend.cleanup(handle)
+        assert result.exit_code == 0 and result.children_reaped
+        assert len(launches) == 1
+        assert launches[0]["home_projection_profile"] == "claude_factory"
+        assert launches[0]["env"][OAUTH_ENV] == environment[OAUTH_ENV]
+    else:
+        with pytest.raises(compute.ComputeLaunchError, match="^invalid Claude factory environment$"):
+            await backend.launch(spec)
+        assert launches == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route", [False, True])
 @pytest.mark.parametrize("recovery", [False, True])
 async def test_factory_compute_binding_overrides_configured_daemon_after_recorded_host(
@@ -915,6 +973,89 @@ async def test_claude_recovery_requires_proof_and_fresh_durable_uuid(real_packag
         with pytest.raises(orch.WorklinkError, match="verified descendant retirement"):
             await invocation
         assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record_kind", ["claude-process", "claude-daemon", "opencode-daemon"])
+async def test_claude_recovery_refuses_nonquiescent_and_inconsistent_daemon_records(
+    tmp_path, monkeypatch, record_kind,
+):
+    from mimir_cultivate.worklink import orchestrator as orch
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+    from mimir_cultivate.worklink.claims import ClaimRecord
+    from mimir_cultivate.worklink.factory_state import save_factory_record, factory_record_path
+
+    identifier = str(uuid.uuid4())
+    daemon = record_kind != "claude-process"
+    session = "ses_fixture" if daemon else "claude-code:" + identifier
+    sandbox = tmp_path / "operator/.factory-sandboxes/chainlink-2126"
+    sandbox.mkdir(parents=True)
+    status = FactoryStatus(
+        run_id="chainlink-2126", valid=True, sandbox_path=str(sandbox),
+        status="running", mode="autonomous", branch="feature/chainlink-2126",
+        pr_base="main", pr_draft=False, lock="fresh", dead_lock=False, lock_session=session,
+    )
+    handle = (compute.LaunchHandle("opencode_daemon", identifier, opencode_session_id=session)
+              if daemon else compute.LaunchHandle("local_subprocess", identifier, 42, 999999999))
+    record = FactoryRunRecord(
+        run_id=status.run_id, issue_id=2126, attempt=1, repository="owner/repo",
+        base_ref="main", branch=status.branch, launcher="/opt/fixture/factory.js",
+        sandbox=str(sandbox), session=session, lock_session=session,
+        host="opencode" if daemon else "claude_code",
+        launch_generation=None if daemon else identifier,
+        opencode_session_id=session if daemon else None, handle=handle,
+        status=status, observed_at=None, controller_phase="running", children_reaped=False,
+    )
+    save_factory_record(tmp_path, record)
+    path = factory_record_path(tmp_path, record.run_id)
+    original = path.read_bytes()
+    if record_kind == "claude-daemon":
+        # The record decoder already refuses this combination. Inject corruption
+        # after construction to exercise the independent recovery guard, not that
+        # earlier check: these matching daemon IDs bypass the legacy-host refusal.
+        object.__setattr__(record, "host", "claude_code")
+        assert record.opencode_session_id == record.handle.opencode_session_id
+        assert record.handle.substrate == "opencode_daemon"
+    events = []
+
+    def binding(**kwargs):
+        events.append("binding")
+        return sandbox
+
+    class Factory(FeatureFactoryBackend):
+        def status(self, *args, **kwargs):
+            events.append("status")
+            return status
+
+    class Compute:
+        async def rearm_session(self, selected):
+            assert selected == handle
+            events.append("rearm")
+            return "continued"
+
+    async def supervise(self, **kwargs):
+        assert kwargs["factory_record"] is record
+        events.append("supervise")
+        return orch.WorklinkRunResult(2126, 1, "interrupted")
+
+    monkeypatch.setattr(orch, "_verify_factory_recovery_binding", binding)
+    monkeypatch.setattr(orch.WorklinkRunner, "_supervise_factory_070", supervise)
+    invocation = orch.WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+        issue=orch.IssueContext(2126, "epic", "build", {"worklink:epic"}),
+        claim_record=ClaimRecord(2126, 2, "fixture", datetime.now(UTC)), claims=SimpleNamespace(),
+        backend=Factory(host=record.host, entrypoint=record.launcher), compute=Compute(), retained=record,
+        launcher=Path(record.launcher), repo_slug="owner/repo", base="main", test_cmd="true",
+        runner=lambda *args, **kwargs: pytest.fail("unexpected controller command"),
+        work_item_json=json.dumps({"run_id": record.run_id}),
+    )
+    if record_kind == "opencode-daemon":
+        assert (await invocation).status == "interrupted"
+        assert events == ["binding", "status", "rearm", "supervise"]
+    else:
+        with pytest.raises(orch.WorklinkError, match="^Claude factory recovery requires verified descendant retirement$"):
+            await invocation
+        assert events == ["binding", "status"]
+    assert path.read_bytes() == original
 
 
 @pytest.mark.asyncio
