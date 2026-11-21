@@ -393,9 +393,9 @@ def test_retired_sweep_errors_are_nonfatal_and_sanitized(tmp_path: Path, monkeyp
     finally:
         os.close(fd)
     lines = capsys.readouterr().err.splitlines()
-    # Acquisition sweeps each lease name (slot 1, slot 2, intent); only slot 1
-    # has a retired directory, but a failing scan fails once per name.
-    expected = {"already-removed": 0, "delete": 1, "scan": 3} if operation == "acquire" else \
+    # Acquisition sweeps each slot name (slot 1, slot 2); only slot 1 has a
+    # retired directory, but a failing scan fails once per name.
+    expected = {"already-removed": 0, "delete": 1, "scan": 2} if operation == "acquire" else \
         {"already-removed": 0, "delete": 2, "scan": 2}
     assert len(lines) == expected[fault]
     for line in lines:
@@ -909,7 +909,7 @@ def test_waiting_large_job_runs_alone_before_later_medium_jobs(tmp_path: Path, s
     _wait(entered["m1"].exists)
     # No tier means large: v1 callers keep running alone.
     large = start(sys.executable, "-c", _marking_payload(entered["large"], release["large"]))
-    _wait(_slot(tmp_path, "intent").exists)
+    _wait(_slot(tmp_path, "lease2").is_dir)  # At the queue head, it holds the free slot.
     m2 = start(sys.executable, "-c", _marking_payload(entered["m2"], release["m2"]), MIMIR_HEAVY_TIER="medium")
     heartbeat = _slot(tmp_path, "lease") / "heartbeat"
     seen = int(heartbeat.read_text())
@@ -962,7 +962,7 @@ def test_medium_takes_slot_two_only_beside_a_medium_slot_one(tmp_path: Path, mon
 
 
 @pytest.mark.parametrize("waiting_large", [False, True])
-def test_waiting_large_intent_blocks_new_medium_jobs(tmp_path: Path, monkeypatch, waiting_large) -> None:
+def test_legacy_large_intent_still_blocks_new_medium_jobs(tmp_path: Path, monkeypatch, waiting_large) -> None:
     module = _helper()
     intent = _slot(tmp_path, "intent")
     if waiting_large:
@@ -1021,3 +1021,39 @@ def test_documented_gap_a_slot_one_only_helper_can_join_a_slot_two_medium(tmp_pa
             os.close(fd)
         release["m2"].touch()
     assert m2.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+
+
+def test_jobs_start_in_arrival_order(tmp_path: Path, start) -> None:
+    # A large job holds the machine; three medium jobs queue behind it in order.
+    entered = {name: tmp_path / f"{name}-in" for name in ("large", "a", "b", "c")}
+    release = {name: tmp_path / f"{name}-release" for name in ("large", "a", "b", "c")}
+    large = start(sys.executable, "-c", _marking_payload(entered["large"], release["large"]))
+    _wait(entered["large"].exists)
+    queue = _slot(tmp_path, "queue")
+    children = [large]
+    for count, name in enumerate(("a", "b", "c"), start=1):
+        children.append(start(sys.executable, "-c", _marking_payload(entered[name], release[name]),
+                              MIMIR_HEAVY_TIER="medium"))
+        _wait(lambda: len([p for p in queue.iterdir() if p.name.isdigit()]) == count)
+    release["large"].touch()
+    _wait(lambda: entered["a"].exists() and entered["b"].exists())
+    assert not entered["c"].exists()  # Two medium slots, taken by the first two arrivals.
+    release["b"].touch()
+    _wait(entered["c"].exists)
+    for name in ("a", "c"):
+        release[name].touch()
+    for child in children:
+        assert child.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+
+
+def test_a_dead_waiters_ticket_goes_stale_and_does_not_block(tmp_path: Path, start) -> None:
+    queue = _slot(tmp_path, "queue")
+    queue.mkdir()
+    ticket = queue / "000000000001"
+    ticket.mkdir()
+    (ticket / "owner").write_text(json.dumps({"tier": "large", "role": "ticket"}))
+    (ticket / "heartbeat").write_text("3\n")  # Never advances: its helper is dead.
+    done = tmp_path / "ran"
+    child = start("touch", str(done), MIMIR_HEAVY_TIER="medium", MIMIR_HEAVY_STALE_SECONDS="1")
+    assert child.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0, child.stderr.read()
+    assert done.exists() and not ticket.exists()

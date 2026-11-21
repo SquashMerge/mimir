@@ -1,13 +1,13 @@
 #!/bin/sh
 # Serialize heavy commands across hosts/containers sharing a writable directory.
 # MIMIR_HEAVY_LOCK_FILE=/shared/heavy.lock uses two slots, /shared/heavy.lock.lease
-# and /shared/heavy.lock.lease2, plus /shared/heavy.lock.intent, each acquired by
-# atomic mkdir. All participants must use this protocol: old lockf callers don't
+# and /shared/heavy.lock.lease2, plus FIFO tickets in /shared/heavy.lock.queue/,
+# each acquired by atomic mkdir. All participants must use this protocol: old lockf callers don't
 # interoperate, and kernel locks don't cross a VM bind mount.
 #
 # MIMIR_HEAVY_TIER=medium holds one slot, so two medium commands can share the
-# machine. large (the default) holds both and runs alone; a waiting large command
-# blocks new medium ones. Use large for anything whose timing is measured. A
+# machine. large (the default) holds both and runs alone. Waiters start in
+# arrival order, so a large command is never starved by later medium ones. Use large for anything whose timing is measured. A
 # holder without a recorded tier (an older helper) counts as large, but an older
 # helper still WAITING sees only slot 1 and can start beside a medium: set medium
 # only once every participant on the lease runs this version. See heavy_run.py.
