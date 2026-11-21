@@ -1022,6 +1022,10 @@ are unchanged.
 
 Factory completion tests use the same closed worker environment as leaf gates,
 including `PATH=/usr/local/bin:/usr/bin:/bin`, never the controller's PATH.
+Provisioning installs toolchain commands (including `uv`) in `/usr/local/bin`.
+The factory launcher's controller CLI PATH is a separate control-plane contract;
+completion tests do not inherit it. Executor tests explicitly model the worker
+installation layout rather than depending on CI-host tool directories.
 If at least 95% of tests error and at least 95% of the observed error phases are
 setup, evidence records an environment failure with the first setup error.
 Oversized JUnit reports remain diagnostic-only (`report_error: junit_oversize`):

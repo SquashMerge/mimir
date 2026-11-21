@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -28,6 +29,32 @@ from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle, LocalS
 from mimir_cultivate.worklink.factory_state import load_factory_record
 from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
 from tests.opencode_fixtures import seed_codex_subscription
+
+
+@pytest.fixture
+def worker_toolchain(tmp_path, monkeypatch):
+    """Model the provisioned worker tools, not the CI runner's PATH layout."""
+    from mimir_cultivate import contained_execution
+    from mimir_cultivate.worklink import compute
+
+    uv = shutil.which("uv")
+    assert uv is not None, "the test suite requires an installed uv"
+    tools = tmp_path / "worker-tools"
+    tools.mkdir()
+    (tools / "uv").symlink_to(Path(uv).resolve(strict=True))
+    original = contained_execution.base_worker_environment
+    assert original("worker-layout")["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+
+    def environment(identifier):
+        env = original(identifier)
+        env["PATH"] = str(tools) + os.pathsep + env["PATH"]
+        return env
+
+    # Only the installation layout is injected. Keep the real closed builder,
+    # request validation, FD transfer, subprocess and gate-result handling.
+    monkeypatch.setattr(contained_execution, "base_worker_environment", environment)
+    monkeypatch.setattr(compute, "base_worker_environment", environment)
+    return tools
 
 
 @contextmanager
@@ -116,12 +143,12 @@ def test_provider_renders_default_work_order_without_override(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_factory_completion_gate_spawns_with_leaf_worker_environment(tmp_path, monkeypatch):
+async def test_factory_completion_gate_spawns_with_leaf_worker_environment(tmp_path, monkeypatch, worker_toolchain):
     from mimir_cultivate.worklink.compute import _enabled_child_env
 
     monkeypatch.setenv("PATH", "/home/mimir/.cargo/bin:/home/mimir/bin:/usr/bin")
     monkeypatch.setenv("GITHUB_TOKEN", "controller-token")
-    command = "printf '%s' \"$PATH\""
+    command = "uv --version >/dev/null && printf '%s' \"$PATH\""
     spec = WorkSpec(2183, 1, "", "main", "branch", "", None, command,
                     "feature_factory", 30, local_checkout=tmp_path)
     report_dir = tmp_path / "reports"
@@ -141,6 +168,7 @@ async def test_factory_completion_gate_spawns_with_leaf_worker_environment(tmp_p
     expected = _enabled_child_env(leaf, "leaf")
     assert result.exit_code == 0
     assert result.stdout == expected["PATH"] == captured["PATH"]
+    assert shutil.which("uv", path=captured["PATH"]) == str(worker_toolchain / "uv")
     assert "/home/mimir" not in captured["PATH"]
     assert "GITHUB_TOKEN" not in captured
     for name in ("USER", "LOGNAME", "SHELL", "LANG", "LC_ALL"):
@@ -213,6 +241,7 @@ def test_provider_runner_dry_run_uses_default_work_order(tmp_path: Path, capsys:
 ])
 async def test_provider_completion_uses_emitted_record_and_worker_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, short_socket_dir: Path, reaped: bool, pr_head: str,
+    worker_toolchain: Path,
 ) -> None:
     root = tmp_path / "worklink"
     checkout = root / "repository" / "1949-1" / "checkout"
@@ -590,7 +619,9 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         ]]
         for request in gate_requests:
             assert request["env"]["PATH"] == base_worker_environment("gate")["PATH"]
+            assert shutil.which("uv", path=request["env"]["PATH"]) == str(worker_toolchain / "uv")
             assert "/home/mimir" not in request["env"]["PATH"]
+            assert "GITHUB_TOKEN" not in request["env"]
     evidence_path = result.evidence_path or next((tmp_path / "state" / "worklink" / "evidence").rglob("*.json"))
     payload = json.loads(evidence_path.read_text())
     assert payload["checkout"] == str(result.checkout)

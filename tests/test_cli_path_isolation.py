@@ -95,15 +95,16 @@ def test_mirrored_git_executes_after_dropping_uid() -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions")
-def test_unreadable_path_entry_does_not_break_fixture_or_tools() -> None:
+@pytest.mark.parametrize("private_ambient_home", [False, True])
+def test_unreadable_path_entry_does_not_break_fixture_or_tools(private_ambient_home) -> None:
     # Run the actual context manager unprivileged even when the suite is root.
     # Embedding its source avoids giving that uid access to private pytest data.
+    # Numeric identities need no host passwd entry; -I ignores ambient Python config.
     options = {}
+    interpreter = sys.executable
     if os.geteuid() == 0:
-        import pwd
-
-        worker = pwd.getpwnam("nobody")
-        options = {"user": worker.pw_uid, "group": worker.pw_gid, "extra_groups": []}
+        options = {"user": 65534, "group": 65534, "extra_groups": []}
+        interpreter = shutil.which("python3", path=os.defpath) or sys._base_executable
     with tempfile.TemporaryDirectory(prefix="mimir-unreadable-path-", dir="/tmp") as temporary:
         root = Path(temporary)
         root.chmod(0o755)
@@ -111,6 +112,11 @@ def test_unreadable_path_entry_does_not_break_fixture_or_tools() -> None:
         unreadable.mkdir()
         (unreadable / "factory.js").write_text("private")
         unreadable.chmod(0)
+        private_home = root / "ambient-home"
+        private_home.mkdir(mode=0o700)
+        private_home.chmod(0)
+        child_env = {"HOME": str(private_home) if private_ambient_home else str(root),
+                     "PATH": os.defpath, "TMPDIR": str(private_home)}
         try:
             script = (
                 "import os, tempfile, subprocess\n"
@@ -119,7 +125,14 @@ def test_unreadable_path_entry_does_not_break_fixture_or_tools() -> None:
                 f"_HOST_CODING_CLIS = {_HOST_CODING_CLIS!r}\n"
                 + inspect.getsource(_coding_cli_path)
                 + f"\noriginal = {str(unreadable)!r} + os.pathsep + '/usr/bin:/bin'\n"
-                "assert not os.access(original.split(os.pathsep)[0], os.R_OK)\n"
+                "assert os.geteuid() != 0\n"
+                "assert not os.access(original.split(os.pathsep)[0], os.R_OK | os.X_OK)\n"
+                "try:\n"
+                " (Path(original.split(os.pathsep)[0]) / 'factory.js').stat()\n"
+                "except PermissionError:\n"
+                " pass\n"
+                "else:\n"
+                " raise AssertionError('fixture did not produce a real permission denial')\n"
                 "with _coding_cli_path(original) as sanitized:\n"
                 " assert sanitized.split(os.pathsep)[0] == original.split(os.pathsep)[0]\n"
                 " result = subprocess.run(['sh', '-c', 'echo test-ran'], env={'PATH': sanitized}, "
@@ -127,12 +140,13 @@ def test_unreadable_path_entry_does_not_break_fixture_or_tools() -> None:
                 " assert result.stdout.strip() == 'test-ran'\n"
             )
             result = subprocess.run(
-                ["/usr/bin/python3", "-c", script], cwd="/",
-                capture_output=True, text=True, **options,
+                [interpreter, "-I", "-c", script], cwd=root,
+                env=child_env, capture_output=True, text=True, **options,
             )
             assert result.returncode == 0, result.stderr
         finally:
             unreadable.chmod(0o700)
+            private_home.chmod(0o700)
 
 
 @pytest.mark.parametrize("operation", ["is_file", "access", "iterdir"])
