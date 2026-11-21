@@ -10,7 +10,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import yaml
 
@@ -4405,6 +4405,7 @@ import shlex
 import shutil
 import stat
 from collections.abc import Awaitable, Callable
+from typing import TypeVar
 import uuid
 
 from .contained_checkout import ContainedCheckout, create_repo_test_checkout
@@ -4721,6 +4722,36 @@ class _ResolvedTestLeg:
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
 CheckoutFactory = Callable[..., ContainedCheckout]
+_CheckoutIOResult = TypeVar("_CheckoutIOResult")
+
+
+async def _checkout_io(
+    operation: Callable[[], _CheckoutIOResult],
+    *,
+    discard: Callable[[_CheckoutIOResult], None] | None = None,
+) -> _CheckoutIOResult:
+    """Settle checkout IO before propagating cancellation.
+
+    A thread cannot be cancelled: losing its result could leak a newly minted
+    checkout. Shield it (including against repeated cancellation), then dispose
+    of a cancelled creation's result off-loop before releasing the caller's lease.
+    Factory failures still use the factory's own partial-checkout cleanup.
+    """
+    pending = asyncio.create_task(asyncio.to_thread(operation))
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(pending)
+            break
+        except asyncio.CancelledError:
+            if pending.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        if discard is not None:
+            await _checkout_io(lambda: discard(result))
+        raise asyncio.CancelledError
+    return result
 
 
 def _selector_matches(path: str, suite: RepositoryTestSuite) -> bool:
@@ -5274,7 +5305,10 @@ class RepoProjectTests:
                     source_git_runner=retained_factory_subprocess_runner,
                     bundle_provider=retained_factory_snapshot_bundle,
                 )
-            checkout = self._checkout_factory(root, **checkout_arguments)
+            checkout = await _checkout_io(
+                lambda: self._checkout_factory(root, **checkout_arguments),
+                discard=lambda created: created.close(),
+            )
         except SnapshotCredentialsRefused as exc:
             await safe_log_event(
                 "repo_test_containment_refused",
@@ -5341,7 +5375,7 @@ class RepoProjectTests:
                 environment["UV_CACHE_DIR"] = f'{environment["XDG_CACHE_HOME"]}/uv'
             if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
                 try:
-                    checkout.close()
+                    await _checkout_io(checkout.close)
                 except (OSError, RuntimeError, ValueError) as exc:
                     await safe_log_event(
                         "repo_test_containment_refused", reason_code="cleanup_failed",
@@ -5433,7 +5467,7 @@ class RepoProjectTests:
                         _remove_live_output(stdout_path, stderr_path)
         finally:
             try:
-                checkout.close()
+                await _checkout_io(checkout.close)
             except (OSError, RuntimeError, ValueError) as exc:
                 await safe_log_event(
                     "repo_test_containment_refused",
@@ -6258,10 +6292,21 @@ async def repo_test(
     pull_request: int,
     selectors: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
-    suite: str | None = None,
+    suite: Annotated[
+        str | None,
+        "For a repository declaring more than one test suite, pass exactly one "
+        "suite name from its test_suites in $MIMIR_HOME/repositories.yaml. "
+        "May be omitted for a single/default suite; legacy selector inference is unchanged.",
+    ] = None,
     include_output: bool = False,
 ) -> dict[str, Any]:
-    """Run configured tests in a contained repository snapshot under the live lease."""
+    """Run configured tests in a contained repository snapshot under the live lease.
+
+    For a repository declaring more than one test suite, pass exactly one
+    ``suite`` explicitly. Declared names come from that repository's
+    ``test_suites`` in ``$MIMIR_HOME/repositories.yaml``. A single/default suite
+    needs no ``suite``; legacy selector-based inference remains supported.
+    """
     retained = _retained_scope(runtime, repository, pull_request)
     if retained is not None:
         return await _repo_test_unlocked(
@@ -6281,6 +6326,8 @@ async def repo_test(
 
 def _remediation_test_guidance(code: str, *, scoped: bool) -> str:
     """Publication advice, not authorization or a replacement for CI checks."""
+    if code == "test_suite_selection_refused":
+        return "No tests ran. Retry with exactly one declared suite using suite=<name>."
     publish = (
         "After scoped tests pass, commit, push the fix to the PR branch, and "
         "re-request review. In the PR comment state that the in-runner full suite "
@@ -6658,6 +6705,32 @@ def _bind_injected_runtime(repo_tool: StructuredTool) -> StructuredTool:
     )
     repo_tool.__dict__.pop("_injected_args_keys", None)
     return repo_tool
+
+
+def build_repo_test_tool() -> StructuredTool:
+    """List current deployment declarations without mutating the shared tool."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return repo_test
+    try:
+        inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
+    except (OSError, RuntimeError, ValueError):
+        # Hints are not authority: invocation still validates configuration.
+        return repo_test
+    declarations = []
+    for record in inventory.repositories:
+        names = [suite.name for suite in record.test_suites]
+        if not names or (record.test_command is not None and not any(
+            suite.default for suite in record.test_suites
+        )):
+            names.insert(0, "default")
+        declarations.append(f"{record.slug}: {', '.join(names)}")
+    if not declarations:
+        return repo_test
+    return repo_test.model_copy(update={
+        "description": repo_test.description + "\nConfigured suites by repository: "
+        + "; ".join(declarations),
+    })
 
 
 REPO_TOOLS = tuple(_bind_injected_runtime(repo_tool) for repo_tool in (

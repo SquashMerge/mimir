@@ -1105,6 +1105,8 @@ def _factory(module: str, name: str) -> Callable[[], object]:
         from importlib import import_module
 
         source = import_module(module)
+        if module.endswith("repository") and name == "repo_test":
+            return source.build_repo_test_tool()
         if name in {"spawn_open_code", "spawn_claude_code"}:
             return getattr(source, name)
         if name in _BUILDS:
