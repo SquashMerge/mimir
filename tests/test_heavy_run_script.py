@@ -393,9 +393,11 @@ def test_retired_sweep_errors_are_nonfatal_and_sanitized(tmp_path: Path, monkeyp
     finally:
         os.close(fd)
     lines = capsys.readouterr().err.splitlines()
-    # Acquisition sweeps each slot name (slot 1, slot 2); only slot 1 has a
-    # retired directory, but a failing scan fails once per name.
-    expected = {"already-removed": 0, "delete": 1, "scan": 2} if operation == "acquire" else \
+    # Acquisition sweeps both slot names, then releases its queue ticket, which
+    # retires and removes the ticket directory and sweeps that name too. So a
+    # failing delete warns for slot 1's leftover and for the retired ticket, and
+    # a failing scan warns for each sweep (slot 1, slot 2, ticket twice).
+    expected = {"already-removed": 0, "delete": 2, "scan": 4} if operation == "acquire" else \
         {"already-removed": 0, "delete": 2, "scan": 2}
     assert len(lines) == expected[fault]
     for line in lines:
