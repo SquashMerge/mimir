@@ -1,4 +1,32 @@
-"""Portable directory lease implementation; public entry point is heavy_run.sh."""
+"""Portable directory lease implementation; public entry point is heavy_run.sh.
+
+v2 (2026-11-21): two slots and two tiers.
+
+* ``MIMIR_HEAVY_TIER=medium`` holds ONE slot. Two medium jobs can run at once.
+  Use it for verification, builds and tests whose timing is not being measured.
+* ``MIMIR_HEAVY_TIER=large`` (the default) holds BOTH slots, so it runs alone.
+  Use it for measurements and anything that needs a quiet machine.
+
+Slots are the lease directories ``<file>.lease`` (slot 1, the v1 name) and
+``<file>.lease2`` (slot 2). Every lease directory uses the v1 protocol: atomic
+mkdir, a heartbeat counter for staleness, and per-generation breaker claims.
+
+Compatibility: a v1 helper knows only slot 1 and writes no ``tier`` in its owner
+file. A slot-1 holder whose tier is missing or unreadable counts as large, and a
+medium job may take slot 2 only while slot 1 is held by a medium job, so a v2
+medium never starts beside a v1 holder. The reverse is NOT guaranteed: when the
+slot-1 medium of a medium pair exits first, a waiting v1 helper (which never
+looks at slot 2 or the intent) can take slot 1 and run beside the slot-2
+medium. v2 large jobs are not affected; they wait for both slots. Use the
+medium tier only once every participant on the lease runs this helper.
+
+Large jobs are not starved. A waiting large job first takes the intent lease
+``<file>.intent``. While it exists, no medium job starts. The large job then
+takes slot 1, then slot 2 (fixed order, so large jobs cannot deadlock each
+other), and releases the intent once it holds both. At most one medium job that
+was already starting can slip in ahead of it; the large job waits for that job
+to finish before its command starts.
+"""
 from __future__ import annotations
 
 import json
@@ -16,6 +44,8 @@ import uuid
 
 
 _pending_signal: int | None = None
+
+TIERS = ("medium", "large")
 
 
 class Interrupted(Exception):
@@ -65,14 +95,18 @@ def _write(fd: int, name: str, value: str) -> None:
     os.rename(name + ".tmp", name, src_dir_fd=fd, dst_dir_fd=fd)
 
 
-def _counter(fd: int) -> str | None:
+def _read(fd: int, name: str) -> str | None:
     try:
-        with open(os.open("heartbeat", os.O_RDONLY, dir_fd=fd)) as source:
+        with open(os.open(name, os.O_RDONLY, dir_fd=fd)) as source:
             return source.read()
     except FileNotFoundError:
-        # A creator may not yet have written its initial counter. Give it the
-        # same full monotonic grace period as a frozen heartbeat.
         return None
+
+
+def _counter(fd: int) -> str | None:
+    # A creator may not yet have written its initial counter. Give it the
+    # same full monotonic grace period as a frozen heartbeat.
+    return _read(fd, "heartbeat")
 
 
 def _cleanup_warning(path: Path, exc: OSError) -> None:
@@ -168,61 +202,174 @@ def _publish_generation(path: Path) -> None:
         os.umask(previous)
 
 
-def _acquire(path: Path, stale: float, interval: float) -> int:
-    _sweep_retired(path)
-    previous: tuple[tuple[int, int], str | None] | None = None
-    unchanged_since = time.monotonic()
+class Lease:
+    """One lease directory: non-blocking take, stale tracking, holder inspection."""
+
+    def __init__(self, path: Path, stale: float):
+        self.path = path
+        self.stale = stale
+        self._previous: tuple[tuple[int, int], str | None] | None = None
+        self._unchanged_since = time.monotonic()
+
+    def try_take(self) -> int | None:
+        """Return an fd for a freshly created generation, or None if held."""
+        try:
+            _publish_generation(self.path)
+        except FileExistsError:
+            pass
+        else:
+            return os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None  # Released between mkdir and open: retry next round.
+        try:
+            observation = (_identity(fd), _counter(fd))
+            now = time.monotonic()
+            if observation != self._previous:
+                self._previous, self._unchanged_since = observation, now
+            elif now - self._unchanged_since >= self.stale:
+                if _break_stale(self.path, fd, observation[1]):
+                    self._previous = None
+        finally:
+            os.close(fd)
+        return None
+
+    def holder_tier(self) -> str | None:
+        """None if free; the holder's tier if held. Unknown counts as large."""
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        try:
+            owner = _read(fd, "owner")
+        finally:
+            os.close(fd)
+        try:
+            tier = json.loads(owner).get("tier") if owner else None
+        except (ValueError, AttributeError):
+            tier = None
+        return tier if tier in TIERS else "large"
+
+
+def _hold(fd: int, tier: str, role: str) -> None:
+    _write(fd, "owner", json.dumps({
+        "host": socket.gethostname(), "pid": os.getpid(),
+        "start_time": time.time(),
+        "timeout": os.environ.get("MIMIR_HEAVY_LOCK_TIMEOUT", "7200"),
+        "tier": tier, "role": role,
+    }) + "\n")
+    _write(fd, "heartbeat", "0\n")
+
+
+class Heartbeat:
+    def __init__(self) -> None:
+        self.held: dict[Path, int] = {}
+        self.counter = 0
+
+    def beat(self) -> None:
+        self.counter += 1
+        for fd in self.held.values():
+            _write(fd, "heartbeat", f"{self.counter}\n")
+
+
+def _acquire(base: str, tier: str, stale: float, interval: float, hb: Heartbeat) -> None:
+    slot1 = Lease(Path(base + ".lease").absolute(), stale)
+    slot2 = Lease(Path(base + ".lease2").absolute(), stale)
+    intent = Lease(Path(base + ".intent").absolute(), stale)
+    for lease in (slot1, slot2, intent):
+        _sweep_retired(lease.path)
+    next_beat = time.monotonic() + interval
+
+    def take(lease: Lease, role: str) -> bool:
+        fd = lease.try_take()
+        if fd is None:
+            return False
+        hb.held[lease.path] = fd
+        _hold(fd, tier, role)
+        return True
+
     while True:
         _check_signal()
-        try:
-            _publish_generation(path)
-        except FileExistsError:
-            try:
-                fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            except FileNotFoundError:
-                continue
-            try:
-                observation = (_identity(fd), _counter(fd))
-                now = time.monotonic()
-                if observation != previous:
-                    previous, unchanged_since = observation, now
-                elif now - unchanged_since >= stale:
-                    if _break_stale(path, fd, observation[1]):
-                        previous = None
-                        continue
-            finally:
-                os.close(fd)
-            time.sleep(min(interval, 0.1))
+        if time.monotonic() >= next_beat:
+            hb.beat()  # Keep any lease we already hold (intent, slot 1) alive.
+            next_beat = time.monotonic() + interval
+        if tier == "large":
+            if intent.path not in hb.held:
+                take(intent, "intent")
+            if intent.path in hb.held:
+                if slot1.path not in hb.held:
+                    take(slot1, "slot1")
+                if slot1.path in hb.held and take(slot2, "slot2"):
+                    fd = hb.held.pop(intent.path)
+                    try:
+                        _release(intent.path, fd)
+                    finally:
+                        os.close(fd)
+                    return
         else:
-            return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            # Writer preference: a waiting large job blocks new medium jobs.
+            # try_take on the intent only for stale tracking; never keep it.
+            if intent.holder_tier() is not None:
+                fd = intent.try_take()  # Breaks a stale intent; else None.
+                if fd is not None:
+                    _release(intent.path, fd)
+                    os.close(fd)
+            elif take(slot1, "slot1"):
+                return
+            elif slot1.holder_tier() == "medium" and take(slot2, "slot2"):
+                return
+            else:
+                _probe_stale(slot2)
+        time.sleep(min(interval, 0.1))
+
+
+def _probe_stale(lease: Lease) -> None:
+    """Track a lease we are not trying to take, so a dead holder is broken.
+
+    Only reached when slot 1 is held by a large or unknown job, so slot 2 must
+    not be taken; but a SIGKILLed medium on slot 2 must still go stale.
+    """
+    try:
+        fd = os.open(lease.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    try:
+        observation = (_identity(fd), _counter(fd))
+        now = time.monotonic()
+        if observation != lease._previous:
+            lease._previous, lease._unchanged_since = observation, now
+        elif now - lease._unchanged_since >= lease.stale:
+            if _break_stale(lease.path, fd, observation[1]):
+                lease._previous = None
+    finally:
+        os.close(fd)
 
 
 def run(command: list[str]) -> int:
-    path = Path(os.environ["MIMIR_HEAVY_LOCK_FILE"] + ".lease").absolute()
+    base = os.environ["MIMIR_HEAVY_LOCK_FILE"]
+    tier = os.environ.get("MIMIR_HEAVY_TIER", "large") or "large"
+    if tier not in TIERS:
+        raise ValueError("MIMIR_HEAVY_TIER must be medium or large")
     stale = _seconds("MIMIR_HEAVY_STALE_SECONDS", "600")
     interval = _seconds("MIMIR_HEAVY_HEARTBEAT_SECONDS", "1")
     if interval >= stale:
         raise ValueError("heartbeat interval must be less than stale threshold")
     # Probe actual mkdir permission even when an existing lease means waiting.
-    with tempfile.TemporaryDirectory(prefix=".heavy-probe-", dir=path.parent):
+    with tempfile.TemporaryDirectory(prefix=".heavy-probe-",
+                                     dir=Path(base + ".lease").absolute().parent):
         pass
 
-    fd: int | None = None
+    hb = Heartbeat()
     child: subprocess.Popen | None = None
     handled = {signal.SIGINT, signal.SIGTERM}
     for sig in handled:
         signal.signal(sig, _interrupt)
     try:
-        fd = _acquire(path, stale, interval)
-        _write(fd, "owner", json.dumps({
-            "host": socket.gethostname(), "pid": os.getpid(),
-            "start_time": time.time(), "timeout": os.environ.get("MIMIR_HEAVY_LOCK_TIMEOUT", "7200"),
-        }) + "\n")
-        _write(fd, "heartbeat", "0\n")
+        _acquire(base, tier, stale, interval, hb)
         _check_signal()
         child = subprocess.Popen(command, start_new_session=True,
                                  env={**os.environ, "MIMIR_HEAVY_LOCK_HELD": "1"})
-        counter = 0
         next_heartbeat = time.monotonic() + interval
         while True:
             _check_signal()
@@ -231,8 +378,7 @@ def run(command: list[str]) -> int:
                 return status if status >= 0 else 128 - status
             except subprocess.TimeoutExpired:
                 if time.monotonic() >= next_heartbeat and child.poll() is None:
-                    counter += 1
-                    _write(fd, "heartbeat", f"{counter}\n")
+                    hb.beat()
                     next_heartbeat = time.monotonic() + interval
     except Interrupted as exc:
         return 128 + exc.signum
@@ -247,7 +393,9 @@ def run(command: list[str]) -> int:
             except ProcessLookupError:
                 pass
             child.wait()
-        if fd is not None:
+        # Release in reverse acquisition order: slot 2, slot 1, intent.
+        for path in sorted(hb.held, key=lambda p: p.name, reverse=True):
+            fd = hb.held[path]
             try:
                 _release(path, fd)
             finally:

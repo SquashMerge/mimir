@@ -238,6 +238,15 @@ umask, so participants need no shared group. `none`
 for `--heavy-lock-dir` clears both settings; omitting the flags on a rerun
 preserves them. Without a shared directory, no timeout is written. Outside setup,
 an unset timeout is not forwarded, so `heavy_run`'s own default applies.
+The lease has two slots. A command run with `MIMIR_HEAVY_TIER=medium` holds one,
+so two medium commands can share the host; `large` (the default) holds both and
+runs alone, and a waiting large command blocks new medium ones. Worklink forwards
+a `medium` or `large` tier set in the agent's environment the same way as the
+timeout (anything else fails closed); setup does not write one. Keep anything
+whose timing or footprint is measured on `large`. Set `medium` only once every
+participant on the shared directory runs this `heavy_run` version: an older
+helper waiting on the lease sees only the first slot, so it can start beside a
+medium command.
 
 `--embedding local` (the default) selects `voyageai/voyage-4-nano` at 1024
 dimensions on CPU. Its query and document vectors share Voyage 4's embedding
