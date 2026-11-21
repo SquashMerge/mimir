@@ -8,8 +8,9 @@
 # MIMIR_HEAVY_TIER=medium holds one slot, so two medium commands can share the
 # machine. large (the default) holds both and runs alone; a waiting large command
 # blocks new medium ones. Use large for anything whose timing is measured. A
-# holder without a recorded tier (an older helper) counts as large. See
-# heavy_run.py's docstring.
+# holder without a recorded tier (an older helper) counts as large, but an older
+# helper still WAITING sees only slot 1 and can start beside a medium: set medium
+# only once every participant on the lease runs this version. See heavy_run.py.
 #
 # The Python helper records host, pid, start time and timeout for humans. Only
 # its heartbeat counter determines staleness: waiters measure unchanged counters

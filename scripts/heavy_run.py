@@ -13,8 +13,12 @@ mkdir, a heartbeat counter for staleness, and per-generation breaker claims.
 
 Compatibility: a v1 helper knows only slot 1 and writes no ``tier`` in its owner
 file. A slot-1 holder whose tier is missing or unreadable counts as large, and a
-medium job may take slot 2 only while slot 1 is held by a medium job. So a v1
-holder still runs alone with respect to v2 jobs.
+medium job may take slot 2 only while slot 1 is held by a medium job, so a v2
+medium never starts beside a v1 holder. The reverse is NOT guaranteed: when the
+slot-1 medium of a medium pair exits first, a waiting v1 helper (which never
+looks at slot 2 or the intent) can take slot 1 and run beside the slot-2
+medium. v2 large jobs are not affected; they wait for both slots. Use the
+medium tier only once every participant on the lease runs this helper.
 
 Large jobs are not starved. A waiting large job first takes the intent lease
 ``<file>.intent``. While it exists, no medium job starts. The large job then

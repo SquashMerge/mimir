@@ -795,8 +795,9 @@ def test_stale_lease_recovers_across_identities_without_a_shared_group(
         err = waiter_log.read_text()
         assert waiter.returncode == 0, err
         assert done.exists()
-        assert err.count("retired stale lease") == 1, err
-        assert not _lease(locks).exists()
+        # The dead holder ran large (the default), so it left both slots to retire.
+        assert err.count("retired stale lease") == 2, err
+        assert not _lease(locks).exists() and not _slot(locks, "lease2").exists()
     finally:
         shutil.rmtree(shared, ignore_errors=True)
 
@@ -838,9 +839,12 @@ def paused(path, mode=0o777, **kwargs):
     while not Path({str(go)!r}).exists():
         time.sleep(.01)
 module.os.mkdir = paused
-fd = module._acquire(Path({str(lease)!r}), 600, 1)
-module._release(Path({str(lease)!r}), fd)
-os.close(fd)
+held = module.Heartbeat()
+module._acquire({str(locks / "heavy.lock")!r}, "medium", 600, 1, held)
+assert list(held.held) == [Path({str(lease)!r})]
+for path, fd in held.held.items():
+    module._release(path, fd)
+    os.close(fd)
 """)
         harness.chmod(0o644)
         probe = subprocess.run([sys.executable, "-c", "pass"], user=41001, group=41001,
@@ -968,3 +972,52 @@ def test_waiting_large_intent_blocks_new_medium_jobs(tmp_path: Path, monkeypatch
     rounds, taken = _medium_acquire_blocked_until(module, tmp_path, monkeypatch, intent)
     assert taken == [_slot(tmp_path, "lease").absolute()]
     assert rounds == (50 if waiting_large else 0)
+
+
+def test_medium_pair_handoff_keeps_a_v2_large_out_until_the_slot_two_medium_exits(tmp_path: Path, start) -> None:
+    # The slot-1 medium leaves first; slot 1 is free while slot 2's medium runs on.
+    entered = {name: tmp_path / f"{name}-in" for name in ("m1", "m2", "large")}
+    release = {name: tmp_path / f"{name}-release" for name in ("m1", "m2", "large")}
+    m1 = start(sys.executable, "-c", _marking_payload(entered["m1"], release["m1"]), MIMIR_HEAVY_TIER="medium")
+    _wait(entered["m1"].exists)
+    m2 = start(sys.executable, "-c", _marking_payload(entered["m2"], release["m2"]), MIMIR_HEAVY_TIER="medium")
+    _wait(entered["m2"].exists)
+    release["m1"].touch()
+    assert m1.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+    large = start(sys.executable, "-c", _marking_payload(entered["large"], release["large"]))
+    heartbeat = _slot(tmp_path, "lease2") / "heartbeat"
+    _wait(lambda: _slot(tmp_path, "lease").is_dir())  # The large job holds slot 1 ...
+    seen = int(heartbeat.read_text())
+    _wait(lambda: int(heartbeat.read_text()) >= seen + 8)
+    assert not entered["large"].exists()  # ... but waits for the slot-2 medium.
+    release["m2"].touch()
+    _wait(entered["large"].exists)
+    release["large"].touch()
+    for child in (m2, large):
+        assert child.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+
+
+def test_documented_gap_a_slot_one_only_helper_can_join_a_slot_two_medium(tmp_path: Path, start) -> None:
+    # Characterizes the limitation heavy_run.py documents: an older helper knows
+    # only slot 1, so after the handoff above it can take slot 1 beside the
+    # remaining slot-2 medium. That is why medium needs every participant
+    # upgraded. A change that closes the gap should flip this assertion.
+    module = _helper()
+    entered = {name: tmp_path / f"{name}-in" for name in ("m1", "m2")}
+    release = {name: tmp_path / f"{name}-release" for name in ("m1", "m2")}
+    m1 = start(sys.executable, "-c", _marking_payload(entered["m1"], release["m1"]), MIMIR_HEAVY_TIER="medium")
+    _wait(entered["m1"].exists)
+    m2 = start(sys.executable, "-c", _marking_payload(entered["m2"], release["m2"]), MIMIR_HEAVY_TIER="medium")
+    _wait(entered["m2"].exists)
+    release["m1"].touch()
+    assert m1.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+    slot1 = _slot(tmp_path, "lease")
+    fd = module.Lease(slot1.absolute(), 600).try_take()  # What a v1 helper does.
+    try:
+        assert fd is not None and _slot(tmp_path, "lease2").is_dir()
+    finally:
+        if fd is not None:
+            module._release(slot1.absolute(), fd)
+            os.close(fd)
+        release["m2"].touch()
+    assert m2.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
