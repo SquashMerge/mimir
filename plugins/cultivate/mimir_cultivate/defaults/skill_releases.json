@@ -780,6 +780,32 @@
   "review-trusted-evidence-first": {
     "review": {"SKILL.md": "b6799f8240d240c960e53279994a1aba5bd282993118d1facc912f8966293f37"}
   },
+  "2151-opencode-2-3-0": {
+    "worklink-tool-pins": {
+      "SKILL.md": "f275758b67462096961c557eb6c09e021f0a2e307667af1ce0447fcdd51d34b1",
+      "pollers.json": "0f1a6281e89ce354681add39dac58a9e95c12c5d4dfa6d3408c0fdf7bd897c4a",
+      "scripts/poller.py": "de83dba8293ac100a723de5398fcae560f083297fb862fd7e0c3438ff7dc972a",
+      "tests/conftest.py": "5df4b16fedf0d178373d2c2196d579d9571ecc0d7c5f1c394360b5b45a937c1a",
+      "tests/test_worklink_tool_pins_poller.py": "1ce74f66db36488f50afcb40ced0b7c45ff44c85a8ca7d5ad720145cd19a3603"
+    }
+  },
+  "2159-before-orphan-lock-reconciliation": {
+    "chainlink-orchestrator": {
+      "SKILL.md": "c87f1a120534a120e6124038450809600f0ebeaa221ad82c49b91dbc5c71ca0b",
+      "pollers.json": "7771c3d953de5a4a299053d523a34695205888a5bb83e7e9f7fc250125ba407d",
+      "scripts/poller.py": "82aeb0c121c28289a2f1320846b2b4659e09f0568cb6b51569621720c72ebd07"
+    }
+  },
+  "2159-orphan-lock-reconciliation": {
+    "chainlink-orchestrator": {
+      "SKILL.md": "c87f1a120534a120e6124038450809600f0ebeaa221ad82c49b91dbc5c71ca0b",
+      "pollers.json": "7771c3d953de5a4a299053d523a34695205888a5bb83e7e9f7fc250125ba407d",
+      "scripts/poller.py": "917c1d83fbb49f8aeaa885022a86aed037b81c889723e299d072d603f2202943"
+    }
+  },
+  "2161-own-pr-review-guidance": {
+    "review": {"SKILL.md": "469c464f82bd568a0a68ae0322828327bb0293836b04c37308c22e875e6fd6e2"}
+  },
   "2150-own-unpublished-commits": {
     "github-poller": {
       "SKILL.md": "447fe0837379d781f1d3050bb157990846d42dfbff8a2a96928a986e2c36b6d9",
@@ -806,5 +832,8 @@
   },
   "2126-claude-subscription": {
     "review": {"SKILL.md": "3e3c21aece2e5b6f61a8444f709e5ed06232903bf9ff3a423de530353183ffbf"}
+  },
+  "2126-claude-subscription-main-integration": {
+    "review": {"SKILL.md": "df96be0c131e321fb236ac511b8363f7ab52f3b805e606fd4b5e0922bd98ad16"}
   }
 }

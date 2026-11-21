@@ -23,8 +23,10 @@ from mimir_cultivate.worklink.evidence import (
     validate_evidence,
 )
 from mimir_cultivate.worklink.factory_state import (
+    archive_factory_record,
     FactoryRecordError,
     FactoryRunRecord,
+    list_factory_records,
     load_factory_record,
     parse_factory_status,
     save_factory_record,
@@ -106,6 +108,26 @@ def test_factory_record_refuses_symlinked_store(tmp_path: Path) -> None:
     (home / "state" / "worklink").symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(FactoryRecordError, match="not contained"):
         save_factory_record(home, _factory_record(tmp_path))
+
+
+@pytest.mark.parametrize("legacy_key", [False, True])
+def test_archive_listing_keeps_all_attempts_and_collision_suffixes(
+    tmp_path: Path, legacy_key: bool,
+) -> None:
+    record = _factory_record(tmp_path)
+    if legacy_key:
+        record = replace(record, run_id=str(record.issue_id))
+    expected = (record, record, replace(record, attempt=2))
+    paths = []
+    for candidate in expected:
+        save_factory_record(tmp_path, candidate)
+        paths.append(archive_factory_record(tmp_path, candidate))
+
+    assert len(set(paths)) == 3
+    assert list_factory_records(tmp_path).records == ()
+    listing = list_factory_records(tmp_path, archived=True)
+    assert listing.failures == ()
+    assert listing.records == expected
 
 
 def test_session_handle_roundtrip_and_historical_defaults(tmp_path: Path) -> None:

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from mimir.saga.ownership import (
     Ownership,
     Visibility,
     intersect_acl,
+    intersect_acl_from_rows,
     is_user_accessible,
 )
 
@@ -198,6 +200,112 @@ def test_intersect_acl_same_owner_domain_keeps_common_authority() -> None:
     assert result.origin_domain == "tenant:one"
     assert result.visibility == Visibility.PRIVATE
     assert result.provenance == {"a": 1, "b": 2}
+
+
+def test_intersect_acl_from_rows_json_null_fails_closed() -> None:
+    row = {
+        "owner_principal": "user:123",
+        "origin_channel": "channel:one",
+        "origin_domain": "tenant:one",
+        "visibility": "public",
+        "provenance": "null",
+    }
+
+    assert intersect_acl_from_rows([row]) == Ownership()
+
+
+@pytest.mark.parametrize(
+    "provenance_json",
+    ["null", "[]", '"x"', "0", "true", "[1]", '[["atom", "a1"]]'],
+    ids=["null", "list", "string", "number", "boolean", "nonempty-list", "pairs"],
+)
+@pytest.mark.parametrize("position", [0, 1], ids=["first", "later"])
+def test_intersect_acl_non_mapping_provenance_fails_closed(
+    provenance_json: str, position: int,
+) -> None:
+    malformed = replace(_owned(), provenance=json.loads(provenance_json))
+    acls = [_owned()]
+    acls.insert(position, malformed)
+
+    result = intersect_acl(acls)
+
+    assert result.visibility == Visibility.LEGACY_ADMIN
+    assert result.owner_principal == "legacy_admin"
+    assert result == Ownership()
+
+
+@pytest.mark.parametrize(
+    "provenance_json", ["null", "[]", '"x"', "0", "true", "[1]", '[["atom", "a1"]]'],
+)
+@pytest.mark.parametrize("position", [0, 1], ids=["first", "later"])
+@pytest.mark.parametrize("encoded", [False, True], ids=["decoded", "json"])
+def test_intersect_acl_from_rows_non_mapping_provenance_fails_closed(
+    provenance_json: str, position: int, encoded: bool,
+) -> None:
+    proven = {
+        "owner_principal": "user:123",
+        "origin_channel": "channel:one",
+        "origin_domain": "tenant:one",
+        "visibility": "public",
+        "provenance": {"atom": "a1"},
+    }
+    malformed = {
+        **proven,
+        "provenance": provenance_json if encoded else json.loads(provenance_json),
+    }
+    rows = [proven]
+    rows.insert(position, malformed)
+
+    assert intersect_acl_from_rows(rows) == Ownership()
+
+
+@pytest.mark.parametrize(
+    ("first_visibility", "second_visibility", "expected_visibility"),
+    [
+        ("public", "public", Visibility.PUBLIC),
+        ("private", "public", Visibility.PRIVATE),
+        ("public", "private", Visibility.PRIVATE),
+        ("service", "private", Visibility.SERVICE),
+        ("private", "service", Visibility.SERVICE),
+        ("service", "legacy_admin", Visibility.LEGACY_ADMIN),
+    ],
+)
+@pytest.mark.parametrize("mapping_type", [dict, MappingProxyType])
+def test_intersect_acl_valid_mappings_preserve_union_and_visibility(
+    first_visibility: str, second_visibility: str, expected_visibility: Visibility,
+    mapping_type: type,
+) -> None:
+    first = _owned(visibility=first_visibility, provenance={"a": 1, "shared": "first"})
+    second = _owned(visibility=second_visibility, provenance={"b": 2, "shared": "last"})
+    result = intersect_acl([
+        replace(first, provenance=mapping_type(first.provenance)),
+        replace(second, provenance=mapping_type(second.provenance)),
+    ])
+
+    if expected_visibility == Visibility.LEGACY_ADMIN:
+        assert result == Ownership()
+    else:
+        assert result == replace(
+            first, visibility=expected_visibility,
+            provenance={"a": 1, "b": 2, "shared": "last"},
+        )
+    assert first.provenance == {"a": 1, "shared": "first"}
+    assert second.provenance == {"b": 2, "shared": "last"}
+
+
+def test_intersect_acl_from_rows_valid_provenance_union() -> None:
+    first = {
+        "owner_principal": "user:123",
+        "origin_channel": "channel:one",
+        "origin_domain": "tenant:one",
+        "visibility": "public",
+        "provenance": '{"a":1}',
+    }
+    second = {**first, "visibility": "private", "provenance": {"b": 2}}
+
+    assert intersect_acl_from_rows([first, second]) == _owned(
+        visibility="private", provenance={"a": 1, "b": 2},
+    )
 
 
 @pytest.mark.parametrize(

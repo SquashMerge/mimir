@@ -1,6 +1,6 @@
-"""Explicitly imported, offline OpenCode 2.2.7 contract support.
+"""Explicitly imported, offline OpenCode 2.3.0 contract support.
 
-The probe responses and the session-lifecycle capture are recorded. Execution
+The 2.3.0 probe responses and historical 2.2.7 lifecycle capture are recorded. Execution
 outcomes and fault/race controls below are synthetic scenarios shaped to match
 that capture (message history, inbox and the watermark-only log endpoint).
 """
@@ -27,7 +27,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "worklink"
 
 class OpenCodeSchema:
     def __init__(self) -> None:
-        self.document = json.loads((FIXTURES / "opencode_2_2_7/openapi.json").read_bytes())
+        self.document = json.loads((FIXTURES / "opencode_2_3_0/openapi.json").read_bytes())
 
     def validate(self, value: Any, schema: dict[str, Any]) -> None:
         Draft202012Validator({**schema, "components": self.document["components"]}).validate(value)
@@ -45,7 +45,7 @@ def effective_permission(
 ) -> str:
     """Finite native-core model: agent then session, final deny before grants.
 
-    Source: retained supplement F3, embedded uD/H/YQ/findLast in 2.2.7.
+    Source: opencode_2_3_0/source-inspection.json (native findLast evaluator).
     This is test support for the enumerated wildcard policies, not a public
     evaluator or a claim of live provider/tool execution.
     """
@@ -68,7 +68,9 @@ class SyntheticSession:
     inbox: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
     log: list[dict[str, Any]] = field(default_factory=list)
+    forms: list[dict[str, Any]] = field(default_factory=list)
     active: bool = False
+    replies: list[dict[str, Any]] = field(default_factory=list)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -83,11 +85,11 @@ class SyntheticFault:
 
 
 class FakeOpenCodeDaemon:
-    scenario_provenance = "synthetic: OpenCode 2.2.7 schema and inspected source"
+    scenario_provenance = "synthetic: OpenCode 2.3.0 schema and inspected source"
 
     def __init__(self) -> None:
         self.schema = OpenCodeSchema()
-        self.recorded = json.loads((FIXTURES / "opencode_2_2_7/probe-result.json").read_bytes())
+        self.recorded = json.loads((FIXTURES / "opencode_2_3_0/probe-result.json").read_bytes())
         self.username = "opencode"
         self.password = secrets.token_urlsafe(24)
         self.sessions: dict[str, SyntheticSession] = {}
@@ -97,8 +99,9 @@ class FakeOpenCodeDaemon:
         self.delete_race = False
         self.interrupt_noop = False
         self.command_prompts = True
-        #: Background shells by id. A shell outlives its session's turn, as in 2.2.7.
+        #: Synthetic background shells by id, using the 2.3.0 shell contract.
         self.shells: dict[str, dict[str, Any]] = {}
+        self.session_page_limit = 100
         self._counter = 0
         self._closing = False
         self.app = web.Application()
@@ -113,6 +116,8 @@ class FakeOpenCodeDaemon:
             "/api/session/{sessionID}/inbox": ["GET"],
             "/api/session/{sessionID}/inbox/{inboxID}": ["DELETE"],
             "/api/session/{sessionID}/interrupt": ["POST"],
+            "/api/session/{sessionID}/form": ["GET"],
+            "/api/session/{sessionID}/form/{formID}/reply": ["POST"],
             "/api/experimental/session/{sessionID}/log": ["GET"],
             "/api/shell": ["GET"], "/api/shell/{id}": ["DELETE"],
         }
@@ -144,6 +149,40 @@ class FakeOpenCodeDaemon:
         self._counter += 1
         return f"{prefix}_{self._counter:024d}"
 
+    def new_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Native Session.create model; explicit rules replace inherited rules.
+
+        Pinned by source-inspection's session_parent_lookup and
+        session_permission_inheritance; subagent_session_create omits rules.
+        """
+        operation = self.schema.operation("/api/session", "POST")
+        self.schema.validate(payload, operation["requestBody"]["content"]["application/json"]["schema"])
+        info = json.loads(self.recorded["responses"]["POST /api/session location"]["body"])["data"]
+        info.update(copy.deepcopy(payload))
+        if payload.get("parentID"):
+            parent = self.sessions[payload["parentID"]].info
+            info["location"] = copy.deepcopy(parent["location"])
+            if payload.get("permissions") is None:
+                info["permissions"] = copy.deepcopy(parent.get("permissions", []))
+        info["id"] = self._id("ses")
+        self.schema.named("Session.Info", info)
+        self.sessions[info["id"]] = SyntheticSession(info)
+        return info
+
+    def question(self, session_id: str, updated_ms: float | None = None, *, title: str = "Questions",
+                 text: str = "Extend the slice with six test paths?") -> dict[str, Any]:
+        """Inject a pending question despite policy, to test the read-only backstop."""
+        form = {"id": self._id("frm"), "sessionID": session_id, "title": title,
+                "metadata": {"kind": "question"}, "fields": [
+                    {"key": "q0", "type": "string", "title": "Test paths", "description": text,
+                     "options": [{"value": label, "label": label} for label in (
+                         "Approve test-path amendment", "Keep current paths")], "custom": True}]}
+        self.schema.named("Form.Info", form)
+        self.sessions[session_id].forms.append(form)
+        if updated_ms is not None:
+            self.sessions[session_id].info["time"]["updated"] = updated_ms
+        return form
+
     def emit(self, session_id: str, event_type: str, **data: Any) -> dict[str, Any]:
         state = self.sessions[session_id]
         event = {
@@ -165,8 +204,27 @@ class FakeOpenCodeDaemon:
                   item={key: item[key] for key in ("type", "payload", "delivery")})
         return item
 
+    def child(self, parent_id: str, *, updated_ms: float, directory: str | None = None) -> str:
+        info = copy.deepcopy(self.sessions[parent_id].info)
+        sid = self._id("ses")
+        info.update(id=sid, parentID=parent_id, time={"created": updated_ms, "updated": updated_ms})
+        if directory is not None:
+            info["location"] = {"directory": directory}
+        self.schema.named("Session.Info", info)
+        self.sessions[sid] = SyntheticSession(info)
+        return sid
+
+    def activity(self, session_id: str, updated_ms: float) -> None:
+        """A durable assistant message also advances Session.Info.time.updated."""
+        state = self.sessions[session_id]
+        message = {"id": self._id("msg"), "type": "assistant", "time": {"created": updated_ms},
+                   "agent": "build", "model": {"providerID": "openai", "id": "gpt-test"}, "content": []}
+        self.schema.named("Session.Message.Assistant", message)
+        state.messages.append(message)
+        state.info["time"]["updated"] = updated_ms
+
     def enqueue_synthetic(self, session_id: str, shell_id: str) -> dict[str, Any]:
-        """Queue what a finished background shell queues: a ``synthetic`` resume (2.2.7 schema)."""
+        """Queue what a finished background shell queues: a ``synthetic`` resume (2.3.0 schema)."""
         shell = self.shells[shell_id]
         item = {"id": self._id("msg"), "sessionID": session_id, "time": {"created": 3}, "type": "synthetic",
                 "payload": {"text": f"Background shell {shell_id} finished.", "description": "shell finished",
@@ -213,9 +271,24 @@ class FakeOpenCodeDaemon:
     def start_shell(self, session_id: str, directory: str, command: str = "sh scripts/heavy_run.sh pytest") -> str:
         shell_id = self._id("sh")
         self.shells[shell_id] = {"id": shell_id, "status": "running", "command": command, "cwd": directory,
-                                 "shell": "/bin/sh", "file": f"/tmp/{shell_id}.log", "pid": 4242,
+                                 "shell": "/bin/sh", "file": f"/tmp/{shell_id}.log", "pid": 1073741824,
                                  "metadata": {"sessionID": session_id}, "time": {"started": 1}}
         return shell_id
+
+    def child_session(self, parent_id: str, directory: str) -> str:
+        info = copy.deepcopy(self.sessions[parent_id].info)
+        info.update(id=self._id("ses"), parentID=parent_id, location={"directory": directory})
+        self.schema.named("Session.Info", info)
+        self.sessions[info["id"]] = SyntheticSession(info)
+        return info["id"]
+
+    def move_session(self, session_id: str, directory: str) -> None:
+        state = self.sessions[session_id]
+        message = {"id": self._id("msg"), "time": {"created": 2}, "type": "location-switched",
+                   "location": {"directory": directory}, "previous": {"location": state.info["location"]}}
+        self.schema.named("Session.Message.LocationSwitched", message)
+        state.messages.append(message)
+        state.info["location"] = {"directory": directory}
 
     def end_shell(self, shell_id: str, status: str = "exited", *, resume: bool = False) -> None:
         """Finish a shell; ``resume`` queues the daemon's synthetic resume, not yet admitted."""
@@ -265,13 +338,21 @@ class FakeOpenCodeDaemon:
             return web.Response(body=self.recorded["responses"][path]["body"].encode(), content_type="text/event-stream")
         if path == "/api/session":
             if request.method == "GET":
-                return self._response(request, {"data": [s.info for s in self.sessions.values()],
-                                                "cursor": {"previous": None, "next": None}})
-            info = json.loads(self.recorded["responses"]["POST /api/session location"]["body"])["data"]
-            info.update(copy.deepcopy(payload))
-            info["id"] = self._id("ses")
-            self.sessions[info["id"]] = SyntheticSession(info)
-            return self._response(request, {"data": info})
+                # Opaque cursor retains the original query, as the native list does.
+                query = dict(request.query)
+                offset = 0
+                if "cursor" in query:
+                    query, offset = json.loads(base64.urlsafe_b64decode(query["cursor"]))
+                data = [s.info for s in self.sessions.values()
+                        if "parentID" not in query or s.info.get("parentID") == query["parentID"]]
+                if query.get("order", "desc") == "desc":
+                    data.reverse()
+                limit = min(int(query.get("limit", "50")), self.session_page_limit)
+                cursor = (base64.urlsafe_b64encode(json.dumps([query, offset + limit]).encode()).decode()
+                          if offset + limit < len(data) else None)
+                return self._response(request, {"data": data[offset:offset + limit],
+                                                "cursor": {"previous": None, "next": cursor}})
+            return self._response(request, {"data": self.new_session(payload)})
         if path == "/api/shell":
             directory = request.query.get("location[directory]")
             return self._response(request, {"location": {"directory": directory or "/"}, "data": [
@@ -289,6 +370,14 @@ class FakeOpenCodeDaemon:
             return self._response(request, {"_tag": "SessionNotFoundError", "sessionID": session_id,
                                             "message": "Synthetic session not found"}, 404)
         state = self.sessions[session_id]
+        if path.endswith("/form"):
+            return self._response(request, {"data": state.forms})
+        if path.endswith("/reply"):
+            # The request validator above pins this to Form.Reply, not a made-up
+            # answers array. Recording and removing it makes auto-reply observable.
+            state.replies.append(copy.deepcopy(payload))
+            state.forms[:] = [f for f in state.forms if f["id"] != request.match_info["formID"]]
+            return self._response(request, None, 204)
         if path.endswith("/log"):
             return await self._log(request, session_id)
         if path.endswith("/environment"):
@@ -350,7 +439,7 @@ class FakeOpenCodeDaemon:
         }})
 
     async def _log(self, request: web.Request, session_id: str) -> web.StreamResponse:
-        """Captured 2.2.7 behaviour: only the ``log.synced`` watermark is served.
+        """Watermark-only model, also observed by the 2.3.0 queued-input probe.
 
         Live follow and ``after=0`` replay both omitted every durable event on the
         real daemon (``opencode_2_2_7/session-lifecycle.json``); follow then stays

@@ -1003,8 +1003,8 @@ jobs:
       - name: Set up Python 3.11
         run: uv python install 3.11
 
-      - name: Sync dependencies (with Claude Code extra)
-        run: uv sync --extra dev --extra claude-code
+      - name: Sync dependencies (with Claude Code extra and Cultivate)
+        run: uv sync --all-packages --extra dev --extra claude-code
 
       - name: Verify adapter, enforcement hook and bridged tool execution
         run: |
@@ -1016,7 +1016,7 @@ jobs:
           patches.ensure_tool_enforcement_hooks_installed(langchain_claude_code)
           print("claude-code adapter smoke ok")
           PY
-          uv run --extra dev --extra claude-code pytest -q -n 0 tests/test_langchain_claude_code_patches.py::test_bridged_structured_tool_executes
+          MIMIR_REQUIRE_CLAUDE_SDK=1 uv run --all-packages --extra dev --extra claude-code pytest -q -n 0 tests/test_langchain_claude_code_patches.py::test_bridged_structured_tool_executes tests/test_claude_code_sdk.py tests/test_claude_code.py
 
   frontend:
     runs-on: ubuntu-24.04

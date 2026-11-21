@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from argparse import Namespace
+import asyncio
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,9 @@ import pytest
 from benchmarks.longmemeval_via_memory import runner
 from mimir.access_control import create_auth_context, create_local_operator_auth_context
 from mimir._context import reset_current_turn, set_current_turn
-from mimir._deepagents_subagent_auth import _subagent_auth_context, _wrap_task_tool
+from mimir._deepagents_subagent_auth import (
+    _subagent_auth_context, _wrap_task_tool, is_delegated_execution,
+)
 from mimir.commitments import cli as commitments_cli
 from mimir.models import AgentEvent, InformationFlowLabels, TurnContext, TurnInteractivity
 from mimir.plugins.registry import PolicyRegistry
@@ -220,6 +223,42 @@ async def test_async_subagent_task_uses_rescoped_live_state_not_foreign_runtime(
     assert refused is foreign and refused.plugin_state("example") is None
     assert lookalike is None
     assert _subagent_auth_context.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("carrier", ["valid", "missing", "invalid"])
+async def test_delegated_execution_is_nested_thread_safe_and_parent_task_local(carrier: str) -> None:
+    auth = create_auth_context(AgentEvent(trigger="user_message", channel_id="channel", author="user"))
+    runtime = SimpleNamespace(context={"valid": auth, "missing": None, "invalid": object()}[carrier])
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    def nested(**_kwargs):
+        assert is_delegated_execution()
+        raise RuntimeError("nested child failed")
+
+    nested_task = _wrap_task_tool(SimpleNamespace(func=nested, coroutine=None))
+
+    async def child(**_kwargs):
+        assert is_delegated_execution()
+        # A missing nested carrier must not erase the lifecycle restriction.
+        with pytest.raises(RuntimeError, match="nested child failed"):
+            await asyncio.to_thread(nested_task.func, runtime=SimpleNamespace(context=None))
+        assert is_delegated_execution()
+        entered.set()
+        await release.wait()
+        raise RuntimeError("child failed")
+
+    task = _wrap_task_tool(SimpleNamespace(func=None, coroutine=child))
+    running = asyncio.create_task(task.coroutine(runtime=runtime))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        # A concurrent parent retains ownership while its child is active.
+        assert not is_delegated_execution()
+    finally:
+        release.set()
+        with pytest.raises(RuntimeError, match="child failed"):
+            await running
+    assert not is_delegated_execution()
 
 
 class _AuthContextConstructorVisitor(ast.NodeVisitor):

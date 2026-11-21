@@ -364,6 +364,10 @@ async def main():
     handle = client._admission_handle(response, {generation!r})
     outcome = await client.session_observe(handle)
     assert outcome.execution_state == 'succeeded', outcome
+    activity = await client.session_tree_activity(handle)
+    assert activity['opencode_session_id'] == handle.identifier
+    assert activity['last_activity_session_id'] == handle.identifier
+    assert activity['pending_form'] is False and activity['running_shell'] is False
     await client.session_cancel(handle)
     await client.session_release(handle)
     hooks = issued.path / 'worker-hooks'

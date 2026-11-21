@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.plugin_selection import cultivate_selected
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
 
 from mimir import access_control
 from mimir._context import reset_current_turn, set_current_turn
@@ -130,7 +131,7 @@ assert not any(name.startswith('mimir_cultivate') for name in sys.modules)
     environment.pop("MIMIR_PLUGINS", None)
     child = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path)], env=environment,
-        capture_output=True, text=True, timeout=20,
+        capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert child.returncode == 0, child.stderr
 
@@ -10723,6 +10724,24 @@ def test_untrusted_pr_cause_is_bounded(tmp_path, monkeypatch):
                         lambda name, **fields: events.append((name, fields)))
     assert _github_poller_auth(authority, item).repo_pr_action_scope is None
     assert events[0][1]["cause"] == "author_unresolved"
+
+
+@pytest.mark.usefixtures("selected_repository_policy")
+@pytest.mark.parametrize("enforce", [False, True])
+def test_own_pr_review_scope_denial_preserves_authorization(enforce):
+    from mimir.access_control import authorize_repo_pr_tool, ToolFlowDirection
+    from tests.test_budget_gate_and_alias import _issued_refusal_scope
+
+    decision = authorize_repo_pr_tool(
+        "pr_submit_review", _issued_refusal_scope(),
+        service_principal=None, enforce=enforce,
+        required_actions=("pr.review",), flow_direction=ToolFlowDirection.SINK,
+    )
+    assert decision.allowed is (not enforce)
+    assert decision.reason == "repo_pr_scope_denied"
+    assert decision.would_block is True
+    assert decision.is_shadow_decision is (not enforce)
+    assert "You authored this PR" in decision.refusal_detail
 
 
 @pytest.mark.usefixtures("selected_repository_policy")

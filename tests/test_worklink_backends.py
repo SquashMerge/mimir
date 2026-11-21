@@ -1201,7 +1201,11 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
         test_command="uv run pytest -q",
     )
     assert spec.local_argv is None
-    assert spec.session_request.text == "-starts with dash"
+    assert spec.session_request.text.endswith("\n\n-starts with dash")
+    assert [
+        line.removeprefix("- `").removesuffix("`")
+        for line in spec.session_request.text.splitlines() if line.startswith("- `")
+    ] == list(spec.session_request.shell_allowlist)
     assert spec.session_request.model == {"providerID": "openai", "id": "gpt-5.6-luna", "variant": "high"}
     compute_result = session_result(stdout="done")
     result = await backend.interpret(order, compute_result)
@@ -2202,6 +2206,7 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
 
     permission = session_permissions(spec.session_request)
     assert permission == [{"action": "external_directory", "resource": "*", "effect": "deny"},
+        {"action": "question", "resource": "*", "effect": "deny"},
         *[{"action": "read", "resource": pattern, "effect": "deny"}
           for pattern in (".env", "**/.env", "**/.env.*")]]
 

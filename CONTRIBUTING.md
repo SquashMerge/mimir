@@ -77,6 +77,22 @@ only the memory backend, not the agent loop or BudgetGate, and is not
 agent-loop evidence. Memory-backend changes (`mimir/saga/`) are covered by
 `tests/test_saga_*` in the main test suite; no separate `cd` is needed.
 
+### Property tests (nightly)
+
+`property_tests/` holds Hypothesis property campaigns for authorization,
+information-flow control, SAGA restricted reads and Worklink lock coordination.
+They are outside `testpaths`, so the default `pytest` run and PR checks never
+collect them. `.github/workflows/nightly-property.yml` runs them on Linux every
+night and on demand (`workflow_dispatch`). Run them locally with:
+
+```bash
+uv run --all-packages --extra dev --extra bench pytest -q property_tests
+```
+
+A confirmed defect gets a small deterministic regression beside the property
+that found it. Each property keeps its own calibrated `max_examples`;
+`property_tests/conftest.py` sets the run-wide Hypothesis profile.
+
 ### Run both, and require both green
 
 Tests have a 300-second per-test bound via pytest-timeout's POSIX `signal`

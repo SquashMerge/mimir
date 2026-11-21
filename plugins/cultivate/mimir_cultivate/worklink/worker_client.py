@@ -32,7 +32,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v19-independent-retirement"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v22-claude-retained-recovery"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
@@ -285,7 +285,8 @@ class WorkerProcess:
 
 class WorkerClient:
     async def _session_rpc(self, operation: str, payload: Mapping[str, object]) -> dict[str, Any]:
-        if operation not in {"session_create", "session_observe", "session_cancel", "session_release"}:
+        if operation not in {"session_create", "session_observe", "session_cancel", "session_release", "session_tree_activity",
+                             "session_rearm", "session_release_quiescent", "session_resume"}:
             raise ValueError("invalid session operation")
         if self.checkout is None and self.path_checkout is None:
             raise ValueError("session operation requires an issued checkout capability")
@@ -347,6 +348,11 @@ class WorkerClient:
                 # quiescence failure surfaced only as "quiescence unverified".
                 logging.getLogger(__name__).warning("worklink session %s failed: %s", operation, detail)
                 raise RuntimeError(f"session executor operation failed: {detail}")
+            if set(response) == {"controller_busy"} and response["controller_busy"] is True:
+                # No session outcome was observed. The durable-session wait loop
+                # retries this just like a lost transport, without cancelling the
+                # host or manufacturing a backend_error. Other failures stay fatal.
+                raise SessionTransportLostError("controller_busy")
             if output is not None:
                 captured, dropped = output.read_bounded()
                 response["stdout"] = captured.decode("utf-8", "ignore")
@@ -380,6 +386,10 @@ class WorkerClient:
             if recovered is None:
                 raise SessionAdmissionError(uncertain=False, generation=str(generation)) from None
             return recovered
+        if response.get("admission_state") == "refused":
+            error = SessionAdmissionError(uncertain=True, generation=str(generation))
+            error.args = ("retained session admission refused: " + str(response.get("reason", "unverified"))[:128],)
+            raise error
         if response.get("admission_state") == "conflict":
             raise SessionAdmissionError(uncertain=True, generation=str(generation),
                                         handle=self._admission_handle(response, str(generation)))
@@ -449,12 +459,44 @@ class WorkerClient:
     async def session_cancel(self, handle: LaunchHandle) -> None:
         response = await self._session_handle_rpc("session_cancel", handle)
         if response.get("cancellation_state") != "verified":
-            raise RuntimeError("session cancellation unverified; retain checkout")
+            from ..opencode import redact_daemon_output
+
+            detail = response.get("cleanup_error")
+            raise RuntimeError("session cancellation unverified; retain checkout" +
+                               (": " + redact_daemon_output(detail)[:8192] if isinstance(detail, str) else ""))
+
+    async def session_tree_activity(self, handle: LaunchHandle) -> dict[str, Any]:
+        from .daemon_sessions import _identifier, _number
+
+        response = await self._session_handle_rpc("session_tree_activity", handle)
+        if (set(response) != {"opencode_session_id", "last_activity_at_ms", "last_activity_session_id",
+                              "pending_form", "running_shell"}
+                or response["opencode_session_id"] != handle.identifier
+                or not _identifier(response["last_activity_session_id"], "ses")
+                or not _number(response["last_activity_at_ms"])
+                or not 0 <= response["last_activity_at_ms"] <= 253402300799999
+                or type(response["pending_form"]) is not bool or type(response["running_shell"]) is not bool):
+            raise RuntimeError("invalid session tree activity")
+        return response
 
     async def session_release(self, handle: LaunchHandle) -> None:
         response = await self._session_handle_rpc("session_release", handle)
         if response != {"released": True}:
             raise RuntimeError("session release unverified; retain checkout")
+
+    async def session_rearm(self, handle: LaunchHandle) -> str:
+        response = await self._session_handle_rpc("session_rearm", handle)
+        if response not in ({"recovery": "fresh"}, {"recovery": "reattach"}, {"recovery": "continued"}):
+            raise RuntimeError("retained_recovery_unverified")
+        return response["recovery"]
+
+    async def session_release_quiescent(self, handle: LaunchHandle) -> None:
+        if await self._session_handle_rpc("session_release_quiescent", handle) != {"released": True}:
+            raise RuntimeError("retained_release_unverified")
+
+    async def session_resume(self, handle: LaunchHandle) -> None:
+        if await self._session_handle_rpc("session_resume", handle) != {"resumed": True}:
+            raise RuntimeError("retained_resume_unverified")
 
     def __init__(
         self,
@@ -541,6 +583,22 @@ class WorkerClient:
         except Exception:
             sock.close()
             raise
+
+    def delete_attempt(self) -> None:
+        """Ask the ownership boundary to remove exactly this path-addressed leaf."""
+        request = {
+            "version": 1, "op": "delete_attempt",
+            "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            "path": str(self.path_checkout), "issue": self.issue_id, "attempt": self.attempt,
+        }
+        sock = self._connect(120)
+        try:
+            sock.send(json.dumps(request, separators=(",", ":")).encode())
+            response = json.loads(sock.recv(4096))
+        finally:
+            sock.close()
+        if response != {"status": "deleted", "path": str(self.path_checkout)}:
+            raise RuntimeError(f"worker executor attempt deletion failed: {response}")
 
     def factory_file_operation(
         self,

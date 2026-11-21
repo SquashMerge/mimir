@@ -724,9 +724,12 @@ def save_factory_record(home: Path, record: FactoryRunRecord) -> Path:
 
 
 def _read_factory_record(home: Path, run_id: str) -> tuple[dict[str, Any], bytes] | None:
-    if not _require_safe_directory(factory_records_dir(home), create=False):
+    return _read_factory_record_path(factory_record_path(home, run_id))
+
+
+def _read_factory_record_path(path: Path) -> tuple[dict[str, Any], bytes] | None:
+    if not _require_safe_directory(path.parent, create=False):
         return None
-    path = factory_record_path(home, run_id)
     try:
         value = path.lstat()
     except FileNotFoundError:
@@ -925,17 +928,19 @@ def _archive_factory_record(
     return destination
 
 
-def list_factory_records(home: Path) -> FactoryRecordListing:
-    directory = factory_records_dir(home)
+def list_factory_records(home: Path, *, archived: bool = False) -> FactoryRecordListing:
+    """List live records by default, or archive evidence without reactivating it."""
+    directory = factory_record_archive_dir(home) if archived else factory_records_dir(home)
     if not _require_safe_directory(directory, create=False):
         return FactoryRecordListing((), ())
     records: list[FactoryRunRecord] = []
     failures: list[FactoryRecordLoadFailure] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
-        if not path.name.endswith(".json") or not _valid_record_run_id(path.stem):
+        if not path.name.endswith(".json") or (not archived and not _valid_record_run_id(path.stem)):
             continue
         try:
-            record = load_factory_record(home, path.stem)
+            loaded = _read_factory_record_path(path)
+            record = FactoryRunRecord.from_json(loaded[0]) if loaded is not None else None
         except Exception as exc:
             failures.append(
                 FactoryRecordLoadFailure(path, f"{type(exc).__name__}: {exc}")

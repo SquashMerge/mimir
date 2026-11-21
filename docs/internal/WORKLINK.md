@@ -15,6 +15,13 @@ notes below describe the original architecture, not the current package boundary
 
 ## OpenCode 2 daemon operation
 
+OpenCode 2.3.0 combines agent permissions then session permissions and uses the
+last matching rule, with final deny before persisted project grants. An agent's
+own `permissions` replace the host default list, rather than inheriting its broad
+allow baseline. Factory 0.14.1 explicitly supplies that baseline before its own
+narrower denies. Native source excerpts and a credential-free registration probe
+are retained in `tests/fixtures/worklink/opencode_2_3_0/PROVENANCE.md`.
+
 Current OpenCode execution uses `OpenCodeDaemonComputeBackend` and
 `opencode_daemon` handles identified by `ses_...`, not per-build OpenCode PIDs.
 The `local_subprocess` configuration name and autonomous opt-in remain for
@@ -23,8 +30,9 @@ describe daemon-session lifecycle. Each invocation creates one exclusive session
 sets a closed shell environment and submits one input. Reconnection observes the
 same durable history/inbox without replaying admission. State comes from the
 message history: the admitted input's `user` message starts the run and the
-`idle` message after it gives the outcome. OpenCode 2.2.7's session log serves
-only a sequence watermark, so log events never decide state. A connected stream,
+`idle` message after it gives the outcome. OpenCode 2.3.0's queued-input log probe
+serves only a sequence watermark, consistent with the historical 2.2.7 live-provider
+capture, so log events never decide state. A connected stream,
 an idle before the input, an HTTP acknowledgment or a model turn alone is not
 completion. Epic status remains
 authoritative through node factory.js, with lock session equal to OpenCode
@@ -581,12 +589,15 @@ Per-issue flow (one `run`):
    `WORKLINK_REPO` set to that base clone, strip group/other write bits in one line:
 
    ```sh
-   (cd "$WORKLINK_REPO" && { printf '.\0'; git ls-files -z; git ls-tree -r -d -z --name-only HEAD; find .git -print0; } | xargs -0 -r sh -c 'for p do [ -L "$p" ] || chmod go-w "./$p" || exit; done' sh)
+   (cd "$WORKLINK_REPO" && { printf '.\0'; git ls-files -z; git ls-tree -r -d -z --name-only HEAD; find .git -print0; } | xargs -0 -r sh -c 'for p do [ -L "$p" ] || chmod go-w "./$p" || { writable=$(find "./$p" -prune \( -perm -020 -o -perm -002 \) -print) && [ -z "$writable" ]; } || exit 1; done' sh)
    ```
 
    This covers the repository root and every tracked directory as well as
    tracked files and `.git`. It preserves executable bits and leaves
-   untracked/ignored worktree paths alone (including symlink targets). A
+   untracked/ignored worktree paths alone (including symlink targets). A refused
+   `chmod` is tolerated only if inspection confirms that the path has neither
+   group- nor other-write permission; otherwise the command exits non-zero.
+   This allows safe foreign-owned entries without requiring ownership repair. A
    directory *above* the repository that the worker can write (listed by
    absolute path in the refusal) must be fixed by hand; a sticky directory such
    as `/tmp` is accepted unless the worker owns it. A symlinked base or `.git`
@@ -991,8 +1002,13 @@ with mount ownership/mode set to the worker uid and 0700. For example, provision
 concurrent test gates; tests can create substantial temporary data. The mount
 and service setting are deployment configuration.
 Rebuild and restart the root executor with the matching controller release;
-the combined daemon/bounded-output/gate-scratch launch contract uses executor
-protocol v17 (`worklink-executor-v17-opencode-daemon-bounded-control-output-gate-scratch`).
+the combined daemon/bounded-output/gate-scratch/session-tree-read/attempt-delete
+contract uses executor protocol v19
+(`worklink-executor-v19-session-tree-activity-attempt-delete`).
+Completed leaf checkouts are deleted by the executor through an anchored,
+symlink-safe walk of that one attempt, including worker-owned content. The
+controller has no local deletion fallback; failures are logged while claim and
+run-state cleanup continue.
 
 Each run gets its own derived scratch tree under that directory. The gate's
 `TMPDIR` points at the tree and pytest's `--basetemp` at its `pytest/` child, so
@@ -1606,7 +1622,7 @@ even if another signal is absent.
 tool_pins:
   - name: opencode               # required: stable local tool name
     category: coding-cli         # required: coding-cli | renderer | tracker | helper
-    pin: "2.2.7"               # required: version, tag, or SHA currently expected
+    pin: "2.3.0"               # required: version, tag, or SHA currently expected
     smoke: "opencode --version"   # required: command used as bump evidence
     source: npm                  # optional lookup strategy for drift checks
     package: "@opencode/cli"     # optional upstream package/repo identifier

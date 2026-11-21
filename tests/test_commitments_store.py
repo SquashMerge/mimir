@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 import pytest
-from tests.timing import HANG_GUARD_SECONDS
+from tests.timing import HANG_GUARD_SECONDS, SUBPROCESS_HANG_GUARD_SECONDS
 
 from mimir.models import AuthContext
 from mimir.commitments import (
@@ -901,7 +901,7 @@ from mimir.commitments.store import CommitmentsStore
 store = CommitmentsStore(path=Path(sys.argv[1]))
 assert asyncio.run(store.complete('live', message_id='sibling-completion'))
 """, str(store.path)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
         )
         assert child.returncode == 0, child.stderr
         appended = True

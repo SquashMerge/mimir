@@ -1,0 +1,96 @@
+{
+  "binary_version": "2.3.0",
+  "scratch": "/workspace/.worklink/mimir/2151-6/.factory/opencode-230-7k1bpy03",
+  "responses": {
+    "/api/info": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"version\":\"2.3.0\",\"pid\":64499,\"hostname\":\"1de91877bbec\",\"urls\":[\"http://127.0.0.1:38967\"],\"paths\":{\"tmp\":\"/tmp/opencode\"},\"capabilities\":{\"persistentPty\":true}}"
+    },
+    "/api/config": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "[{\"type\":\"directory\",\"path\":\"/workspace/.worklink/mimir/2151-6/.factory/opencode-230-7k1bpy03/config/opencode\"},{\"type\":\"document\",\"info\":{\"plugins\":[]}}]"
+    },
+    "/api/health": {
+      "status": 404,
+      "body": ""
+    },
+    "/health": {
+      "status": 200,
+      "content_type": "text/html",
+      "body": "<!doctype html>\n<html lang=\"en\" style=\"background-color: var(--v2-background-bg-deep, #fafafa)\">\n  <head>\n    <meta charset=\"utf-8\" />\n    <meta\n      name=\"viewport\"\n      content=\"width=device-width, initial-scale=1, interactive-widget=resizes-content, viewport-fit=cover\"\n    />\n    <!-- data-sm lets the MetaProvider replace this pre-load title with the app's <Title> tags. -->\n    <title data-sm>OpenCode</title>\n    <link rel=\"icon\" type=\"image/x-icon\" href=\"/icons/prod/favicon.ico\" />\n    <link rel=\"apple-touch-icon\" sizes=\"180x180\" href=\"/icons/prod/apple-touch-icon.png\" />\n    <link rel=\"manifest\" href=\"/site.webmanifest\" crossorigin=\"use-credentials\" />\n    <meta name=\"theme-color\" content=\"#fafafa\" />\n    <meta name=\"mobile-web-app-capable\" content=\"yes\" />\n    <meta name=\"apple-mobile-web-app-capable\" content=\"yes\" />\n    <meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\" />\n    <meta property=\"og:image\" content=\"/social-share.png\" />\n    <meta property=\"twitter:image\" content=\"/social-share.png\" />\n    <script id=\"oc-theme-preload-script\">;(function () {\n  var key = \"opencode-theme-id\"\n  var themeId = localStorage.getItem(key) || \"oc-2\"\n\n  var scheme = localStorage.getItem(\"opencode-color-scheme\") || \"system\"\n  var isDark = scheme === \"dark\" || (scheme === \"system\" && matchMedia(\"(prefers-color-scheme: dark)\").matches)\n  var mode = isDark ? \"dark\" : \"light\"\n\n  document.documentElement.dataset.theme = themeId\n  document.documentElement.dataset.colorScheme = mode\n  document.documentElement.style.backgroundColor = isDark ? \"#080808\" : \"#fafafa\"\n\n  // Update theme-color meta tag to match app color scheme\n  var metas = document.querySelectorAll(\"meta[name='theme-color']\")\n  if (metas.length > 0) metas[0].setAttribute(\"content\", isDark ? \"#080808\" : \"#fafafa\")\n\n  if (themeId === \"oc-2\") return\n\n  var css = localStorage.getItem(\"opencode-theme-css-\" + mode)\n  if (css) {\n    var style = document.createElement(\"style\")\n    style.id = \"oc-theme-preload\"\n    style.textContent =\n      \":root{color-scheme:\" +\n      mode +\n      \";--text-mix-blend-mode:\" +\n      (isDark ? \"plus-lighter\" : \"multiply\") +\n      \";\" +\n      css +\n      \"}\"\n    document.head.appendChild(style)\n  }\n})()\n</script>\n    <script type=\"module\" crossorigin src=\"/_assets/index-CdrXiL9T.js\"></script>\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/rolldown-runtime-hePW80VL.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/solid-DqNkeKnl.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/web-9Hb5TzXy.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/helper-lIsiF35T.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/dist-3e61_V1I.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/eventListener-DveANrYu.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/JNCCF6MP-CT4mMYxX.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/UKTBL2JL-DK19neNV.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/dist-DugCKMb4.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/dist-BhESyvBA.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/LP6E37CW-CwzTDif9.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/store-Dd_eI9Ib.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/dist-BCzSB-0r.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/menu-scroll-C9Vf7cAY.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/ZZYKR3VO-C5ejgIrs.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/YFEENJN5-Dn_ZlMzi.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/OGE3DKII-DsLoLIY-.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/SOM3K36D-C1_aAxJ-.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/select-DaXCp1KS.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/dist-QXOOOQd2.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/uuid-DhWL7h7D.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/dialog-CVhNi0n7.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/i18n-DKGlszx-.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/encode-DO9V0ZMq.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/dist-CGI4yef_.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/reduced-nsQJmDHw.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/toast-CX3kdevQ.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/path-m0dFCAHb.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/desktop-native-CJas-RMZ.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/preload-helper-Czpn1I53.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/language-Crr_iyLe.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/shared-events-BRO736Wd.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/promise-CpEOPGHA.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/health-DpE8FsYz.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/core-BXqU3ikT.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/internal-DPEqReiF.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/gui-B_ZczzYZ.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/session-mention-CACczxAs.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/host-CviMZTLj.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/fuzzysort-ukaRp9PC.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/icon-DBZoqc_u.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/button-DJTGCYeb.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/dialog-DwG984tX.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/text-input-B3KRdsQK.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/session-message-D9lz3-Sv.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/session-iCwEtI6h.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/persistent-pty-DUrETfPt.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/solid-BHgPUtg1.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/current-tool-state-C3Ag0GR8.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/current-DLk33hmC.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/loop-BI4bKJ7M.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/motion-tuning-BWGaRYo_.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/icon-button-tTjrRo1U.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/loader-D-4iAQbB.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/oc-2-COeEKe_J.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/context-D5oWjHa1.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/project-avatar-CaT-rJv6.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/tooltip-wFIVTIbq.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/VI7QYH27-YkSt2TIl.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/menu-CgkI_xeq.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/keybind-BdU4y62Y.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/markdown-CaLTSDOU.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/builtin-Cn-9AMsG.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/switch-B8nkIEn4.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/host-apis-Cgp9ZJxk.js\">\n    <link rel=\"modulepreload\" crossorigin href=\"/_assets/text-field-EN8DDIKc.js\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/menu-scroll-DvCj7oVt.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/select-DU3nr_WR.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/toast-H4Zvf7UO.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/button-CUcpBpNW.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/icon-BDQzFLnz.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/dialog-BUYQZsMU.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/text-input-CcEpDKKM.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/current-Bctsudka.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/icon-button-k4-w3twm.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/loader-g3VDrgIX.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/project-avatar-BY0JVYFk.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/tooltip-CLbg2OhN.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/menu-BEJ3PKY9.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/keybind-CLxpfiUC.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/switch-DFuaInmf.css\">\n    <link rel=\"stylesheet\" crossorigin href=\"/_assets/index-BV8b8hvd.css\">\n  </head>\n  <body\n    class=\"antialiased overscroll-none font-(family-name:--font-family-text) text-[13px] font-[440] overflow-hidden bg-v2-background-bg-deep\"\n  >\n    <noscript>You need to enable JavaScript to run this app.</noscript>\n    <div id=\"root\" class=\"flex flex-col h-dvh bg-v2-background-bg-deep p-px\"></div>\n  </body>\n</html>\n"
+    },
+    "/api/session": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"data\":[],\"cursor\":{\"previous\":null,\"next\":null}}"
+    },
+    "/api/event": {
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "data: {\"id\":\"evt_1e92e0662001ehiNsmGD0f2aWs\",\"type\":\"server.connected\",\"data\":{}}\n\n"
+    },
+    "/api/shell": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"location\":{\"directory\":\"/workspace/.worklink/mimir/2151-6/.factory/opencode-230-7k1bpy03/checkout\"},\"data\":[]}"
+    },
+    "unauthenticated /api/session": {
+      "status": 401,
+      "body": "{\"_tag\":\"UnauthorizedError\",\"message\":\"Authentication required\"}"
+    },
+    "unauthenticated /api/event": {
+      "status": 401,
+      "body": "{\"_tag\":\"UnauthorizedError\",\"message\":\"Authentication required\"}"
+    },
+    "POST /api/session empty": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"data\":{\"id\":\"ses_e16d1f97fffe64ZG9r9xMT2bQ4\",\"projectID\":\"4556b14e77345bc03cbe20147ba10dc13b246291\",\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"time\":{\"created\":1794913470088,\"updated\":1794913470088},\"location\":{\"directory\":\"/workspace/.worklink/mimir/2151-6/.factory/opencode-230-7k1bpy03/checkout\"}}}"
+    },
+    "POST /api/session location": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"data\":{\"id\":\"ses_e16d1f975ffeBvg6eHIamaeTH4\",\"projectID\":\"4556b14e77345bc03cbe20147ba10dc13b246291\",\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"time\":{\"created\":1794913470107,\"updated\":1794913470107},\"permissions\":[{\"action\":\"external_directory\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"shell\",\"resource\":\"*\",\"effect\":\"deny\"},{\"action\":\"shell\",\"resource\":\"uv run pytest*\",\"effect\":\"allow\"}],\"location\":{\"directory\":\"/workspace/.worklink/mimir/2151-6/.factory/opencode-230-7k1bpy03/checkout\"}}}"
+    },
+    "PUT environment": {
+      "status": 204,
+      "content_type": "",
+      "body": ""
+    },
+    "POST prompt queued": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"data\":{\"id\":\"msg_1e92e069d001JWn0GlmhTkdNRH\",\"sessionID\":\"ses_e16d1f975ffeBvg6eHIamaeTH4\",\"time\":{\"created\":1794913470110},\"type\":\"user\",\"payload\":{\"text\":\"synthetic queued input; never execute\"},\"delivery\":\"steer\"}}"
+    },
+    "GET inbox": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"data\":[{\"id\":\"msg_1e92e069d001JWn0GlmhTkdNRH\",\"sessionID\":\"ses_e16d1f975ffeBvg6eHIamaeTH4\",\"time\":{\"created\":1794913470110},\"type\":\"user\",\"payload\":{\"text\":\"synthetic queued input; never execute\"},\"delivery\":\"steer\"}]}"
+    },
+    "GET message": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"data\":[],\"cursor\":{\"previous\":null,\"next\":null}}"
+    },
+    "POST interrupt": {
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"interrupted\":false}"
+    },
+    "GET log": {
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body": "data: {\"type\":\"log.synced\",\"aggregateID\":\"ses_e16d1f975ffeBvg6eHIamaeTH4\",\"seq\":1}\n\n"
+    },
+    "DELETE inbox": {
+      "status": 204,
+      "content_type": "",
+      "body": ""
+    }
+  },
+  "server_pid": 64499,
+  "server_exit": 143,
+  "server_awaited": true
+}

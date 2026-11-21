@@ -1,9 +1,9 @@
-"""Epic consumers against the schema-backed synthetic 2.2.7 daemon."""
+"""Epic consumers against the schema-backed synthetic 2.3.0 daemon."""
 from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -70,10 +70,17 @@ class EpicBoundary:
 
     async def session_cancel(self, handle):
         if not self.cancel_verified or not await self.controller.cancel():
-            raise RuntimeError("unverified owned quiescence")
+            raise RuntimeError(self.controller.record.cleanup_error or "unverified owned quiescence")
+
+    async def session_tree_activity(self, handle):
+        assert handle.identifier == self.controller.record.opencode_session_id
+        return await self.controller.tree_activity()
 
     async def session_release(self, handle):
         await self.controller.release()
+
+    async def session_rearm(self, handle):
+        return (await self.controller.recover_epic(issue=2125, attempt=1, action="session_rearm"))["recovery"]
 
 
 async def admit(tmp_path, daemon, client):
@@ -105,6 +112,749 @@ async def admit(tmp_path, daemon, client):
     return spec, boundary, compute, handle, record
 
 
+def wire_retained_executor(tmp_path, monkeypatch, daemon, boundary):
+    """Use the real executor operation, replacing only the UID/socket boundary."""
+    import hashlib
+    from mimir_cultivate.worklink import daemon_config, daemon_health, daemon_service, daemon_sessions, identities
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    root = tmp_path / "executor"
+    root.mkdir(mode=0o700)
+    (root / "sessions").mkdir(mode=0o700)
+    key = hashlib.sha256(f"{boundary.checkout}:2125:1".encode()).hexdigest()
+    path = root / "sessions" / f"{key}.json"
+    boundary.controller.path.replace(path)
+    boundary.controller.path = boundary.controller._record_path = path
+    daemon_service.atomic_json(root / "launch.json", {"launch_generation": "epic-generation"},
+                              uid=os.geteuid(), gid=os.getegid(), mode=0o600)
+    monkeypatch.setattr(daemon_config, "DAEMON_ROOT", str(root))
+    monkeypatch.setattr(identities, "get_identities", lambda: SimpleNamespace(worklink_uid=os.geteuid()))
+    monkeypatch.setattr(identities, "assert_worklink_identity", lambda ids: None)
+    monkeypatch.setattr(daemon_health, "load_api", lambda paths, uid: {
+        "url": daemon.base_url, "username": daemon.username, "password": daemon.password})
+    monkeypatch.setattr(daemon_service, "RuntimePaths", lambda: SimpleNamespace(daemon=root))
+    async def rpc(self, operation, payload):
+        info = self.path_checkout.stat()
+        return await daemon_sessions._executor_operation({
+            "op": operation, "path": str(self.path_checkout), "issue": self.issue_id, "attempt": self.attempt,
+            "device": info.st_dev, "inode": info.st_ino, **payload})
+    monkeypatch.setattr(WorkerClient, "_session_rpc", rpc)
+    return WorkerClient.for_path_checkout(boundary.checkout, issue_id=2125, attempt=1, run_uid=os.geteuid())
+
+
+@pytest.mark.parametrize("action", ["release-session", "resume-session"])
+@pytest.mark.parametrize("condition", ["success", "shell", "pending-resume", "question", "form", "wrong-attempt",
+                                       "wrong-issue", "leaf", "active-claim", "unconfirmed"])
+async def test_operator_session_commands_real_executor(tmp_path, monkeypatch, action, condition):
+    import argparse
+    from contextlib import nullcontext
+    from mimir_cultivate import commands
+    from mimir_cultivate.worklink import autonomy, control
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        wire_retained_executor(tmp_path, monkeypatch, daemon, boundary)
+        daemon.finish(handle.identifier, outcome="interrupted")
+        child = daemon.child_session(handle.identifier, record.sandbox)
+        if condition in {"shell", "pending-resume"}:
+            shell = daemon.start_shell(child, record.sandbox)
+            if condition == "pending-resume":
+                daemon.shells[shell]["status"] = "exited"
+                daemon.enqueue_synthetic(child, shell)
+        elif condition in {"question", "form"}:
+            form = daemon.question(child)
+            if condition == "form":
+                form["metadata"]["kind"] = "other"
+        elif condition == "leaf":
+            boundary.controller._persist(kind="leaf")
+        calls = []
+        def run(argv):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0,
+                json.dumps({"locks": [{"issue_id": 2125}] if condition == "active-claim" else []}), "")
+        monkeypatch.setattr(control, "_runner", lambda home: run)
+        monkeypatch.setattr(control, "_claim_mutex", lambda home: nullcontext())
+        monkeypatch.setattr(autonomy, "chainlink_bin", lambda: "fixture-chainlink")
+        args = argparse.Namespace(home=tmp_path, issue_id=2126 if condition == "wrong-issue" else 2125,
+            attempt=2 if condition == "wrong-attempt" else 1, confirm_quiescent=condition != "unconfirmed",
+            worklink_action=action)
+        result = await asyncio.to_thread(commands.dispatch, args, argparse.ArgumentParser())
+        assert result == (0 if condition == "success" else 1)
+        prompts = [body for method, route, _, body in daemon.requests if method == "POST" and route.endswith("/prompt")]
+        assert len(prompts) == (1 if condition == "success" and action == "resume-session" else 0)
+        assert boundary.controller.path.exists() == (condition != "success" or action != "release-session")
+        assert len([1 for method, route, _, _ in daemon.requests if method == "POST" and route == "/api/session"]) == 1
+        assert any(argv[-1] == "worklink:ready" for argv in calls) == (condition == "success" and action == "resume-session")
+        assert load_factory_record(tmp_path, record.run_id) == record
+
+
+@pytest.mark.parametrize("live", [False, True])
+async def test_conflict_admission_freshens_only_dead_owned_epic(tmp_path, monkeypatch, live):
+    from mimir_cultivate.worklink import daemon_gate
+    from mimir_cultivate.worklink.backends.base import SessionAdmissionError
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        spec, boundary, _, old, record = await admit(tmp_path, daemon, client)
+        peer = wire_retained_executor(tmp_path, monkeypatch, daemon, boundary)
+        retained_path = boundary.controller.path
+        retired_path = retained_path.with_name(f"{retained_path.stem}.{old.identifier}.retired.json")
+        assert json.loads(retained_path.read_text())["opencode_session_id"] == old.identifier
+        assert not retired_path.exists()
+        monkeypatch.setattr(daemon_gate, "prepare_daemon_health",
+                            lambda env: {"ok": True, "launch_generation": "epic-generation"})
+        if not live:
+            daemon.finish(old.identifier, outcome="interrupted")
+        if live:
+            with pytest.raises(SessionAdmissionError) as error:
+                await peer.session_create(spec.session_request, timeout_s=30)
+            assert error.value.handle.identifier == old.identifier
+            assert json.loads(retained_path.read_text())["opencode_session_id"] == old.identifier
+            assert not retired_path.exists()
+        else:
+            # Exercise session_create's retained-record conflict branch, not the
+            # orchestrator's separate session_rearm -> session_create sequence.
+            fresh = await peer.session_create(spec.session_request, timeout_s=30)
+            assert fresh.identifier == fresh.opencode_session_id != old.identifier
+            assert json.loads(retained_path.read_text())["opencode_session_id"] == fresh.identifier
+            retired = json.loads(retired_path.read_text())
+            assert retired["opencode_session_id"] == old.identifier
+            assert retired["cancellation_state"] == "verified"
+            assert retired["issue_id"] == record.issue_id
+            assert retired["attempt"] == record.attempt
+        assert len([1 for method, route, _, _ in daemon.requests if method == "POST" and route == "/api/session"]) == (1 if live else 2)
+        assert load_factory_record(tmp_path, record.run_id) == record
+
+
+def specialist_shells(daemon, handle, record):
+    """Two direct children plus a nested specialist that has moved locations."""
+    sandbox = record.sandbox
+    slice_path = str(Path(sandbox) / "worktrees/be-leaf")
+    first = daemon.child_session(handle.identifier, sandbox)
+    second = daemon.child_session(handle.identifier, slice_path)
+    nested = daemon.child_session(first, slice_path + "/old")
+    owned = [daemon.start_shell(first, sandbox), daemon.start_shell(second, slice_path),
+             daemon.start_shell(nested, slice_path + "/old"),
+             daemon.start_shell(handle.identifier, record.session_checkout)]
+    daemon.move_session(nested, slice_path)
+    return owned
+
+
+@pytest.mark.parametrize("anonymous", [False, True])
+async def test_epic_cancel_never_touches_unrelated_session_shells_at_same_location(tmp_path, anonymous):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
+        foreign = [daemon.start_shell("ses_unrelated_leaf", daemon.shells[shell]["cwd"]) for shell in owned]
+        # Include missing ownership metadata: location alone must never authorize deletion.
+        if anonymous:
+            shell = daemon.start_shell("ses_unknown", record.sandbox)
+            daemon.shells[shell]["metadata"] = {}
+            foreign.append(shell)
+        await compute.cancel(handle)
+        assert boundary.controller.record.cancellation_state == "verified"
+        assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+        assert all(daemon.shells[s]["status"] == "running" for s in foreign)
+        deleted = {route.rsplit("/", 1)[-1] for method, route, _, _ in daemon.requests
+                   if method == "DELETE" and route.startswith("/api/shell/")}
+        assert deleted == set(owned)
+
+
+@pytest.mark.parametrize("fault", ["delete-failure", "lying-ack", "listing-failure"])
+async def test_epic_shell_cleanup_incomplete_names_remaining_shell_and_session(tmp_path, monkeypatch, fault):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
+        retained = owned[1]
+        delete = client.delete_shell
+        async def failing_delete(shell_id, directory):
+            if shell_id == retained:
+                if fault == "delete-failure":
+                    daemon.faults[("DELETE", f"/api/shell/{shell_id}")].append(SyntheticFault(status=500))
+                elif fault == "lying-ack":
+                    daemon.faults[("DELETE", f"/api/shell/{shell_id}")].append(SyntheticFault(status=204))
+                else:
+                    daemon.faults[("GET", "/api/shell")].append(SyntheticFault(status=500))
+                    return
+            await delete(shell_id, directory)
+        monkeypatch.setattr(client, "delete_shell", failing_delete)
+        cancel = boundary.controller.cancel
+        async def bounded_cancel():
+            return await cancel(timeout_s=0.3)
+        monkeypatch.setattr(boundary.controller, "cancel", bounded_cancel)
+        with pytest.raises(ComputeCleanupError, match=retained):
+            await compute.cancel(handle)
+        recovered = SessionController.recover(client, boundary.controller.path,
+            generation=handle.launch_generation, checkout=Path(record.session_checkout))
+        assert recovered.record.cancellation_state == "unverified"
+        assert retained in recovered.record.cleanup_error
+        assert daemon.shells[retained]["metadata"]["sessionID"] in recovered.record.cleanup_error
+        assert daemon.shells[retained]["status"] == "running"
+        assert not load_factory_record(tmp_path, record.run_id).children_reaped
+
+
+@pytest.mark.parametrize("reused", [False, True])
+async def test_epic_cancel_verifies_orphan_pid_start_time_not_only_shell_listing(tmp_path, monkeypatch, reused):
+    from mimir_cultivate.worklink import daemon_processes as processes
+    import signal
+
+    # A faithful /proc tree: child escaped into its own process group, then
+    # DELETE reparents it to init and removes all daemon shell visibility.
+    table = {200: (1, 100, "S"), 201: (200, 101, "S"), 202: (201, 102, "S"),
+             999: (1, 999, "S")}
+    monkeypatch.setattr(processes, "_process", lambda pid: table.get(pid))
+    monkeypatch.setattr(processes, "Path", lambda _: SimpleNamespace(
+        iterdir=lambda: [SimpleNamespace(name=str(pid)) for pid in table]))
+    sent = []
+    handles = {}
+    def open_pid(pid):
+        handles[pid + 1000] = pid
+        return pid + 1000
+    def send(fd, sig):
+        pid = handles[fd]
+        sent.append((pid, sig))
+        if pid == 202 and sig == signal.SIGKILL:
+            table.pop(pid, None)
+        elif pid == 201:
+            table.pop(pid, None)
+    # Patch only this module's os/signal facades, not process-global stdlib.
+    monkeypatch.setattr(processes, "os", SimpleNamespace(pidfd_open=open_pid, close=lambda fd: None))
+    monkeypatch.setattr(processes, "signal", SimpleNamespace(
+        SIGTERM=signal.SIGTERM, SIGKILL=signal.SIGKILL, pidfd_send_signal=send))
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        child = daemon.child_session(handle.identifier, record.sandbox)
+        shell = daemon.start_shell(child, record.sandbox)
+        daemon.shells[shell]["pid"] = 200
+        delete = client.delete_shell
+        async def delete_and_orphan(sid, directory):
+            # Witnesses must already be durable before lineage disappears.
+            assert boundary.controller.record.cleanup_processes == [[201, 101], [202, 102]]
+            await delete(sid, directory)
+            table.pop(200)
+            table[201] = (1, 101, "S")
+            table[202] = (1, 777 if reused else 102, "S")
+        monkeypatch.setattr(client, "delete_shell", delete_and_orphan)
+        await compute.cancel(handle)
+        assert boundary.controller.record.cancellation_state == "verified"
+        assert boundary.controller.record.cleanup_processes == []
+        assert (201, signal.SIGTERM) in sent
+        assert 999 in table and not any(pid == 999 for pid, _ in sent)
+        if reused:
+            assert table[202][1] == 777 and not any(pid == 202 for pid, _ in sent)
+        else:
+            assert 202 not in table
+            assert (202, signal.SIGKILL) in sent
+
+
+@pytest.mark.parametrize("failure,reason", [
+    ("open", "process handle unavailable: errno EPERM"),
+    ("open-denied", "process handle unavailable: errno EACCES"),
+    ("open-unsupported", "process handle unavailable: errno ENOSYS"),
+    ("open-unknown", "process handle unavailable: errno unknown"),
+    ("open-missing", "process handle unavailable: Python API missing"),
+    ("signal", "process signal refused: errno EPERM"),
+    ("signal-missing", "process signal refused: Python API missing"),
+    ("read", "process identity unreadable"),
+    ("timeout", "TimeoutError"),
+])
+async def test_epic_cancel_preserves_process_failure_cause_and_retained_pid(tmp_path, monkeypatch, failure, reason):
+    from mimir_cultivate.worklink import daemon_processes as processes
+    import signal
+
+    table = {200: (1, 100, "S"), 201: (200, 101, "S")}
+    deleted = False
+    def process(pid):
+        if deleted and failure == "timeout":
+            raise TimeoutError
+        if deleted and failure == "read":
+            raise DaemonClientError("process identity unreadable")
+        return table.get(pid)
+    monkeypatch.setattr(processes, "_process", process)
+    monkeypatch.setattr(processes, "Path", lambda _: SimpleNamespace(
+        iterdir=lambda: [SimpleNamespace(name=str(pid)) for pid in table]))
+    import errno
+
+    closed = []
+    def open_pid(pid):
+        if failure.startswith("open"):
+            number = {"open": errno.EPERM, "open-denied": errno.EACCES,
+                      "open-unsupported": errno.ENOSYS, "open-unknown": 987654}.get(failure)
+            raise OSError(number, "sensitive OS diagnostic must not escape")
+        return 1234
+    def send(fd, sig):
+        raise PermissionError(errno.EPERM, "sensitive OS diagnostic must not escape")
+    def fallback_kill(pid, sig):
+        raise PermissionError(errno.EPERM, "sensitive OS diagnostic must not escape")
+    os_facade = SimpleNamespace(close=closed.append, kill=fallback_kill,
+        stat=lambda path: SimpleNamespace(st_uid=1002), geteuid=lambda: 1002)
+    if failure != "open-missing":
+        os_facade.pidfd_open = open_pid
+    signal_facade = SimpleNamespace(SIGTERM=signal.SIGTERM, SIGKILL=signal.SIGKILL)
+    if failure != "signal-missing":
+        signal_facade.pidfd_send_signal = send
+    # Simulate CPython build capabilities locally; never remove stdlib APIs
+    # globally, where asyncio's already-selected child watcher uses them.
+    monkeypatch.setattr(processes, "os", os_facade)
+    monkeypatch.setattr(processes, "signal", signal_facade)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        shell = daemon.start_shell(handle.identifier, record.session_checkout)
+        daemon.shells[shell]["pid"] = 200
+        daemon.finish(handle.identifier)
+        delete = client.delete_shell
+        async def orphan(sid, directory):
+            nonlocal deleted
+            assert boundary.controller.record.cleanup_processes == [[201, 101]]
+            await delete(sid, directory)
+            table.pop(200)
+            table[201] = (1, 101, "S")
+            deleted = True
+        monkeypatch.setattr(client, "delete_shell", orphan)
+        with pytest.raises(ComputeCleanupError, match=reason):
+            await compute.cancel(handle)
+        recovered = SessionController.recover(client, boundary.controller.path,
+            generation=handle.launch_generation, checkout=Path(record.session_checkout))
+        assert recovered.record.cancellation_state == "unverified"
+        assert recovered.record.cleanup_processes == [[201, 101]]
+        assert "PID 201 (start 101)" in recovered.record.cleanup_error
+        assert reason in recovered.record.cleanup_error
+        assert "sensitive OS diagnostic" not in recovered.record.cleanup_error
+        assert closed == ([1234] if failure.startswith("signal") else [])
+        assert not await client.running_shells(record.session_checkout)
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="Linux process identity witness")
+@pytest.mark.parametrize("pidfd_mode", ["native", "missing", "refused"])
+async def test_epic_cancel_reaps_real_setsid_child_after_daemon_forgets_shell(tmp_path, monkeypatch, pidfd_mode):
+    from mimir_cultivate.worklink import daemon_processes as processes
+    import signal
+    import sys
+
+    if pidfd_mode != "native":
+        facade = SimpleNamespace(**{name: value for name, value in vars(os).items()
+                                     if name != "pidfd_open"})
+        if pidfd_mode == "refused":
+            def refused(pid):
+                import errno
+                raise PermissionError(errno.EPERM, "synthetic pidfd restriction")
+            facade.pidfd_open = refused
+        monkeypatch.setattr(processes, "os", facade)
+
+    # The child acknowledges setsid and TERM handling before exposing its PID.
+    child_code = "import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print(os.getpid(),flush=True); time.sleep(60)"
+    parent_code = ("import subprocess,sys,time; "
+                   "p=subprocess.Popen([sys.executable,'-u','-c',sys.argv[1]],start_new_session=True,stdout=subprocess.PIPE,text=True); "
+                   "print(p.stdout.readline(),end='',flush=True); time.sleep(60)")
+    parent = subprocess.Popen([sys.executable, "-u", "-c", parent_code, child_code],
+                              stdout=subprocess.PIPE, text=True)
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    child_pid = None
+    try:
+        child_pid = int(await asyncio.wait_for(asyncio.to_thread(parent.stdout.readline), 5))
+        assert os.getpgid(child_pid) == child_pid != os.getpgid(parent.pid)
+        async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+            _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+            shell = daemon.start_shell(handle.identifier, record.session_checkout)
+            daemon.shells[shell]["pid"] = parent.pid
+            delete = client.delete_shell
+            async def delete_parent(sid, directory):
+                assert any(w[0] == child_pid for w in boundary.controller.record.cleanup_processes)
+                parent.terminate()
+                await asyncio.to_thread(parent.wait, 5)
+                await delete(sid, directory)
+                assert processes._process(child_pid)[0] != parent.pid
+            monkeypatch.setattr(client, "delete_shell", delete_parent)
+            await compute.cancel(handle)
+            assert boundary.controller.record.cancellation_state == "verified"
+            assert not await client.running_shells(record.session_checkout)
+            state = processes._process(child_pid)
+            assert state is None or state[2] == "Z"
+            assert unrelated.poll() is None
+    finally:
+        # Test-owned interlocks: even a cleanup-removal mutation cannot leak
+        # its spawned processes, and no production process is selected.
+        if parent.poll() is None:
+            parent.kill()
+        parent.wait(timeout=5)
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        unrelated.kill()
+        unrelated.wait(timeout=5)
+        parent.stdout.close()
+
+
+@pytest.mark.parametrize("mode", ["missing", "refused"])
+@pytest.mark.parametrize("identity", ["owned", "reused-before", "reused-during", "foreign", "gone"])
+async def test_pidfd_fallback_confines_identity_and_rechecks_after_signal(monkeypatch, mode, identity):
+    from mimir_cultivate.worklink import daemon_processes as processes
+    import errno
+    import signal
+
+    table = {201: (1, 777 if identity == "reused-before" else 101, "S")}
+    sent, reads = [], []
+    def process(pid):
+        reads.append((pid, bool(sent)))
+        return table.get(pid)
+    def owner(path):
+        assert path == "/proc/201"
+        if identity == "gone":
+            raise FileNotFoundError
+        return SimpleNamespace(st_uid=2000 if identity == "foreign" else 1002)
+    def kill(pid, sig):
+        sent.append((pid, sig))
+        if identity == "reused-during":
+            table[pid] = (1, 888, "S")
+        else:
+            table.pop(pid)
+    facade = SimpleNamespace(stat=owner, geteuid=lambda: 1002, kill=kill)
+    if mode == "refused":
+        def refused(pid):
+            raise PermissionError(errno.EPERM, "sensitive OS diagnostic")
+        facade.pidfd_open = refused
+    monkeypatch.setattr(processes, "os", facade)
+    monkeypatch.setattr(processes, "_process", process)
+    if identity == "foreign":
+        with pytest.raises(DaemonClientError, match="fallback process owner mismatch"):
+            await processes.terminate_descendants([[201, 101]], wait_s=0)
+        assert sent == []
+    else:
+        # Direct call proves the post-signal read is in the fallback itself,
+        # not only in the later termination loop.
+        processes._signal([201, 101], signal.SIGTERM)
+        if identity in {"owned", "reused-during"}:
+            assert reads[-1] == (201, True)
+        survivors = await processes.terminate_descendants([[201, 101]], wait_s=0)
+        # A disappeared /proc owner entry is not an absence witness in this
+        # fake table: leave cleanup unverified while _process still sees it.
+        assert survivors == ([[201, 101]] if identity == "gone" else [])
+        assert sent == ([(201, signal.SIGTERM)] if identity in {"owned", "reused-during"} else [])
+        if identity in {"owned", "reused-during"}:
+            assert len(reads) >= 5
+
+
+@pytest.mark.parametrize("survives", [False, True])
+async def test_epic_idle_cancel_requires_no_surviving_orphan_pids(tmp_path, monkeypatch, survives):
+    from mimir_cultivate.worklink import daemon_processes as processes
+    import signal
+
+    table = {200: (1, 100, "S"), 201: (200, 101, "S")}
+    monkeypatch.setattr(processes, "_process", lambda pid: table.get(pid))
+    monkeypatch.setattr(processes, "Path", lambda _: SimpleNamespace(
+        iterdir=lambda: [SimpleNamespace(name=str(pid)) for pid in table]))
+    sent = []
+    def send(witness, sig):
+        sent.append((witness[0], sig))
+        if not survives:
+            table.pop(witness[0], None)
+    monkeypatch.setattr(processes, "_signal", send)
+    terminate = processes.terminate_descendants
+    completed = []
+    async def terminate_without_wait(witnesses):
+        # Exercise real TERM/KILL and survivor selection without waiting for fake
+        # processes. Cancellation must get past termination, not time out in it.
+        result = await terminate(witnesses, wait_s=0)
+        completed.append(result)
+        return result
+    monkeypatch.setattr(processes, "terminate_descendants", terminate_without_wait)
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        shell = daemon.start_shell(handle.identifier, record.session_checkout)
+        daemon.shells[shell]["pid"] = 200
+        # A real durable idle witness makes the session eligible for verified
+        # cancellation once shells disappear; the orphan is the ONLY blocker.
+        daemon.finish(handle.identifier)
+        assert not daemon.sessions[handle.identifier].active
+        delete = client.delete_shell
+        async def orphan(sid, directory):
+            assert boundary.controller.record.cleanup_processes == [[201, 101]]
+            await delete(sid, directory)
+            table.pop(200)
+            table[201] = (1, 101, "S")
+        monkeypatch.setattr(client, "delete_shell", orphan)
+        verified = await boundary.controller.cancel(timeout_s=2)
+        assert completed and completed[0] == ([[201, 101]] if survives else [])
+        assert (201, signal.SIGTERM) in sent
+        assert boundary.controller.record.execution_state == "succeeded"
+        assert not await client.running_shells(record.session_checkout)
+        assert daemon.shells[shell]["status"] == "killed"
+        assert verified is (not survives)
+        recovered = SessionController.recover(client, boundary.controller.path,
+            generation=handle.launch_generation, checkout=Path(record.session_checkout))
+        if survives:
+            assert (201, signal.SIGKILL) in sent
+            assert table[201] == (1, 101, "S")
+            assert recovered.record.cleanup_processes == [[201, 101]]
+            assert "PID 201" in recovered.record.cleanup_error
+            assert recovered.record.cancellation_state == "unverified"
+        else:
+            assert 201 not in table
+            assert recovered.record.cleanup_processes == []
+            assert recovered.record.cleanup_error is None
+            assert recovered.record.cancellation_state == "verified"
+
+
+async def test_epic_late_root_shell_waits_for_process_snapshot_before_delete(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import daemon_processes as processes
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        refresh = boundary.controller._refresh
+        spawned = []
+        witnessed = []
+        monkeypatch.setattr(processes, "snapshot_descendants", lambda pid: witnessed.append(pid) or [])
+        async def late_refresh():
+            if not spawned:
+                spawned.append(daemon.start_shell(handle.identifier, record.session_checkout))
+            return await refresh()
+        monkeypatch.setattr(boundary.controller, "_refresh", late_refresh)
+        delete = client.delete_shell
+        async def checked_delete(sid, directory):
+            assert daemon.shells[sid]["pid"] in witnessed
+            await delete(sid, directory)
+        monkeypatch.setattr(client, "delete_shell", checked_delete)
+        await compute.cancel(handle)
+        assert spawned and daemon.shells[spawned[0]]["status"] == "killed"
+
+
+async def test_epic_session_tree_follows_every_page_and_archived_descendants(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, compute, handle, record = await admit(tmp_path, daemon, client)
+        for _ in range(101):
+            last = daemon.child_session(handle.identifier, record.sandbox)
+        daemon.sessions[last].info["time"]["archived"] = 3
+        nested = daemon.child_session(last, str(Path(record.sandbox) / "worktrees/last"))
+        shell = daemon.start_shell(nested, daemon.sessions[nested].info["location"]["directory"])
+        await compute.cancel(handle)
+        assert daemon.shells[shell]["status"] == "killed"
+        assert any(query.get("cursor") for method, route, query, _ in daemon.requests
+                   if method == "GET" and route == "/api/session")
+
+
+async def test_epic_cancel_drains_child_resume_queued_by_shell_deletion(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        daemon.delete_race = True
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        child = daemon.child_session(handle.identifier, record.sandbox)
+        shell = daemon.start_shell(child, record.sandbox)
+        delete = client.delete_shell
+        async def delete_and_resume(shell_id, directory):
+            await delete(shell_id, directory)
+            daemon.enqueue_synthetic(child, shell_id)
+            daemon.deliver(child, daemon.sessions[child].inbox[0]["id"])
+            # Model both an admitted and a still-queued completion delivery.
+            daemon.enqueue_synthetic(child, shell_id)
+        monkeypatch.setattr(client, "delete_shell", delete_and_resume)
+        await compute.cancel(handle)
+        assert boundary.controller.record.cancellation_state == "verified"
+        assert daemon.shells[shell]["status"] == "killed"
+        assert not daemon.sessions[child].active
+        assert not daemon.sessions[child].inbox
+
+
+async def test_epic_cancel_rediscovers_child_spawned_during_final_interrupt(tmp_path, monkeypatch):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        interrupt = client.interrupt
+        root_interrupts = 0
+        spawned = []
+        async def spawning_interrupt(session_id):
+            nonlocal root_interrupts
+            result = await interrupt(session_id)
+            if session_id == handle.identifier:
+                root_interrupts += 1
+                if root_interrupts == 2:
+                    child = daemon.child_session(session_id, str(Path(record.sandbox) / "worktrees/late"))
+                    spawned.append(daemon.start_shell(child, daemon.sessions[child].info["location"]["directory"]))
+            return result
+        monkeypatch.setattr(client, "interrupt", spawning_interrupt)
+        await compute.cancel(handle)
+        assert spawned and daemon.shells[spawned[0]]["status"] == "killed"
+        assert boundary.controller.record.cancellation_state == "verified"
+
+
+async def test_epic_session_tree_rejects_foreign_parent_link_before_deletion(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        child = daemon.child_session(handle.identifier, record.sandbox)
+        foreign = daemon.sessions[child].info
+        foreign["parentID"] = "ses_another_run"
+        shell = daemon.start_shell(child, record.sandbox)
+        daemon.faults[("GET", "/api/session")].append(SyntheticFault(body=json.dumps({
+            "data": [foreign], "cursor": {"previous": None, "next": None}}).encode()))
+        assert not await boundary.controller.cancel()
+        assert boundary.controller.record.cancellation_state == "unverified"
+        assert daemon.shells[shell]["status"] == "running"
+        assert not any(method == "DELETE" and route.startswith("/api/shell/")
+                       for method, route, _, _ in daemon.requests)
+
+
+async def test_epic_session_tree_rejects_foreign_root_identity_before_deletion(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        foreign = daemon.child_session(handle.identifier, record.sandbox)
+        shell = daemon.start_shell(foreign, record.sandbox)
+        daemon.faults[("GET", f"/api/session/{handle.identifier}")].append(SyntheticFault(
+            body=json.dumps({"data": daemon.sessions[foreign].info}).encode()))
+        assert not await boundary.controller.cancel()
+        assert boundary.controller.record.cancellation_state == "unverified"
+        assert daemon.shells[shell]["status"] == "running"
+        assert not any(method == "DELETE" and route.startswith("/api/shell/")
+                       for method, route, _, _ in daemon.requests)
+
+
+async def test_epic_terminal_recovery_stops_descendant_shells_before_finalization(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import orchestrator
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, compute, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
+        completed = replace(record.status, status="completed")
+        monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: Path(record.sandbox))
+        async def finished(self, **kwargs):
+            assert kwargs["factory_record"].children_reaped
+            assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+            return WorklinkRunResult(2125, 1, "review_ready")
+        monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finished)
+        result = await WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._recover_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)), claims=object(),
+            backend=SimpleNamespace(host="opencode", status=lambda *a, **kw: completed), compute=compute,
+            retained=record, launcher=Path(record.launcher), repo_slug=record.repository,
+            base="main", test_cmd="pytest", runner=lambda *a, **kw: None, work_item_json="{}")
+        assert result.status == "review_ready"
+
+
+async def test_session_cancel_executor_diagnostic_reaches_caller(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, _, _, handle, _ = await admit(tmp_path, daemon, client)
+        peer = WorkerClient(None)
+        async def rpc(*args, **kwargs):
+            return {"cancellation_state": "unverified", "cleanup_error":
+                    "session tree cleanup incomplete: sh_retained (ses_specialist)"}
+        monkeypatch.setattr(peer, "_session_handle_rpc", rpc)
+        with pytest.raises(RuntimeError, match=r"sh_retained \(ses_specialist\)"):
+            await peer.session_cancel(handle)
+
+
+@pytest.mark.parametrize("cause", ["budget", "idle", "startup", "already-parked", "terminal", "delete-failure"])
+async def test_epic_park_stops_descendant_shells_at_sandbox_and_slice_locations(
+    tmp_path, monkeypatch, supervisor_clock, cause,
+):
+    from mimir_cultivate.worklink import orchestrator
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        # Running owned shells now correctly prevent an idle park (#2165).
+        # For that case, model a shell launch racing the already-made idle
+        # decision: cancellation must still discover and stop every descendant.
+        owned = [] if cause == "idle" else specialist_shells(daemon, handle, record)
+        if cause == "idle":
+            cancel = compute.cancel
+            async def launch_before_cancel(selected):
+                assert not owned
+                owned.extend(specialist_shells(daemon, handle, record))
+                await cancel(selected)
+            monkeypatch.setattr(compute, "cancel", launch_before_cancel)
+        foreign = daemon.start_shell("ses_unrelated", record.sandbox)
+        boundary.finish = False
+        current = record.status
+        polls = 0
+        terminal_calls = []
+        if cause == "idle":
+            monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20000.0)
+        if cause == "startup":
+            record = replace(record, status=None, observed_at=None)
+            monkeypatch.setattr(orchestrator, "_factory_startup_status_timeout_s", lambda: 10.0)
+        if cause == "delete-failure":
+            delete = client.delete_shell
+            async def refuse(shell_id, directory):
+                if shell_id == owned[1]:
+                    daemon.faults[("DELETE", f"/api/shell/{shell_id}")].append(SyntheticFault(status=500))
+                await delete(shell_id, directory)
+            monkeypatch.setattr(client, "delete_shell", refuse)
+            cancel = boundary.controller.cancel
+            async def bounded_cancel():
+                return await cancel(timeout_s=0.3)
+            monkeypatch.setattr(boundary.controller, "cancel", bounded_cancel)
+
+        def status(*args, **kwargs):
+            nonlocal polls
+            polls += 1
+            if cause == "startup":
+                supervisor_clock.now += 6
+                return FactoryStatus(record.run_id, False, record.sandbox)
+            if cause in {"already-parked", "terminal"}:
+                return replace(current, status="needs-human" if cause == "already-parked" else "completed",
+                               park_snapshot=str(tmp_path / "snapshot") if cause == "already-parked" else None)
+            if boundary.controller.record.cancellation_state == "none":
+                if cause == "idle":
+                    # First observe progress, then cross the idle threshold without
+                    # advancing the work budget or changing the snapshot.
+                    supervisor_clock.now = 1 if polls == 1 else 8000
+                else:
+                    supervisor_clock.now = 60
+            return current
+
+        def terminal(*args, **kwargs):
+            nonlocal current
+            assert owned and all(daemon.shells[s]["status"] == "killed" for s in owned)
+            terminal_calls.append(kwargs["reason"])
+            current = replace(current, status="needs-human", park_snapshot=str(tmp_path / "snapshot"))
+
+        async def finished(self, **kwargs):
+            assert kwargs["factory_record"].children_reaped
+            assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+            return WorklinkRunResult(2125, 1, "needs-human")
+
+        monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finished)
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", datetime.now(UTC)),
+            claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None),
+            backend=SimpleNamespace(status=status, heartbeat=lambda *a, **kw: None,
+                                    terminal=terminal, poll_interval_s=0.001),
+            compute=compute, factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None,
+            started_at=datetime.now(UTC))
+        if cause == "delete-failure":
+            with pytest.raises(ComputeCleanupError, match=owned[1]):
+                await asyncio.wait_for(invocation, 60)
+            saved = load_factory_record(tmp_path, record.run_id)
+            assert not saved.children_reaped and owned[1] in saved.controller_error
+            assert not terminal_calls
+        elif cause == "startup":
+            with pytest.raises(WorklinkError, match="startup deadline"):
+                await asyncio.wait_for(invocation, 60)
+            assert all(daemon.shells[s]["status"] == "killed" for s in owned)
+        else:
+            assert (await asyncio.wait_for(invocation, 60)).status == "needs-human"
+            if cause in {"budget", "idle"}:
+                assert len(terminal_calls) == 1
+                if cause == "idle":
+                    assert "driver idle" in terminal_calls[0]
+        assert daemon.shells[foreign]["status"] == "running"
+
+
+async def test_epic_child_question_is_an_operator_visible_failure_without_waiting(tmp_path):
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        spec, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.finish = False
+        child = daemon.new_session({"parentID": handle.identifier, "agent": "backend-builder"})["id"]
+        form = daemon.question(child, title="Slice paths", text="May I extend be-leaf with six test paths?")
+        result = await compute.wait(handle, 30)
+        order = WorkOrder(2125, Path(record.session_checkout), "", None, 30, {}, tmp_path / "transcripts")
+        raw = await FeatureFactoryBackend().interpret(order, result)
+        assert raw.backend_status == "failed"
+        assert "pending_question" in raw.error
+        assert "Slice paths" in raw.error
+        assert "May I extend be-leaf with six test paths?" in raw.error
+        assert not result.timed_out
+        assert daemon.sessions[child].forms == [form] and not daemon.sessions[child].replies
+
+
 async def test_epic_production_command_checkout_model_permissions_and_environment(tmp_path):
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         spec, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
@@ -112,6 +862,7 @@ async def test_epic_production_command_checkout_model_permissions_and_environmen
         assert create == {"location": {"directory": record.session_checkout},
             "model": {"providerID": "openai", "id": "gpt-test", "variant": "high"},
             "permissions": [{"action": "external_directory", "resource": "*", "effect": "deny"},
+                {"action": "question", "resource": "*", "effect": "deny"},
                 *[{"action": "read", "resource": pattern, "effect": "deny"}
                   for pattern in (".env", "**/.env", "**/.env.*")]]}
         commands = [body for _, route, _, body in daemon.requests if route.endswith("/command")]
@@ -371,6 +1122,83 @@ async def test_running_factory_reattaches_same_host_without_input(tmp_path, monk
         assert len([route for _, route, _, _ in daemon.requests if route.endswith("/command")]) == 1
 
 
+@pytest.mark.parametrize("recovery", ["fresh", "live", "shell", "pending-resume", "release", "resume",
+                                    "parked-resume", "unavailable", "form"])
+async def test_rearmed_retained_epic_recovers_through_real_orchestrator(tmp_path, monkeypatch, recovery):
+    from mimir_cultivate.worklink import orchestrator
+
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        spec, boundary, compute, old, record = await admit(tmp_path, daemon, client)
+        if recovery != "live":
+            daemon.finish(old.identifier, outcome="interrupted")
+        boundary.finish = False
+        if recovery == "shell":
+            child = daemon.child_session(old.identifier, record.sandbox)
+            daemon.start_shell(child, record.sandbox)
+        elif recovery == "pending-resume":
+            child = daemon.child_session(old.identifier, record.sandbox)
+            shell = daemon.start_shell(child, record.sandbox)
+            daemon.shells[shell]["status"] = "exited"
+            daemon.enqueue_synthetic(child, shell)
+        elif recovery in {"release", "resume", "parked-resume"}:
+            await boundary.controller.recover_epic(issue=2125, attempt=1,
+                action="session_release_quiescent" if recovery == "release" else "session_resume")
+            if recovery == "parked-resume":
+                record = replace(record, status=replace(record.status, status="needs-human",
+                                                       park_snapshot=str(tmp_path / "park")))
+        elif recovery == "unavailable":
+            daemon.faults[("GET", f"/api/session/{old.identifier}")].append(SyntheticFault(status=500))
+        elif recovery == "form":
+            child = daemon.child_session(old.identifier, record.sandbox)
+            daemon.question(child)
+        sentinel = Path(record.sandbox) / "retained-work"
+        sentinel.write_text("saved run work")
+        monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: Path(record.sandbox))
+        monkeypatch.setattr(orchestrator, "_git_credential_settings", lambda *a: ())
+        def order(self, **kwargs):
+            return WorkOrder(2125, Path(record.session_checkout), "", None, 30,
+                {**spec.env, "MIMIR_MODEL_SPEC": "codex-plus:gpt-test#high", "FACTORY_PUBLISHING_IDENTITY": "fixture-bot",
+                 "GIT_AUTHOR_NAME": "Fixture Bot", "GIT_AUTHOR_EMAIL": "fixture@example.invalid"}), "fixture-bot"
+        monkeypatch.setattr(WorklinkRunner, "_factory_launch_order", order)
+        current = record.status
+        class Factory(FeatureFactoryBackend):
+            def status(self, *args, **kw):
+                return current
+            def lock(self, run_id, action, **kw):
+                nonlocal current
+                assert run_id == record.run_id and action == "release"
+                assert kw["session"] == old.identifier
+                current = replace(current, lock="absent", lock_session=None)
+        async def supervise(self, **kwargs):
+            saved = kwargs["factory_record"]
+            assert saved.run_id == record.run_id and saved.sandbox == record.sandbox
+            assert saved.branch == record.branch and sentinel.read_text() == "saved run work"
+            assert (saved.opencode_session_id != old.identifier) == (recovery in {"fresh", "release"})
+            return WorklinkRunResult(2125, 2, "supervising")
+        monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._recover_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 2, "fixture", datetime.now(UTC)),
+            claims=SimpleNamespace(_issue_comments=lambda *a, **kw: []),
+            backend=Factory(), compute=compute, retained=record, launcher=Path(record.launcher),
+            repo_slug=record.repository, base="main", test_cmd="pytest", work_item_json=spec.env["MIMIR_WORK_ITEM_JSON"],
+            runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "https://github.com/owner/repo.git\n", ""))
+        if recovery in {"unavailable", "form"}:
+            with pytest.raises(DaemonClientError, match="HTTP failure" if recovery == "unavailable" else "retained_pending_form"):
+                await invocation
+            assert boundary.create_calls == 1 and boundary.controller.path.exists()
+            assert load_factory_record(tmp_path, record.run_id) == record
+            return
+        result = await invocation
+        assert result.status == "supervising"
+        assert boundary.create_calls == (2 if recovery in {"fresh", "release"} else 1)
+        prompts = [body for method, route, _, body in daemon.requests if method == "POST" and route.endswith("/prompt")]
+        assert len(prompts) == (1 if recovery in {"resume", "parked-resume"} else 0)
+        if prompts:
+            assert prompts[0] == {"text": "Continue the persisted factory run chainlink-2125 using factory resume semantics. "
+                                  "Resume its saved state and next step; do not create a new run or story.", "resume": True}
+
+
 @pytest.mark.parametrize("verified,release_fault", [(True, None), (False, None),
     *[(True, fault) for fault in ("failed", "held", "foreign", "history", "next", "status")]])
 async def test_fresh_park_recovery_uses_actual_new_context_after_old_quiescence(tmp_path, monkeypatch, verified, release_fault):
@@ -472,6 +1300,7 @@ async def test_explicit_epic_stop_is_bound_to_the_actual_host(tmp_path, requeste
     from mimir_cultivate.worklink.control import _mark_operator_stop
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
         boundary.outcome = "interrupted"
         _mark_operator_stop(tmp_path, 2125, 1, opencode_session_id=handle.identifier if requested else "ses_old_host")
         class Factory:
@@ -496,6 +1325,7 @@ async def test_explicit_epic_stop_is_bound_to_the_actual_host(tmp_path, requeste
         evidence = json.loads((tmp_path / "state/worklink/evidence/2125-1.json").read_text())
         assert evidence["opencode_session_id"] == handle.identifier
         assert evidence["status"] == ("interrupted" if requested else "failed")
+        assert all(daemon.shells[s]["status"] == "killed" for s in owned)
 
 
 @pytest.mark.parametrize("ending", ["running", "completed", "foreign", "unverified"])
@@ -505,6 +1335,7 @@ async def test_operator_stop_consumer_retains_or_releases_only_after_owned_quies
     from mimir_cultivate.worklink.worker_client import WorkerClient
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         _, boundary, _, handle, record = await admit(tmp_path, daemon, client)
+        owned = specialist_shells(daemon, handle, record)
         loop = asyncio.get_running_loop()
         lookups = 0
         def status(self, *a, **kw):
@@ -547,6 +1378,7 @@ async def test_operator_stop_consumer_retains_or_releases_only_after_owned_quies
                 assert boundary.controller.path.exists()
             else:
                 assert result.stopped and result.claim_released and retained.children_reaped
+                assert all(daemon.shells[s]["status"] == "killed" for s in owned)
                 assert retained.controller_phase == ("terminal" if ending == "completed" else "stopped")
                 if verified_evidence:
                     assert proof.read_bytes() == prior
@@ -771,6 +1603,121 @@ def supervisor_clock(monkeypatch):
     }))
     monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 100.0)
     return clock
+
+
+@pytest.mark.parametrize("observation_path", ["normal", "missed-status"])
+@pytest.mark.parametrize("activity", ["driver", "child", "grandchild", "quiet", "question", "pending-form", "shell", "driver-shell", "foreign-shell", "budget"])
+async def test_factory_idle_uses_session_tree_activity(
+    tmp_path, monkeypatch, supervisor_clock, activity, observation_path,
+):
+    from mimir_cultivate.worklink import orchestrator
+
+    base = datetime(2026, 11, 17, tzinfo=UTC)
+    class ClockDate(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return base + timedelta(seconds=supervisor_clock.now)
+    monkeypatch.setattr(orchestrator, "datetime", ClockDate)
+    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20000.0)
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 900.0)
+    # Own the liveness witnesses; this test concerns daemon activity, not Git IO.
+    monkeypatch.setattr(orchestrator, "_factory_work_snapshot", lambda *a: None)
+    monkeypatch.setattr(orchestrator, "_factory_transcript_snapshot", lambda *a: {})
+    async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
+        _, boundary, compute, handle, record = await admit(tmp_path, daemon, client)
+        boundary.finish = False
+        baseline = base.timestamp() * 1000
+        daemon.sessions[handle.identifier].info["time"]["updated"] = baseline
+        child = daemon.child(handle.identifier, updated_ms=baseline)
+        grandchild = daemon.child(child, updated_ms=baseline + 500000)
+        source = {"driver": handle.identifier, "child": child}.get(activity, grandchild)
+        if activity == "question":
+            # Publish before the compute wait task starts, rather than racing its
+            # HTTP observation against the supervisor's synthetic clock.
+            daemon.question(source, baseline + 1000)
+        # Fresh unrelated roots must never keep this run alive.
+        unrelated = await client.create_session(directory=str(tmp_path), model={"providerID": "openai", "id": "gpt-test"}, permissions=[])
+        daemon.activity(unrelated["data"]["id"], baseline + 30000000)
+        if activity == "shell":
+            daemon.start_shell(grandchild, str(tmp_path / "moved-specialist"))
+            daemon.sessions[grandchild].info["location"] = {"directory": str(tmp_path / "moved-specialist")}
+        elif activity in {"driver-shell", "foreign-shell"}:
+            # A long-lived driver lock-refresh shell is not progress. Authorize
+            # specialist work by metadata.sessionID, never by command text.
+            owner = handle.identifier if activity == "driver-shell" else unrelated["data"]["id"]
+            daemon.start_shell(owner, record.session_checkout)
+        current = record.status
+        reasons = []
+        missed = False
+        activity_reads = []
+        real_activity = boundary.session_tree_activity
+        async def tree_activity(selected):
+            activity_reads.append(supervisor_clock.now)
+            return await real_activity(selected)
+        monkeypatch.setattr(boundary, "session_tree_activity", tree_activity)
+
+        class Factory:
+            poll_interval_s = 0.001
+            def status(self, *args, **kwargs):
+                nonlocal current, missed
+                if (observation_path == "missed-status" and not missed
+                        and supervisor_clock.now == 7000):
+                    missed = True
+                    supervisor_clock.now = 8000
+                    raise RuntimeError("synthetic factory observation failure")
+                if current.status == "running" and supervisor_clock.now >= (21000 if activity == "budget" else 10000):
+                    # Bound a regressed watchdog too: a missed park becomes a
+                    # discriminating result assertion, not a real-time hang.
+                    current = replace(current, status="completed")
+                return current
+            def heartbeat(self, *args, **kwargs):
+                supervisor_clock.now += 1000
+                if activity in {"driver", "child", "grandchild", "budget"}:
+                    daemon.activity(source, baseline + supervisor_clock.now * 1000)
+                elif activity in {"question", "pending-form"}:
+                    form = daemon.question(source, baseline + supervisor_clock.now * 1000)
+                    if activity == "pending-form":
+                        # Non-question human forms still exercise the idle backstop;
+                        # questions take #2164's earlier operator-visible error path.
+                        form["metadata"]["kind"] = "other"
+            def terminal(self, *args, **kwargs):
+                nonlocal current
+                reasons.append(kwargs["reason"])
+                current = replace(current, status="needs-human", park_snapshot=str(tmp_path / "snapshot"))
+
+        async def finish(self, **kwargs):
+            return WorklinkRunResult(2125, 1, kwargs["factory_record"].status.status)
+        monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finish)
+        invocation = WorklinkRunner(home=tmp_path, repo=Path(record.sandbox))._supervise_factory_070(
+            issue=IssueContext(2125, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(2125, 1, "fixture", base),
+            claims=SimpleNamespace(heartbeat_issue=lambda *a, **kw: None), backend=Factory(), compute=compute,
+            factory_record=record, test_cmd="pytest", runner=lambda *a, **kw: None, started_at=base)
+        if activity == "question":
+            with pytest.raises(WorklinkError, match="pending_question"):
+                await asyncio.wait_for(invocation, 60)
+            assert supervisor_clock.now < 7200
+            assert reasons == [] and activity_reads == []
+            assert daemon.sessions[source].forms
+            assert not daemon.sessions[source].replies
+            return
+        result = await asyncio.wait_for(invocation, 60)
+        assert activity_reads and min(activity_reads) >= 7200
+        assert missed == (observation_path == "missed-status")
+        if activity in {"quiet", "pending-form", "driver-shell", "foreign-shell", "budget"}:
+            assert result.status == "needs-human" and len(reasons) == 1
+            if activity == "budget":
+                assert reasons[0].startswith("budget exhausted")
+                assert supervisor_clock.now == 20000
+            else:
+                assert "factory driver idle" in reasons[0]
+                assert source in reasons[0]
+                stamp = daemon.sessions[source].info["time"]["updated"]
+                assert datetime.fromtimestamp(stamp / 1000, UTC).isoformat() in reasons[0]
+                assert ("pending form is not progress" in reasons[0]) == (activity == "pending-form")
+                assert supervisor_clock.now == 8000
+        else:
+            assert result.status == "completed" and reasons == []
 
 
 def test_epic_launch_at_operator_checkout_without_controller_init(tmp_path, monkeypatch):

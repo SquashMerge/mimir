@@ -21,6 +21,8 @@ from unittest.mock import Mock, call
 
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 pytest.importorskip("mimir_cultivate", reason="Worklink executor belongs to Cultivate")
 
 from mimir_cultivate.worklink.checkout import CheckoutAuthorization, _mint_checkout_authorization
@@ -49,6 +51,195 @@ def _issued(tmp_path: Path) -> Path:
 def _authorization(path: Path) -> CheckoutAuthorization:
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     return _mint_checkout_authorization(path, 41, 2, fd)
+
+
+@pytest.fixture
+def attempt_deletion(monkeypatch):
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor
+
+    # A trusted ancestry, independent of the worker-writable checkout hosting
+    # pytest. Only identities and socket peer setup are substituted.
+    with tempfile.TemporaryDirectory(prefix="attempt-delete-", dir="/tmp") as temporary:
+        root = Path(temporary) / "worklink"
+        checkout = root / "repo" / "41-2"
+        checkout.mkdir(parents=True)
+        checkout.chmod(0o2770)
+        root.chmod(0o750)
+        checkout.parent.chmod(0o750)
+        sibling = checkout.with_name("41-3")
+        sibling.mkdir()
+        sibling.chmod(0o2770)
+        (sibling / "canary").write_text("sibling")
+        outside = Path(temporary) / "outside"
+        outside.mkdir()
+        (outside / "canary").write_text("outside")
+        ids = identities.WorklinkIdentities(os.geteuid(), os.geteuid() + 1, os.getegid())
+        monkeypatch.setattr(worker_exec, "get_identities", lambda: ids)
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+        client = WorkerClient.for_path_checkout(checkout, issue_id=41, attempt=2, run_uid=ids.worklink_uid)
+        pending = []
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def connect(timeout):
+                local, remote = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                local.settimeout(timeout)
+                pending.append(pool.submit(worker_exec.handle_connection, remote))
+                return local
+            monkeypatch.setattr(client, "_connect", connect)
+            yield SimpleNamespace(root=root, checkout=checkout, sibling=sibling, outside=outside,
+                                  client=client, identities=ids, request={
+                "version": 1, "op": "delete_attempt", "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+                "path": str(checkout), "issue": 41, "attempt": 2,
+            })
+            for future in pending:
+                future.result(timeout=10)
+
+
+def test_attempt_delete_removes_worker_content_without_following_links_or_siblings(attempt_deletion):
+    boundary = attempt_deletion
+    cache = boundary.checkout / "__pycache__"
+    cache.mkdir(mode=0o700)
+    (cache / "poller.cpython-311.pyc").write_bytes(b"worker bytecode")
+    (boundary.checkout / "external").symlink_to(boundary.outside, target_is_directory=True)
+    (boundary.checkout / "file-link").symlink_to(boundary.outside / "canary")
+    (boundary.checkout / "missing").symlink_to(boundary.outside / "absent")
+
+    boundary.client.delete_attempt()
+    boundary.client.delete_attempt()  # Idempotent after successful cleanup.
+
+    assert not boundary.checkout.exists()
+    assert boundary.checkout.parent.is_dir()
+    assert (boundary.sibling / "canary").read_text() == "sibling"
+    assert (boundary.outside / "canary").read_text() == "outside"
+
+
+@pytest.mark.parametrize("defect", ["fields", "fds", "identity", "issue", "attempt", "path_type", "nul",
+    "outside", "relative", "noncanonical", "parent", "nested", "repository", "dotdot", "sibling"])
+def test_attempt_delete_refuses_invalid_contract_and_scope(attempt_deletion, defect):
+    boundary = attempt_deletion
+    request = dict(boundary.request)
+    fds = []
+    outside_attempt = boundary.outside / "repo" / "41-2"
+    outside_attempt.mkdir(parents=True)
+    outside_attempt.chmod(0o2770)
+    outside_attempt.parent.chmod(0o750)
+    boundary.outside.chmod(0o750)
+    if defect == "repository":
+        invalid = boundary.root / "bad repo" / "41-2"
+        invalid.mkdir(parents=True)
+        invalid.parent.chmod(0o750)
+        invalid.chmod(0o2770)
+    if defect == "dotdot":
+        (boundary.root.parent / "41-2").mkdir(mode=0o2770)
+        (boundary.root.parent / "41-2").chmod(0o2770)
+    if defect == "fields":
+        request["extra"] = True
+    elif defect == "fds":
+        fds = [1]
+    elif defect == "identity":
+        request["executor_identity"] = "old-executor"
+    elif defect in {"issue", "attempt"}:
+        request[defect] = 0
+    else:
+        request["path"] = {
+            "path_type": None, "nul": "\x00", "outside": str(outside_attempt),
+            "relative": "repo/41-2", "noncanonical": str(boundary.checkout) + "/",
+            "parent": str(boundary.checkout.parent), "nested": str(boundary.checkout / "nested"),
+            "repository": str(boundary.root / "bad repo" / "41-2"),
+            "dotdot": str(boundary.root / ".." / "41-2"), "sibling": str(boundary.sibling),
+        }[defect]
+    reason = ("exact contract" if defect in {"fields", "fds"} else
+              "stale root executor" if defect == "identity" else
+              "positive integer" if defect in {"issue", "attempt"} else
+              "path is invalid" if defect in {"path_type", "nul"} else
+              "outside the Worklink root" if defect in {"outside", "relative"} else
+              "shape is invalid")
+    with pytest.raises(RuntimeError, match=reason):
+        worker_exec._handle_delete_attempt(Mock(), request, fds)
+    assert boundary.checkout.is_dir()
+    assert outside_attempt.is_dir()
+    assert (boundary.sibling / "canary").read_text() == "sibling"
+    assert (boundary.outside / "canary").read_text() == "outside"
+
+
+@pytest.mark.parametrize("defect", ["symlink", "file", "owner", "group", "mode"])
+def test_attempt_delete_refuses_invalid_checkout_metadata(attempt_deletion, monkeypatch, defect):
+    boundary = attempt_deletion
+    real_stat = os.stat
+    if defect in {"symlink", "file"}:
+        boundary.checkout.rmdir()
+        if defect == "symlink":
+            boundary.outside.chmod(0o2770)
+            boundary.checkout.symlink_to(boundary.outside, target_is_directory=True)
+        else:
+            boundary.checkout.write_text("not a directory")
+            boundary.checkout.chmod(0o2770)
+    else:
+        def observed(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if path == "41-2" and kwargs.get("dir_fd") is not None:
+                change = {"owner": {"st_uid": boundary.identities.mimir_uid + 10},
+                          "group": {"st_gid": boundary.identities.worklink_gid + 10},
+                          "mode": {"st_mode": stat.S_IFDIR | 0o2777}}[defect]
+                return stat_with(info, **change)
+            return info
+        monkeypatch.setattr(os, "stat", observed)
+    with pytest.raises(RuntimeError, match="ownership or mode"):
+        worker_exec._handle_delete_attempt(Mock(), boundary.request, [])
+    assert (boundary.outside / "canary").read_text() == "outside"
+
+
+@pytest.mark.parametrize("defect", ["owner", "world_write", "worker_group_write"])
+@pytest.mark.parametrize("ancestor", ["repository", "root"])
+def test_attempt_delete_refuses_worker_writable_ancestors(attempt_deletion, monkeypatch, defect, ancestor):
+    boundary = attempt_deletion
+    target = boundary.checkout.parent if ancestor == "repository" else boundary.root
+    inode = target.stat().st_ino
+    real_fstat = os.fstat
+    def observed(fd):
+        info = real_fstat(fd)
+        if info.st_ino == inode:
+            change = {"owner": {"st_uid": boundary.identities.worklink_uid},
+                      "world_write": {"st_mode": stat.S_IFDIR | 0o702},
+                      "worker_group_write": {"st_mode": stat.S_IFDIR | 0o770}}[defect]
+            return stat_with(info, **change)
+        return info
+    monkeypatch.setattr(os, "fstat", observed)
+    with pytest.raises(RuntimeError, match="ancestor is worker-writable"):
+        worker_exec._handle_delete_attempt(Mock(), boundary.request, [])
+    assert boundary.checkout.exists()
+
+
+def test_attempt_delete_never_follows_ancestor_symlink(attempt_deletion):
+    boundary = attempt_deletion
+    parent = boundary.checkout.parent
+    relocated = boundary.outside / "relocated"
+    parent.rename(relocated)
+    parent.symlink_to(relocated, target_is_directory=True)
+    with pytest.raises(OSError):
+        worker_exec._handle_delete_attempt(Mock(), boundary.request, [])
+    assert (relocated / "41-2").is_dir()
+    assert (relocated / "41-3" / "canary").read_text() == "sibling"
+
+
+def test_attempt_delete_requires_symlink_safe_walker(attempt_deletion, monkeypatch):
+    monkeypatch.setattr(shutil.rmtree, "avoids_symlink_attacks", False)
+    with pytest.raises(RuntimeError, match="symlink-safe"):
+        worker_exec._handle_delete_attempt(Mock(), attempt_deletion.request, [])
+    assert attempt_deletion.checkout.is_dir()
+
+
+@pytest.mark.parametrize("response", [{"status": "deleted", "path": "/sibling"},
+    {"status": "ok"}, {"error": "deletion denied"}, None])
+def test_attempt_delete_client_requires_exact_success(attempt_deletion, monkeypatch, response):
+    channel = Mock()
+    channel.recv.return_value = json.dumps(response).encode()
+    monkeypatch.setattr(attempt_deletion.client, "_connect", lambda timeout: channel)
+    with pytest.raises(RuntimeError, match="attempt deletion failed"):
+        attempt_deletion.client.delete_attempt()
+    channel.close.assert_called_once()
+    assert json.loads(channel.send.call_args.args[0]) == attempt_deletion.request
+    assert attempt_deletion.checkout.is_dir()
 
 
 @pytest.mark.asyncio
@@ -320,6 +511,7 @@ async def test_epic_operator_checkout_lifecycle_refuses_unrecorded_locations(ses
     assert create["location"] == {"directory": str(outer)}
     assert create["model"] == {"providerID": "openai", "id": "gpt-test", "variant": "high"}
     assert create["permissions"] == [{"action": "external_directory", "resource": "*", "effect": "deny"},
+        {"action": "question", "resource": "*", "effect": "deny"},
         *[{"action": "read", "resource": name, "effect": "deny"} for name in (".env", "**/.env", "**/.env.*")]]
     environment = boundary.daemon.sessions[handle.identifier].environment
     assert environment["GH_TOKEN"] == environment["GITHUB_TOKEN"] == "generation-bot-token"
@@ -3736,7 +3928,8 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
         payload = (
             "import subprocess, sys; "
             f"sys.exit(subprocess.run([sys.executable, '-c', {grandchild!r}], "
-            "start_new_session=True, timeout=5).returncode)"
+            # Hang guard for the grandchild, not an identity-switch latency bound.
+            f"start_new_session=True, timeout={SUBPROCESS_HANG_GUARD_SECONDS}).returncode)"
         )
         if git_intake:
             git = shutil.which("git", path="/usr/bin:/bin")

@@ -27,6 +27,7 @@ from typing import Sequence
 import pytest
 
 from tests.plugin_selection import cultivate_selected
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
 
 if not cultivate_selected():
     pytest.skip("Worklink autonomy requires selected Cultivate", allow_module_level=True)
@@ -1493,6 +1494,251 @@ def test_archive_factory_record_releases_checkout_retention(tmp_path: Path) -> N
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
 
 
+@pytest.fixture
+def runtime_prune_attempt(
+    tmp_path: Path, factory_process_ticks: None,
+) -> tuple[Path, Path, FactoryRunRecord]:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / "checkout" / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    runtime = child / ".factory-runtime" / "data"
+    runtime.mkdir(parents=True)
+    (runtime / "store").write_text("retained runtime", encoding="utf-8")
+    os.utime(child, (0, 0))
+    record = replace(
+        _factory_record(sandbox, phase="terminal", status="completed", process="dead"),
+        children_reaped=True,
+    )
+    return repo, child, record
+
+
+def test_prune_archived_verified_dead_reaped_runtime(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord],
+) -> None:
+    repo, child, record = runtime_prune_attempt
+    save_factory_record(tmp_path, record)
+    archived = archive_worklink_factory_records(tmp_path, record.issue_id)
+    assert len(archived) == 1
+    assert list_factory_records(tmp_path).records == ()
+    assert list_factory_records(tmp_path, archived=True).records == (record,)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+    assert not child.exists()
+    assert archived[0].is_file()
+
+
+@pytest.mark.parametrize("process", ["live", "missing-ticks", "unknown-substrate"])
+def test_prune_archived_runtime_requires_verified_driver_death(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord],
+    monkeypatch: pytest.MonkeyPatch, process: str,
+) -> None:
+    repo, child, record = runtime_prune_attempt
+    record = replace(record, handle=_factory_record(Path(record.sandbox), process=process).handle)
+    save_factory_record(tmp_path, record)
+    archive_worklink_factory_records(tmp_path, record.issue_id)
+    events = []
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert (child / ".factory-runtime" / "data" / "store").read_text() == "retained runtime"
+    assert ("worklink_factory_runtime_prune_refused", {
+        "attempt_path": str(child), "reason": "driver death is not verified",
+    }) in events
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_prune_archived_runtime_requires_specialist_reaping(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord], legacy: bool,
+) -> None:
+    repo, child, record = runtime_prune_attempt
+    path = save_factory_record(tmp_path, replace(record, children_reaped=False))
+    if legacy:
+        payload = json.loads(path.read_text())
+        del payload["children_reaped"]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    archive_worklink_factory_records(tmp_path, record.issue_id)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert (child / ".factory-runtime" / "data" / "store").read_text() == "retained runtime"
+
+
+@pytest.mark.parametrize("unrelated_archive", [False, True])
+def test_prune_runtime_without_any_record_is_refused(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord],
+    unrelated_archive: bool,
+) -> None:
+    repo, child, record = runtime_prune_attempt
+    # An archived record for a different attempt must not authorize this one.
+    if unrelated_archive:
+        other_sandbox = child.parent / "841-2" / "checkout" / ".factory-sandboxes" / record.run_id
+        save_factory_record(tmp_path, replace(
+            _factory_record(other_sandbox, process="dead"), attempt=2, children_reaped=True,
+        ))
+        archive_worklink_factory_records(tmp_path, record.issue_id)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert (child / ".factory-runtime" / "data" / "store").read_text() == "retained runtime"
+
+
+def test_prune_runtime_repeated_refusal_logs_once_across_ticks(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, child, _ = runtime_prune_attempt
+    events = []
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+    for _ in range(3):
+        assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+
+    refusals = [fields for name, fields in events if name == "worklink_factory_runtime_prune_refused"]
+    assert refusals == [{
+        "attempt_path": str(child), "reason": "runtime has no authoritative factory record",
+    }]
+    assert child.exists()
+
+
+def test_prune_runtime_refusal_logs_reason_changes_and_recovery(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, child, record = runtime_prune_attempt
+    events = []
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    save_factory_record(tmp_path, replace(record, children_reaped=False))
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    save_factory_record(tmp_path, record)
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+    # Recreating the same path must not inherit the old refusal suppression.
+    (child / ".factory-runtime").mkdir(parents=True)
+    os.utime(child, (0, 0))
+    save_factory_record(tmp_path, replace(record, children_reaped=False))
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+
+    runtime_events = [(name, fields) for name, fields in events
+                      if name.startswith("worklink_factory_runtime_prune_")]
+    assert [name for name, _ in runtime_events] == [
+        "worklink_factory_runtime_prune_refused", "worklink_factory_runtime_prune_refused",
+        "worklink_factory_runtime_prune_ready", "worklink_factory_runtime_prune_refused",
+    ]
+    assert [fields["reason"] for name, fields in runtime_events if name.endswith("refused")] == [
+        "runtime has no authoritative factory record",
+        "specialist reaping is not verified; operator quiescence recovery required",
+        "specialist reaping is not verified; operator quiescence recovery required",
+    ]
+
+
+def test_prune_runtime_refusals_are_independent_per_path(
+    runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, child, _ = runtime_prune_attempt
+    other = child.parent / "842-1"
+    (other / ".factory-runtime").mkdir(parents=True)
+    events = []
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+    for attempt in (child, other, child, other):
+        assert not autonomy._prepare_factory_runtime_prune(attempt, [])
+    assert [fields["attempt_path"] for _, fields in events] == [str(child), str(other)]
+
+
+@pytest.mark.parametrize("archive_name", [
+    "chainlink-842-attempt-1.json", "chainlink-842-attempt-1-2.json",
+    "842-attempt-1.json", "unidentified-legacy.json",
+])
+def test_prune_legacy_archive_failure_is_contained_per_attempt(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord],
+    monkeypatch: pytest.MonkeyPatch, archive_name: str,
+) -> None:
+    repo, readable, record = runtime_prune_attempt
+    save_factory_record(tmp_path, record)
+    readable_archive, = archive_worklink_factory_records(tmp_path, record.issue_id)
+
+    legacy = readable.parent / "842-1"
+    sandbox = legacy / "checkout" / ".factory-sandboxes" / "chainlink-842"
+    sandbox.mkdir(parents=True)
+    (legacy / ".factory-runtime").mkdir()
+    (legacy / ".factory-runtime" / "store").write_text("legacy runtime", encoding="utf-8")
+    legacy_record = replace(
+        _factory_record(sandbox, phase="terminal", status="completed", process="dead"),
+        children_reaped=True,
+    )
+    payload = legacy_record.to_json()
+    # Real-shape historical contract from deployment review: list-valued gates
+    # (as in chainlink-1521-attempt-1/-2), not merely malformed JSON.
+    payload["status"]["gates"] = []
+    unreadable_archive = readable_archive.parent / archive_name
+    unreadable_archive.write_text(json.dumps(payload), encoding="utf-8")
+
+    unrelated = readable.parent / "843-1"
+    unrelated.mkdir()
+    # Unknown archive names also refuse only runtime-bearing attempts without
+    # readable authority, never ordinary attempts without a runtime store.
+    for child in (readable, legacy, unrelated):
+        os.utime(child, (0, 0))
+    listing = list_factory_records(tmp_path, archived=True)
+    assert listing.records == (record,)
+    assert len(listing.failures) == 1
+    assert listing.failures[0].path == unreadable_archive
+    assert "gates must be a bounded object" in listing.failures[0].reason
+    events = []
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+
+    pruned = autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo)
+    assert set(pruned) == {readable, unrelated}
+    assert not readable.exists()
+    assert not unrelated.exists()
+    assert (legacy / ".factory-runtime" / "store").read_text() == "legacy runtime"
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    refusals = [fields for name, fields in events if name == "worklink_factory_runtime_prune_refused"]
+    assert refusals == [{
+        "attempt_path": str(legacy), "reason": "archived factory record unreadable",
+    }]
+    assert readable_archive.is_file()
+    assert unreadable_archive.is_file()
+    assert list_factory_records(tmp_path).records == ()
+
+
+def test_prune_unreadable_live_record_still_blocks_all_attempts(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord],
+) -> None:
+    repo, child, record = runtime_prune_attempt
+    path = save_factory_record(tmp_path, record)
+    path.write_text("{", encoding="utf-8")
+    unrelated = child.parent / "842-1"
+    unrelated.mkdir()
+    os.utime(unrelated, (0, 0))
+
+    assert len(list_factory_records(tmp_path).failures) == 1
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert unrelated.is_dir()
+    assert (child / ".factory-runtime" / "data" / "store").read_text() == "retained runtime"
+
+
+@pytest.mark.parametrize("unsafe", ["malformed", "symlink"])
+def test_prune_refuses_unreadable_archived_record(
+    tmp_path: Path, runtime_prune_attempt: tuple[Path, Path, FactoryRunRecord], unsafe: str,
+) -> None:
+    repo, child, record = runtime_prune_attempt
+    save_factory_record(tmp_path, record)
+    path, = archive_worklink_factory_records(tmp_path, record.issue_id)
+    if unsafe == "malformed":
+        path.write_text("{", encoding="utf-8")
+    else:
+        target = tmp_path / "untrusted.json"
+        path.rename(target)
+        path.symlink_to(target)
+
+    # Even a usable live record cannot override unreadable archive evidence.
+    save_factory_record(tmp_path, record)
+    assert len(list_factory_records(tmp_path, archived=True).failures) == 1
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert (child / ".factory-runtime" / "data" / "store").read_text() == "retained runtime"
+
+
 @pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_does_not_extend_checkout_for_another_attempt(tmp_path: Path) -> None:
     _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
@@ -2249,7 +2495,7 @@ def test_poller_import_path_repair_uses_explicit_source_dir_without_editable_ins
         env={"MIMIR_SOURCE_DIR": str(source_dir), "PATH": os.environ.get("PATH", "")},
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -2280,7 +2526,7 @@ def test_poller_import_path_repair_adds_source_venv_site_packages(tmp_path: Path
         env={"MIMIR_SOURCE_DIR": str(source_dir), "PATH": os.environ.get("PATH", "")},
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -2398,6 +2644,34 @@ def _load_poller_module():
         sys.modules.pop(spec.name, None)
         raise
     return module
+
+
+def test_stale_worklink_lock_released_on_next_tick(tmp_path, monkeypatch):
+    poller = _load_poller_module()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(poller, "BackendRegistry", lambda _: None)
+    monkeypatch.setattr(poller.WorklinkConfig, "load", lambda _: object())
+    monkeypatch.setattr(poller, "pending_failure_alerts", lambda _: (set(), []))
+    # Reconciliation must run even when incident delivery suppresses ready dispatch.
+    monkeypatch.setattr(poller, "_deliver_failure_alerts", lambda *args: False)
+    locks = {"2152": {"issue_id": 2152, "agent_id": "mimir-worklink"}}
+    calls, events = [], []
+
+    def run(args, **kwargs):
+        assert kwargs["cwd"] == str(tmp_path)
+        calls.append(args)
+        if args[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"locks": locks}), "")
+        assert args == [poller._chainlink_bin(), "locks", "release", "2152"]
+        locks.clear()
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(poller.subprocess, "run", run)
+    monkeypatch.setattr(poller, "_emit", events.append)
+    assert poller.main() == 0
+    assert not locks
+    assert len([c for c in calls if c[1:3] == ["locks", "release"]]) == 1
+    assert any(e.get("signal") == "worklink_lock_reconciled" and e["issue_id"] == 2152 for e in events)
 
 
 def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:

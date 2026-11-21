@@ -227,7 +227,7 @@ def test_contained_ingress_drops_sensitive_endpoint_without_safe_override(name: 
 
 
 def test_worker_protocol_matches_executor_image_contract() -> None:
-    expected_protocol = "worklink-executor-v19-independent-retirement"
+    expected_protocol = "worklink-executor-v22-claude-retained-recovery"
     assert worker_client.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_exec.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
     assert worker_client.MAX_REQUEST_BYTES == worker_exec.MAX_REQUEST_BYTES == 256 * 1024
@@ -235,6 +235,52 @@ def test_worker_protocol_matches_executor_image_contract() -> None:
     assert worker_client.DEFAULT_EXECUTOR_SOCKET == worker_exec.DEFAULT_EXECUTOR_SOCKET == Path(
         "/run/mimir-worklink/socket/worklink-execd.sock"
     )
+
+
+@pytest.mark.parametrize("operation", ["session_rearm", "session_release_quiescent", "session_resume"])
+@pytest.mark.parametrize("stale_side", ["executor", "controller"])
+def test_retained_recovery_rejects_stale_executor_protocol_before_dispatch(
+    operation: str, stale_side: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_identity = "worklink-executor-v22-claude-retained-recovery"
+    old_identity = "worklink-executor-v21-controller-busy-retained-recovery"
+    request = {
+        "version": 1, "op": operation, "executor_identity": current_identity,
+        "issue": 2173, "attempt": 1, "device": 1, "inode": 2,
+        "path": "/unused/checkout", "generation": "test-generation",
+        "opencode_session_id": "ses_retained",
+    }
+    boundary_calls = []
+
+    def checkout_boundary():
+        boundary_calls.append(operation)
+        raise RuntimeError("test checkout boundary reached")
+
+    monkeypatch.setattr(worker_exec, "get_identities", checkout_boundary)
+
+    def exchange():
+        client, executor = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            client.settimeout(2)
+            executor.settimeout(2)
+            client.send(json.dumps(request).encode())
+            worker_exec.handle_connection(executor)
+            return json.loads(client.recv(worker_exec.MAX_REQUEST_BYTES))
+        finally:
+            client.close()
+            executor.close()
+
+    # The same exact-shape request reaches checkout admission with matching
+    # identities, so a malformed request cannot make this refusal test pass.
+    assert exchange()["error"] == "test checkout boundary reached"
+    assert boundary_calls == [operation]
+    boundary_calls.clear()
+    if stale_side == "executor":
+        monkeypatch.setattr(worker_exec, "EXECUTOR_PROTOCOL_IDENTITY", old_identity)
+    else:
+        request["executor_identity"] = old_identity
+    assert exchange() == {"id": None, "error": worker_client.STALE_EXECUTOR_DIAGNOSTIC}
+    assert boundary_calls == []
 
 
 def test_checkout_root_env_and_default_are_shared(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

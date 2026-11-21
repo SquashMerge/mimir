@@ -94,7 +94,7 @@ the private deployment env. Switching routes requires a fresh deployment.
 | `$MIMIR_HOME/.claude/.credentials.json` (path resolved by `MIMIR_CLAUDE_OAUTH_CREDENTIALS`; falls back to `$HOME/.claude/.credentials.json` only if MIMIR_HOME is unset) | Claude Max OAuth subprocess for `ANTHROPIC_BASE_URL`-routed deployments | `claude /login` from a terminal with access to the host browser | `mimir oauth-usage-check` (already exists); a non-failing `oauth_usage_polled` event in `events.jsonl` |
 | Gmail OAuth refresh tokens (gog keyring) | `gog` CLI for Gmail / Calendar | `gog auth login <account>` (interactive) | `gog gmail search 'newer_than:1h' --max 1 --account <name>` succeeds |
 | Google Workspace OAuth (gogcli) | Google Calendar, Drive | Same as above | `gog calendar list --account <name>` |
-| `/var/lib/mimir-worklink/daemon/data/opencode/opencode.db` | Worklink OpenCode 2 daemon; `openai` / `chatgpt-browser` OAuth (also accepts existing `chatgpt-headless`) | Automatically seeded from the agent's `~/.codex/auth.json` (`$CODEX_HOME/auth.json` if set); use setup's existing agent `codex login --device-auth` command | Controller reconciliation uses authenticated `/api/credential`, equivalent to pinned 2.2.7 `auth export`/`import`. Sanitized local health inspects the DB read-only as worklink. `locally_unexpired` and `refreshable_unverified` permit workloads; neither proves subscription, revocation or future refresh validity. OpenCode owns DB writes and migrations. |
+| `/var/lib/mimir-worklink/daemon/data/opencode/opencode.db` | Worklink OpenCode 2 daemon; `openai` / `chatgpt-browser` OAuth (also accepts existing `chatgpt-headless`) | Automatically seeded from the agent's `~/.codex/auth.json` (`$CODEX_HOME/auth.json` if set); use setup's existing agent `codex login --device-auth` command | Controller reconciliation uses authenticated `/api/credential`, equivalent to pinned 2.3.0 `auth export`/`import`. Sanitized local health inspects the DB read-only as worklink. `locally_unexpired` and `refreshable_unverified` permit workloads; neither proves subscription, revocation or future refresh validity. OpenCode owns DB writes and migrations. |
 
 The controller (`mimir` uid) reconciles before leaf builds and factory epic launches,
 at startup, and every 15 minutes (`MIMIR_WORKLINK_CODEX_RECONCILE_CRON`, default
@@ -102,7 +102,9 @@ at startup, and every 15 minutes (`MIMIR_WORKLINK_CODEX_RECONCILE_CRON`, default
 credentials. Daemon-newer tokens replace only the agent access/refresh/account
 fields and `last_refresh`, preserving `id_token`, `oauth_provenance`,
 `login_owner_id` and all unknown keys. All daemon imports use `expires: 0`:
-OpenCode 2.2.7's no-refresh sentinel. Equal expiries still normalize legacy
+OpenCode 2.3.0's no-refresh sentinel (verified in the pinned native OAuth
+staleness predicate; see `tests/fixtures/worklink/opencode_2_3_0/PROVENANCE.md`).
+Equal expiries still normalize legacy
 positive-expiry entries; an identical normalized bundle does not write.
 Reads, atomic mode-0600 write-back and daemon propagation hold the same exclusive
 `auth.json.lock` flock as codex-plus and re-read after acquiring it.

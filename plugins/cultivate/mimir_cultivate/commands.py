@@ -62,6 +62,13 @@ def add_argparse(
     clear_p.add_argument("--occurrence", help="Require this exact incident occurrence id.")
     clear_p.add_argument("--home", type=Path, default=None, help="Agent home.")
 
+    for action in ("release-session", "resume-session"):
+        recovery_p = worklink_sub.add_parser(action, help="Recover a quiescent retained epic driver.")
+        recovery_p.add_argument("issue_id", type=int)
+        recovery_p.add_argument("--attempt", type=int, required=True)
+        recovery_p.add_argument("--confirm-quiescent", action="store_true", required=True)
+        recovery_p.add_argument("--home", type=Path, default=None)
+
     recover_runtime_p = worklink_sub.add_parser(
         "clear-factory-runtime", help="Operator-confirmed cleanup of a quiescent legacy factory store."
     )
@@ -178,6 +185,9 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     if args.worklink_action == "clear-incident":
         return _clear_incident(args)
+
+    if args.worklink_action in {"release-session", "resume-session"}:
+        return _recover_session(args)
 
     if args.worklink_action == "clear-factory-runtime":
         from .worklink.autonomy import recover_factory_runtime
@@ -350,6 +360,10 @@ def _require_incident_quiescent(home: Path, issue_id: int, run: Runner, chainlin
         if not factory_process_is_verified_dead(record, allow_missing_start_ticks=True):
             raise ValueError("issue has an active factory run (or run liveness is unknown)")
 
+    _require_no_active_claim(issue_id, run, chainlink_bin)
+
+
+def _require_no_active_claim(issue_id: int, run: Runner, chainlink_bin: str) -> None:
     result = run([chainlink_bin, "locks", "list", "--json"])
     if result.returncode != 0:
         raise ValueError("cannot verify active claims: chainlink locks list failed")
@@ -367,6 +381,59 @@ def _require_incident_quiescent(home: Path, issue_id: int, run: Runner, chainlin
             raise ValueError("cannot verify active claims: invalid issue identity")
         if int(raw_id) == issue_id:
             raise ValueError("issue has an active claim")
+
+
+def _recover_session(args: argparse.Namespace) -> int:
+    import asyncio
+    from .worklink.autonomy import chainlink_bin
+    from .worklink.control import _claim_mutex, _runner
+    from .worklink.dispatch_failures import (
+        clear_operator_incident, current_failure_record, dispatch_failure_state_dir,
+    )
+    from .worklink.factory_state import load_factory_records_for_issue
+    from .worklink.identities import get_identities
+    from .worklink.worker_client import WorkerClient
+
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    run, binary = _runner(home), chainlink_bin()
+    try:
+        if not args.confirm_quiescent:
+            raise ValueError("operator_confirmation_required")
+        with _claim_mutex(home):
+            _require_no_active_claim(args.issue_id, run, binary)
+            records = load_factory_records_for_issue(home, args.issue_id)
+            if len(records) != 1:
+                raise ValueError("retained_epic_driver_unavailable")
+            record = records[0]
+            if record.issue_id != args.issue_id or record.attempt != args.attempt:
+                raise ValueError("retained_attempt_mismatch")
+            if (record.run_id != f"chainlink-{args.issue_id}" or record.handle is None
+                    or record.handle.substrate != "opencode_daemon" or record.session_checkout is None
+                    or record.session != record.opencode_session_id
+                    or record.opencode_session_id != record.handle.opencode_session_id):
+                raise ValueError("retained_epic_driver_binding_invalid")
+            client = WorkerClient.for_path_checkout(
+                Path(record.session_checkout), issue_id=args.issue_id, attempt=args.attempt,
+                run_uid=get_identities().worklink_uid)
+            operation = (client.session_resume if args.worklink_action == "resume-session"
+                         else client.session_release_quiescent)
+            asyncio.run(operation(record.handle))
+            if args.worklink_action == "resume-session":
+                state_dir = dispatch_failure_state_dir(home)
+                incident = current_failure_record(state_dir, args.issue_id)
+                if incident is not None and incident.get("active") is True:
+                    clear_operator_incident(state_dir, args.issue_id, reason="operator resume-session",
+                                            signature=incident["signature"], occurrence_id=incident["occurrence_id"])
+                for label in ("worklink:blocked", "worklink:failed"):
+                    if run([binary, "issue", "unlabel", str(args.issue_id), label]).returncode:
+                        raise RuntimeError("session_resumed_but_rearm_failed")
+                if run([binary, "issue", "label", str(args.issue_id), "worklink:ready"]).returncode:
+                    raise RuntimeError("session_resumed_but_rearm_failed")
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        print(f"{args.worklink_action} refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"worklink #{args.issue_id}: {args.worklink_action} succeeded")
+    return 0
 
 
 def _clear_incident(args: argparse.Namespace) -> int:

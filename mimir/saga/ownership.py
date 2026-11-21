@@ -16,6 +16,7 @@ import json
 import logging
 import sqlite3
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from time import monotonic
@@ -663,13 +664,14 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
     - origin_channel: all sources must have the same channel.
       Mixed channels → None (becomes legacy_admin).
     - visibility: most restrictive wins (public < private < service < legacy_admin).
-    - provenance: union of all source provenances; if any source lacks
-      provenance (empty dict), result has empty provenance (becomes legacy_admin).
+    - provenance: union of all source provenances; if any source has empty,
+      missing, or non-mapping provenance, result has empty provenance
+      (becomes legacy_admin).
 
     A source is considered "ambiguous" if:
     - Its owner_principal is legacy_admin (pre-v7 data)
     - Its visibility is legacy_admin
-    - Its provenance is empty or missing
+    - Its provenance is empty, missing, or not a mapping (including JSON null)
     - It has mixed owner/domain/channel with other sources
 
     Args:
@@ -688,7 +690,7 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
     origin_channel = first.origin_channel
     channel_mismatch = False
     origin_domain = first.origin_domain
-    provenance = dict(first.provenance)
+    provenance = dict(first.provenance) if isinstance(first.provenance, Mapping) else {}
     vis_order = [
         Visibility.PUBLIC,
         Visibility.PRIVATE,
@@ -718,7 +720,7 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
             max(_visibility_rank(visibility), _visibility_rank(acl.visibility))
         ]
 
-        if not acl.provenance:
+        if not isinstance(acl.provenance, Mapping) or not acl.provenance:
             provenance = {}
         elif provenance:
             provenance = {**provenance, **acl.provenance}

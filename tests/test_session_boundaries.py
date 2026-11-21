@@ -8,6 +8,7 @@ markers, the ``closed_since`` corrective-overrides applier, and
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -248,8 +249,9 @@ def test_validation_chainlink_does_not_use_lookup_slot_next_to_merged_pr(
 
 
 def test_validation_partial_not_found_only_marks_missing_alias_unverified(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="mimir.session_boundary_log")
     def fake_run(args, **kwargs):
         return subprocess.CompletedProcess(
             args, 1,
@@ -278,9 +280,89 @@ def test_validation_partial_not_found_only_marks_missing_alias_unverified(
     assert boundaries[0]["unfinished"] == [
         "issue #2116 queued [unverified]", "issue #50 open",
     ]
+    assert not [
+        record for record in caplog.records
+        if record.name == "mimir.session_boundary_log" and record.levelno > logging.DEBUG
+    ]
+
+
+@pytest.mark.parametrize("missing_node", [
+    None,
+    {"issueOrPullRequest": None},
+    # An error must not be trusted even if its alias also contains a state.
+    {"issueOrPullRequest": {"__typename": "Issue", "state": "CLOSED"}},
+])
+def test_validation_not_found_alias_never_drops_unknown_work(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    missing_node: dict | None,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="mimir.session_boundary_log")
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 1,
+            json.dumps({
+                "data": {
+                    "a0": missing_node,
+                    "a1": {"issueOrPullRequest": {
+                        "__typename": "PullRequest", "state": "MERGED",
+                    }},
+                },
+                "errors": [{
+                    "type": "NOT_FOUND", "path": ["a0", "issueOrPullRequest"],
+                }],
+            }), "gh: Could not resolve to an issue or pull request\n",
+        )
+
+    monkeypatch.setattr("mimir.session_boundary_log.subprocess.run", fake_run)
+    boundaries = validate_unfinished_work(
+        _boundary(
+            "issue #2178 queued", "PR #1187 awaits merge",
+            "issue #2178 and PR #1187 need follow-up",
+        ),
+        default_repo="octo/repo",
+    )
+    assert boundaries[0]["unfinished"] == [
+        "issue #2178 queued [unverified]",
+        "issue #2178 and PR #1187 need follow-up [unverified]",
+    ]
+    assert not [
+        record for record in caplog.records
+        if record.name == "mimir.session_boundary_log" and record.levelno > logging.DEBUG
+    ]
+
+
+def test_validation_all_aliases_not_found_is_not_a_request_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="mimir.session_boundary_log")
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 1,
+            json.dumps({
+                "data": {"a0": None, "a1": {"issueOrPullRequest": None}},
+                "errors": [
+                    {"type": "NOT_FOUND", "path": ["a0"]},
+                    {"type": "NOT_FOUND", "path": ["a1", "issueOrPullRequest"]},
+                ],
+            }), "gh: Not found\n",
+        )
+
+    monkeypatch.setattr("mimir.session_boundary_log.subprocess.run", fake_run)
+    boundaries = validate_unfinished_work(
+        _boundary("issue #2178 queued", "PR #2179 awaits review"),
+        default_repo="octo/repo",
+    )
+    assert boundaries[0]["unfinished"] == [
+        "issue #2178 queued [unverified]", "PR #2179 awaits review [unverified]",
+    ]
+    assert not [
+        record for record in caplog.records
+        if record.name == "mimir.session_boundary_log" and record.levelno > logging.DEBUG
+    ]
 
 
 @pytest.mark.parametrize("stdout", [
+    "",
     json.dumps({"errors": [{"type": "UNAUTHORIZED"}]}),
     "not json",
     json.dumps({
@@ -298,6 +380,21 @@ def test_validation_partial_not_found_only_marks_missing_alias_unverified(
                     }},
                     "a1": None,
                 },
+                "errors": [{"type": "NOT_FOUND", "path": path}],
+            }),
+            id=f"invalid-not-found-path-{path}",
+        )
+        for path in (None, [], ["unrequested"], ["a2"])
+    ],
+    *[
+        pytest.param(
+            json.dumps({
+                "data": {
+                    "a0": {"issueOrPullRequest": {
+                        "__typename": "PullRequest", "state": "MERGED",
+                    }},
+                    "a1": None,
+                },
                 "errors": [{"type": error_type, "path": ["a1"]}],
             }),
             id=f"present-alias-{error_type.lower()}",
@@ -306,7 +403,7 @@ def test_validation_partial_not_found_only_marks_missing_alias_unverified(
     ],
 ])
 def test_validation_full_github_failure_marks_all_unverified(
-    monkeypatch: pytest.MonkeyPatch, stdout: str,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stdout: str,
 ) -> None:
     def fake_run(args, **kwargs):
         return subprocess.CompletedProcess(args, 1, stdout, "gh: auth failed\n")
@@ -319,6 +416,34 @@ def test_validation_full_github_failure_marks_all_unverified(
     assert boundaries[0]["unfinished"] == [
         "PR #1187 merged [unverified]", "issue #2116 queued [unverified]",
     ]
+    assert any(
+        record.name == "mimir.session_boundary_log"
+        and record.levelno == logging.ERROR
+        and record.getMessage() == "unfinished-work GitHub validation failed"
+        for record in caplog.records
+    )
+
+
+def test_validation_github_timeout_keeps_all_items_and_logs_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fake_run(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr("mimir.session_boundary_log.subprocess.run", fake_run)
+    boundaries = validate_unfinished_work(
+        _boundary("PR #1187 merged", "issue #2116 queued"),
+        default_repo="octo/repo",
+    )
+    assert boundaries[0]["unfinished"] == [
+        "PR #1187 merged [unverified]", "issue #2116 queued [unverified]",
+    ]
+    assert any(
+        record.name == "mimir.session_boundary_log"
+        and record.levelno == logging.ERROR
+        and record.getMessage() == "unfinished-work GitHub validation failed"
+        for record in caplog.records
+    )
 
 
 def test_validation_failure_keeps_item_unverified_and_stale_hedge():

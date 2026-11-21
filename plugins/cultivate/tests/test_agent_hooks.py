@@ -22,6 +22,7 @@ def test_selected_provider_registers_owner_bound_turn_callbacks(monkeypatch) -> 
         ("cultivate", "feedback"),
         ("cultivate", "startup_prerequisites"),
         ("cultivate", "pr_checkout"),
+        ("cultivate", "pr_checkout_cleanup"),
     }
     prerequisite = registry.turn_hooks["cultivate", "startup_prerequisites"]
     assert prerequisite is opencode.startup_prerequisites

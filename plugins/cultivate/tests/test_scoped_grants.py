@@ -317,13 +317,33 @@ def _auth(policy, state, enforce, *, discovered=False):
     )
 
 
-def _remediation_turn(tmp_path, monkeypatch, *, discovered=False):
+def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=False, behind_base=False, file_tools=False, event_type=None):
     from mimir import access_control
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import policy_scope
     from mimir_cultivate import repository
 
-    origin, _, scope, state = _repo_scope_and_state(tmp_path)
+    assert not (conflicting and behind_base)
+    if conflicting:
+        from tests.test_repo_tools import _two_sided_conflict_tools
+        origin, scope, state, _ = _two_sided_conflict_tools(tmp_path)
+    else:
+        origin, source, scope, state = _repo_scope_and_state(tmp_path)
+        if behind_base:
+            _git(source, "checkout", "-q", "main")
+            (source / "base-only.txt").write_text("advanced base\n")
+            _git(source, "add", "base-only.txt")
+            _git(source, "commit", "-qm", "advance base")
+            _git(source, "push", "-q", "origin", "HEAD:main")
+            scope = replace(scope, observed_base_sha=_git(source, "rev-parse", "HEAD"))
+            root = state.checkout_lease.lease_root
+            state = RepoReviewState(scope)
+            create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    if event_type is not None:
+        scope = replace(scope, event_type=event_type)
+        root = state.checkout_lease.lease_root
+        state = RepoReviewState(scope)
+        create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
     # This test's forge remote is a local bare Git repository.
     monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: scope.canonical_repo)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
@@ -334,6 +354,14 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False):
         ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
         _plugin_slot_policy=policy,
     )
+    if file_tools:
+        service = build_trigger_service_principal(
+            canonical=auth.canonical_principal, trigger="poller", profile="github",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=(*policy.tools, "edit_file", "write_file"), creation_path="test",
+        )
+        auth = replace(auth, service_authority=service, is_service=True,
+                       repo_review_state=state, repo_pr_action_scope=scope)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     from mimir.access_control import pr_checkout_lease_attestation
     with policy_scope(policy):
@@ -341,14 +369,28 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False):
     gate = BudgetGateMiddleware(policy)
     args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
 
-    def invoke(name, **extra):
+    from mimir.readonly_backend import WriteGuardBackend
+    backend = WriteGuardBackend(state.checkout_lease.path.parent, [state.checkout_lease.path.name])
+    filesystem_tools = {
+        "edit_file": StructuredTool.from_function(backend.edit, name="edit_file", description="Edit file"),
+        "write_file": StructuredTool.from_function(backend.write, name="write_file", description="Write file"),
+    }
+
+    def invoke(name, _artifact=None, **extra):
+        arguments = extra if name in filesystem_tools else {**args, **extra}
         request = ToolCallRequest(
-            tool_call={"name": name, "args": {**args, **extra}, "id": name,
+            tool_call={"name": name, "args": arguments, "id": name,
                        "type": "tool_call"},
-            tool=policy.tools[name].factory(), state={}, runtime=Runtime(context=auth),
+            tool=filesystem_tools[name] if name in filesystem_tools else policy.tools[name].factory(),
+            state={}, runtime=Runtime(context=auth),
         )
 
         def handler(call):
+            if name in filesystem_tools:
+                method = backend.edit if name == "edit_file" else backend.write
+                result = method(**call.tool_call["args"])
+                assert result.error is None, result.error
+                return ToolMessage(content="File updated", tool_call_id=name)
             if name == "repo_checkout":
                 from mimir_cultivate.repository import _publish_attested_lease_result
                 _publish_attested_lease_result(SimpleNamespace(context=auth), state)
@@ -362,7 +404,16 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False):
                     state={}, context=auth, config={}, stream_writer=lambda _: None,
                     tool_call_id=name, store=None,
                 )
-                result = tool.func(**call.tool_call["args"], runtime=runtime)
+                try:
+                    if tool.coroutine is not None:
+                        import asyncio
+                        result = asyncio.run(tool.coroutine(**call.tool_call["args"], runtime=runtime))
+                    else:
+                        result = tool.func(**call.tool_call["args"], runtime=runtime)
+                except ToolException as exc:
+                    if _artifact is None:
+                        raise
+                    return ToolMessage(content=str(exc), tool_call_id=name, status="error", artifact=_artifact)
             return ToolMessage(content=json.dumps(result), tool_call_id=name)
 
         with policy_scope(policy):
@@ -372,6 +423,459 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False):
     assert checked_out.status != "error", checked_out.content
     assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
     return origin, scope, state, auth, invoke
+
+
+@pytest.mark.parametrize("kind", ["rebase", "merge"])
+def test_conflicted_operation_inspect_abort_same_trusted_turn(tmp_path, monkeypatch, kind):
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    conflict = invoke(f"repo_{kind}")
+    assert conflict.status == "error", conflict.content
+    assert "tracked.txt" in conflict.content
+    assert state.interrupted_operation is not None
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    for name in ("repo_status", "repo_unmerged"):
+        result = invoke(name)
+        assert result.status == "success", result.content
+        assert "tracked.txt" in result.content
+        assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    aborted = invoke(f"repo_{kind}_abort")
+    assert aborted.status == "success", aborted.content
+    assert state.interrupted_operation is None
+    assert _git(state.checkout_lease.path, "symbolic-ref", "--short", "HEAD") == scope.head_ref
+    assert _git(state.checkout_lease.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    assert invoke("repo_status").status == "success"
+
+
+def _decision(auth, scope, name, **extra):
+    from mimir.plugins.core import policy_scope
+
+    with policy_scope(auth._plugin_slot_policy):
+        return ToolRegistry().authorize_tool(
+            name, auth, enforce=True, policy=auth._plugin_slot_policy,
+            target_channel=extra.get("file_path") if name in {"edit_file", "write_file"} else None,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number, **extra},
+        )
+
+
+@pytest.mark.parametrize("kind", ["rebase", "merge"])
+@pytest.mark.parametrize("tool", ["repo_push", "repo_commit", "repo_stage", "repo_restore_file", "write_file", "edit_file", "repo_test"])
+def test_interrupted_operation_does_not_grant_other_writes(tmp_path, monkeypatch, kind, tool):
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True, file_tools=True)
+    assert invoke(f"repo_{kind}").status == "error"
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    decision = _decision(auth, scope, tool, path=str(state.checkout_lease.path / "tracked.txt"),
+                         file_path=str(state.checkout_lease.path / "tracked.txt"), content="must not write")
+    assert decision.allowed == (kind == "merge" and tool != "repo_push"), (tool, decision)
+
+
+@pytest.mark.parametrize("tool", ["edit_file", "write_file", "repo_stage", "repo_restore_file", "repo_test", "repo_commit"])
+@pytest.mark.parametrize("invalid", [
+    "no_evidence", "other_turn", "other_scope", "other_lease", "observed_base",
+    "base_ref", "nested_operation", "foreign_merge_head", "non_base_target",
+])
+def test_interrupted_merge_writes_require_matching_evidence(tmp_path, monkeypatch, tool, invalid):
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True, file_tools=True)
+    assert invoke("repo_merge").status == "error"
+    receipt = state.interrupted_operation
+    lease = state.checkout_lease
+    assert receipt is not None
+    if invalid == "no_evidence":
+        object.__setattr__(state, "interrupted_operation", None)
+    elif invalid in {"other_turn", "other_scope", "other_lease", "observed_base", "base_ref"}:
+        field = {"other_turn": "turn_nonce", "other_scope": "scope_id",
+                 "other_lease": "lease_identity"}.get(invalid, invalid)
+        value = (str(lease.path), "other") if invalid == "other_lease" else "other"
+        object.__setattr__(state, "interrupted_operation", replace(receipt, **{field: value}))
+    elif invalid == "nested_operation":
+        (lease.path / ".git/rebase-apply").mkdir()
+    else:
+        target = scope.observed_head_sha
+        (lease.path / ".git/MERGE_HEAD").write_text(target + "\n")
+        if invalid == "non_base_target":
+            object.__setattr__(state, "interrupted_operation", replace(receipt, target=target))
+    decision = _decision(auth, scope, tool, file_path=str(lease.path / "tracked.txt"), content="refused")
+    assert not decision.allowed, (invalid, tool, decision)
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+
+
+def test_conflicted_merge_resolve_stage_commit_push_same_trusted_turn(tmp_path, monkeypatch):
+    from mimir_cultivate import repository
+
+    origin, scope, state, auth, invoke = _remediation_turn(
+        tmp_path, monkeypatch, conflicting=True, file_tools=True,
+        event_type="pr_changes_requested_stale",
+    )
+    assert invoke("repo_merge").status == "error"
+    lease = state.checkout_lease
+    path = lease.path / "tracked.txt"
+    conflicted = path.read_text()
+    assert "<<<<<<<" in conflicted
+    assert not _decision(auth, scope, "repo_push").allowed
+    result = invoke("edit_file", file_path=str(path), old_string=conflicted,
+                    new_string="base property\nhead property\n")
+    assert result.status == "success", result.content
+    assert path.read_text() == "base property\nhead property\n"
+    result = invoke("write_file", file_path=str(lease.path / "resolution.txt"), content="resolved\n")
+    assert result.status == "success", result.content
+    result = invoke("repo_restore_file", revision=scope.observed_head_sha,
+                    source_path="tracked.txt", destination_path="restored.txt")
+    assert result.status == "success", result.content
+    assert (lease.path / "restored.txt").read_text()
+    paths = ("tracked.txt", "resolution.txt", "restored.txt")
+    # First clear the proven unmerged index entry, then stage new resolution files.
+    result = invoke("repo_stage", paths=("tracked.txt",))
+    assert result.status == "success", result.content
+    result = invoke("repo_stage", paths=paths)
+    assert result.status == "success", result.content
+    tested = []
+
+    async def execute(self, selectors, *, suite):
+        # Only the contained subprocess is stubbed; actual repo_test authorization,
+        # checkout validation and IFC classification still run with MERGE_HEAD.
+        repository.RepoGitTools(self._state).validated_checkout_root()
+        tested.append(True)
+        return repository.ProjectTestResult(True, "ok", 0)
+
+    monkeypatch.setattr(repository.RepoProjectTests, "execute", execute)
+    result = invoke("repo_test")
+    assert result.status == "success", result.content
+    assert tested == [True]
+    result = invoke("repo_commit", paths=(*paths, "base-test", "head-test", "suite"), message="resolve scoped merge")
+    assert result.status == "success", result.content
+    assert not (lease.path / ".git/MERGE_HEAD").exists()
+    assert state.interrupted_operation is None
+    result = invoke("repo_push")
+    assert result.status == "success", result.content
+    assert _git(origin, "rev-parse", scope.destination_ref) == state.git_expected_head
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+
+
+def test_conflicted_rebase_continue_failures_stay_trusted_then_complete(tmp_path, monkeypatch):
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_rebase").status == "error"
+    # Missing resolution evidence is a local refusal, not untrusted ingest.
+    missing = invoke("repo_rebase")
+    assert missing.status == "error" and "conflict_evidence_required" in missing.content
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    evidence = dict(base_property="base property", base_verification="base-test",
+                    head_property="head property", head_verification="head-test")
+    # Git itself refuses --continue while the index is still unmerged.
+    failed = invoke("repo_rebase", **evidence)
+    assert failed.status == "error", failed.content
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    lease = state.checkout_lease
+    # Operator-provided resolution: this issue deliberately does not grant file
+    # edits or staging while interrupted.
+    (lease.path / "tracked.txt").write_text("base property\nhead property\n")
+    _git(lease.path, "add", "tracked.txt")
+    continued = invoke("repo_rebase", **evidence)
+    assert continued.status == "success", continued.content
+    assert state.interrupted_operation is None
+    assert _git(lease.path, "symbolic-ref", "--short", "HEAD") == scope.head_ref
+    # Success no longer uses interrupted-operation authority. In particular it
+    # does not exempt changed foreign-authored patches from normal IFC labels.
+    assert auth.ifc_state.has_untrusted_active_ingest()
+
+
+@pytest.mark.parametrize("kind", ["rebase", "merge"])
+@pytest.mark.parametrize("invalid", [
+    "no_evidence", "other_pr", "other_scope", "other_lease", "other_turn",
+    "observed_head", "observed_base", "base_ref", "non_base_target", "original_head",
+    "unknown_kind", "git_orig_head", "git_head_name", "other_operation", "unprotected_base",
+    "target_not_descendant", "evidence_target", "missing_marker",
+])
+def test_interrupted_continuity_fails_closed(tmp_path, monkeypatch, kind, invalid):
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke(f"repo_{kind}").status == "error"
+    receipt = state.interrupted_operation
+    assert receipt is not None
+    lease = state.checkout_lease
+    if invalid == "no_evidence":
+        object.__setattr__(state, "interrupted_operation", None)
+    elif invalid == "other_pr":
+        object.__setattr__(scope, "pr_number", scope.pr_number + 1)
+    elif invalid == "other_scope":
+        object.__setattr__(state, "interrupted_operation", replace(receipt, scope_id="other"))
+    elif invalid == "other_lease":
+        object.__setattr__(state, "interrupted_operation", replace(receipt, lease_identity=(str(lease.path), "other")))
+    elif invalid == "other_turn":
+        object.__setattr__(state, "interrupted_operation", replace(receipt, turn_nonce="other"))
+    elif invalid in {"observed_head", "observed_base", "base_ref"}:
+        value = _git(lease.path, "merge-base", scope.observed_head_sha, scope.observed_base_sha) if invalid == "observed_base" else "other"
+        object.__setattr__(state, "interrupted_operation", replace(receipt, **{invalid: value}))
+    elif invalid == "original_head":
+        value = scope.observed_base_sha
+        object.__setattr__(state, "interrupted_operation", replace(receipt, original_head=value))
+        marker = lease.path / ".git" / ("rebase-merge/orig-head" if kind == "rebase" else "ORIG_HEAD")
+        marker.write_text(value + "\n")
+        if kind == "merge":
+            _git(lease.path, "update-ref", scope.destination_ref, value)
+    elif invalid == "non_base_target":
+        marker = lease.path / ".git" / ("rebase-merge/onto" if kind == "rebase" else "MERGE_HEAD")
+        marker.write_text(scope.observed_head_sha + "\n")
+    elif invalid == "unknown_kind":
+        object.__setattr__(state, "interrupted_operation", replace(receipt, kind="other"))
+    elif invalid == "git_orig_head":
+        marker = lease.path / ".git" / ("rebase-merge/orig-head" if kind == "rebase" else "ORIG_HEAD")
+        marker.write_text("f" * 40 + "\n")
+    elif invalid == "git_head_name":
+        if kind == "rebase":
+            (lease.path / ".git/rebase-merge/head-name").write_text("refs/heads/other\n")
+        else:
+            _git(lease.path, "symbolic-ref", "HEAD", "refs/heads/other")
+    elif invalid == "other_operation":
+        (lease.path / ".git" / ("MERGE_HEAD" if kind == "rebase" else "rebase-apply")).mkdir()
+    elif invalid == "unprotected_base":
+        object.__setattr__(scope, "base_ref", "topic")
+        object.__setattr__(state, "interrupted_operation", replace(receipt, base_ref="topic"))
+    elif invalid in {"evidence_target", "target_not_descendant"}:
+        target = scope.observed_head_sha
+        object.__setattr__(state, "interrupted_operation", replace(receipt, target=target))
+        (lease.path / ".git" / ("rebase-merge/onto" if kind == "rebase" else "MERGE_HEAD")).write_text(target + "\n")
+    elif invalid == "missing_marker":
+        (lease.path / ".git" / ("rebase-merge/onto" if kind == "rebase" else "ORIG_HEAD")).unlink()
+    assert not _decision(auth, scope, "repo_unmerged").allowed
+    decision = _decision(auth, scope, f"repo_{kind}_abort")
+    assert not decision.allowed and not decision.repo_pr_diagnostics_bound
+
+
+@pytest.mark.parametrize("kind", ["rebase", "merge"])
+def test_foreign_interrupted_operation_without_own_start_has_no_continuity(tmp_path, monkeypatch, kind):
+    _, scope, state, auth, _ = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    lease = state.checkout_lease
+    failed = subprocess.run(["git", "-C", str(lease.path), "-c", "user.name=foreign",
+                             "-c", "user.email=foreign@example.test", kind, scope.observed_base_sha],
+                            capture_output=True, text=True)
+    assert failed.returncode == 1 and "CONFLICT" in failed.stdout
+    assert state.interrupted_operation is None
+    for tool in ("repo_status", "repo_unmerged", f"repo_{kind}_abort", "repo_rebase"):
+        assert not _decision(auth, scope, tool).allowed
+
+
+@pytest.mark.parametrize("kind", ["rebase", "merge"])
+def test_failed_operation_without_git_recovery_state_records_no_receipt(tmp_path, monkeypatch, kind):
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    (state.checkout_lease.path / "tracked.txt").write_text("unstaged local edit\n")
+    failure = invoke(f"repo_{kind}")
+    assert failure.status == "error" and "tracked.txt" not in _git(
+        state.checkout_lease.path, "ls-files", "--unmerged",
+    )
+    assert state.interrupted_operation is None
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    assert _decision(auth, scope, "repo_status").allowed
+
+
+@pytest.mark.parametrize("kind", ["rebase", "merge"])
+def test_abort_failure_on_attested_scope_stays_trusted(tmp_path, monkeypatch, kind):
+    _, _, _, auth, invoke = _remediation_turn(tmp_path, monkeypatch)
+    failed = invoke(f"repo_{kind}_abort")  # No operation is in progress.
+    assert failed.status == "error", failed.content
+    assert "repository_git_failed" in failed.content
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    assert invoke("repo_status").status == "success"
+
+
+@pytest.mark.parametrize("invalid", ["author", "attestation", "head_repo", "head_remote", "base_ref"])
+def test_git_failure_binding_requires_preexecution_attestation(tmp_path, monkeypatch, invalid):
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=invalid == "author")
+    if invalid == "author":
+        # Initial attestation already enforces author trust. Test this separate
+        # guard on the continuation path, where recorded start evidence replaces
+        # the ordinary HEAD/branch attestation.
+        assert invoke("repo_rebase").status == "error"
+        auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    elif invalid == "attestation":
+        from mimir import access_control
+        monkeypatch.setattr(access_control, "_attested_pr_checkout_lease", lambda *_: False)
+    else:
+        object.__setattr__(scope, invalid, "other")
+    assert not _decision(auth, scope, "repo_rebase").repo_pr_diagnostics_bound
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "output_limit"])
+def test_interrupted_rebase_ancestry_probe_fails_closed(tmp_path, monkeypatch, failure):
+    from mimir_cultivate import repository
+
+    _, scope, _, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_rebase").status == "error"
+    monkeypatch.setattr(repository, "hardened_git_command", lambda *_args, **_kw: SimpleNamespace(
+        returncode=1 if failure == "nonzero" else 0,
+        timed_out=failure == "timeout", output_limited=failure == "output_limit",
+    ))
+    assert not _decision(auth, scope, "repo_unmerged").allowed
+
+
+@pytest.mark.parametrize("invalid", ["not_host_grants", "unattested", "foreign_operation"])
+def test_interruption_receipt_requires_host_grants_and_attestation(tmp_path, monkeypatch, invalid):
+    from mimir_cultivate.repository import RepoGitTools
+
+    _, scope, state, auth, _ = _remediation_turn(tmp_path, monkeypatch, conflicting=invalid == "foreign_operation")
+    if invalid == "not_host_grants":
+        auth = replace(auth, scoped_pr_grants=SimpleNamespace(nonce="not-a-host-grant"))
+    elif invalid == "unattested":
+        auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    else:
+        failed = subprocess.run([
+            "git", "-C", str(state.checkout_lease.path), "-c", "user.name=foreign",
+            "-c", "user.email=foreign@example.test", "merge", scope.observed_base_sha,
+        ], capture_output=True, text=True)
+        assert failed.returncode == 1 and "CONFLICT" in failed.stdout
+    from mimir.plugins.core import policy_scope
+    with policy_scope(auth._plugin_slot_policy):
+        tools = RepoGitTools(state, auth_context=auth)
+        assert tools._interruption_receipt("rebase", scope.observed_base_sha) is None
+
+
+@pytest.mark.parametrize("invalid", ["author", "turn_nonce"])
+def test_interrupted_inspection_publisher_fails_closed(tmp_path, monkeypatch, invalid):
+    from mimir.access_control import begin_protected_result_capture, end_protected_result_capture
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate.repository import _publish_attested_lease_result
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_rebase").status == "error"
+    if invalid == "author":
+        auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    else:
+        object.__setattr__(state, "interrupted_operation", replace(state.interrupted_operation, turn_nonce="other"))
+    token = begin_protected_result_capture()
+    try:
+        with policy_scope(auth._plugin_slot_policy):
+            _publish_attested_lease_result(Runtime(context=auth), state, tool_name="repo_unmerged")
+    finally:
+        provenance = end_protected_result_capture(token)
+    assert provenance is None or not provenance.sources
+
+
+def test_interrupted_inspection_classifier_rechecks_live_grant(tmp_path, monkeypatch):
+    from mimir.access_control import ProtectedResultProvenance, classify_protected_result
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_rebase").status == "error"
+    authorization = _decision(auth, scope, "repo_unmerged")
+    assert authorization.allowed
+    object.__setattr__(state, "interrupted_operation", replace(state.interrupted_operation, turn_nonce="other"))
+    trusted = auth.ifc_state.labels.sources[0]
+    assert trusted.integrity == "trusted"
+    labels = classify_protected_result(
+        "repo_unmerged", {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        auth, authorization, result={"stdout": "tracked.txt"},
+        provenance=ProtectedResultProvenance((trusted,)),
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+
+
+def test_interrupted_rebase_continue_only_for_conflicting_event(tmp_path, monkeypatch):
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_rebase").status == "error"
+    object.__setattr__(scope, "event_type", "pr_mergeability_rebase")
+    assert not _decision(auth, scope, "repo_rebase").allowed
+    assert _decision(auth, scope, "repo_rebase_abort").allowed
+
+
+@pytest.mark.parametrize("kind", ["rebase", "merge"])
+def test_conflicted_operation_preserves_forge_artifact_taint(tmp_path, monkeypatch, kind):
+    from mimir.access_control import ProtectedResultProvenance
+
+    _, scope, _, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    source = SourceLabel(
+        principal="attacker", domain="repository", resource_id="forge-comment",
+        bridge_instance="forge", sensitivity="public", source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+    result = invoke(f"repo_{kind}", _artifact=ProtectedResultProvenance((source,)))
+    assert result.status == "error" and "tracked.txt" in result.content
+    assert source in auth.ifc_state.labels.sources
+    assert auth.ifc_state.has_untrusted_active_ingest()
+    assert not _decision(auth, scope, f"repo_{kind}_abort").allowed
+
+
+@pytest.mark.parametrize("tool", ["repo_rebase", "repo_merge", "repo_rebase_abort", "repo_merge_abort"])
+@pytest.mark.parametrize("invalid", [
+    None, "other_pr", "other_repository", "unattested", "not_failed", "disallowed",
+    "would_block", "wrong_decision", "other_tool", "other_owner", "membership", "resource_scope",
+])
+def test_git_failure_diagnostics_bind_only_authorized_attested_target(tmp_path, monkeypatch, tool, invalid):
+    from copy import copy
+    from mimir.access_control import classify_protected_result
+
+    _, scope, state, auth, _ = _remediation_turn(tmp_path, monkeypatch)
+    authorization = _decision(auth, scope, tool)
+    assert authorization.allowed and authorization.repo_pr_diagnostics_bound
+    arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    if invalid == "other_pr":
+        arguments["pull_request"] += 1
+    elif invalid == "other_repository":
+        arguments["repository"] = "other/repo"
+    elif invalid == "unattested":
+        authorization = replace(authorization, repo_pr_diagnostics_bound=False)
+    elif invalid == "disallowed":
+        authorization = replace(authorization, allowed=False)
+    elif invalid == "would_block":
+        authorization = replace(authorization, would_block=True)
+    elif invalid == "wrong_decision":
+        authorization = replace(authorization, decision="admin_required")
+    elif invalid == "other_tool":
+        authorization = replace(authorization, tool_name="repo_push")
+    elif invalid in {"other_owner", "membership", "resource_scope"}:
+        policy = copy(authorization.policy)
+        policy._tools = dict(policy.tools)
+        policy._tools[tool] = replace(policy.tools[tool], **{
+            "other_owner": {"owner": "other"}, "membership": {"memberships": frozenset()},
+            "resource_scope": {"resource_scope": "channel"},
+        }[invalid])
+        authorization = replace(authorization, policy=policy)
+    # Classification must use pre-execution authority, not require a lease that
+    # a failed/aborted operation may have changed in the meantime.
+    state.revoke_checkout_lease(state.checkout_lease)
+    labels = classify_protected_result(
+        tool, arguments, auth, authorization, result=ToolException("Git failure"),
+        failed=invalid != "not_failed",
+    )
+    assert bool(labels and labels.has_untrusted_active_ingest) is (invalid is not None)
+
+
+@pytest.mark.parametrize("tool", ["repo_rebase", "repo_merge", "repo_rebase_abort", "repo_merge_abort"])
+@pytest.mark.parametrize("attachment", ["provenance", "artifact", "both"])
+def test_git_failure_binding_keeps_independently_published_labels(tmp_path, monkeypatch, tool, attachment):
+    from mimir.access_control import ProtectedResultProvenance, classify_protected_result
+
+    _, scope, _, auth, _ = _remediation_turn(tmp_path, monkeypatch)
+    authorization = _decision(auth, scope, tool)
+    source = SourceLabel(
+        principal="attacker", domain="repository", resource_id="forge-text",
+        bridge_instance="forge", sensitivity="public", source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+    untrusted = ProtectedResultProvenance((source,))
+    provenance = untrusted if attachment == "provenance" else None
+    if attachment == "both":
+        provenance = ProtectedResultProvenance((replace(source, resource_id="trusted", integrity="trusted"),))
+    labels = classify_protected_result(
+        tool, {"repository": scope.canonical_repo, "pull_request": scope.pr_number}, auth,
+        authorization, failed=True, provenance=provenance,
+        result=ToolMessage(content="Git failure", status="error", tool_call_id="failure",
+                           artifact=untrusted if attachment != "provenance" else None),
+    )
+    assert source in labels.sources and labels.has_untrusted_active_ingest
+    if attachment == "both":
+        assert len(labels.sources) == 2
+
+
+@pytest.mark.parametrize("tool", ["repo_fetch", "repo_commit", "repo_push", "repo_revert"])
+def test_git_failure_binding_does_not_exempt_other_repository_tools(tmp_path, monkeypatch, tool):
+    from mimir.access_control import classify_protected_result
+
+    _, scope, state, auth, _ = _remediation_turn(tmp_path, monkeypatch)
+    authorization = _decision(auth, scope, tool)
+    assert authorization.allowed and not authorization.repo_pr_diagnostics_bound
+    state.revoke_checkout_lease(state.checkout_lease)
+    labels = classify_protected_result(
+        tool, {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        auth, authorization, result=ToolException("Git failure"), failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
 
 
 def _commit_remediation(state, invoke, message):
@@ -385,6 +889,221 @@ def _commit_remediation(state, invoke, message):
         assert outcome.status != "error", outcome.content
         assert json.loads(outcome.content)["ok"] is True
     return _git(state.checkout_lease.path, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("discovered", [False, True], ids=["event", "server-discovered"])
+def test_rebase_grant_continuity_status_rebase_diff_test_commit_push(tmp_path, monkeypatch, discovered):
+    from mimir_cultivate import repository
+
+    origin, scope, state, auth, invoke = _remediation_turn(
+        tmp_path, monkeypatch, discovered=discovered, behind_base=True,
+    )
+    original_head = scope.observed_head_sha
+    original_scope_id = scope.scope_id
+    original_grants = dict(auth.scoped_pr_grants._follow[("cultivate", scope.scope_id)])
+    calls = []
+    runner = repository._bounded_subprocess_runner
+
+    def recording_runner(argv, **kwargs):
+        calls.append(argv)
+        return runner(argv, **kwargs)
+
+    # Keep real Git execution, replacing only the contained test process (no Docker).
+    original_init = repository.RepoGitTools.__init__
+
+    def init(self, *args, **kwargs):
+        kwargs["runner"] = recording_runner
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(repository.RepoGitTools, "__init__", init)
+    tested = []
+
+    async def execute(self, selectors, *, suite):
+        tested.append(_git(state.checkout_lease.path, "rev-parse", "HEAD"))
+        return repository.ProjectTestResult(True, "ok", 0)
+
+    monkeypatch.setattr(repository.RepoProjectTests, "execute", execute)
+    for name, extra in (("repo_status", {}), ("repo_rebase", {}),
+                        ("repo_diff", {"mode": "base"}), ("repo_test", {})):
+        result = invoke(name, **extra)
+        assert result.status == "success", (name, result.content)
+        assert json.loads(result.content)["ok"] is True
+    rebased = state.git_expected_head
+    assert tested == [rebased]
+    assert rebased != original_head
+    assert scope.scope_id == original_scope_id
+    assert scope.observed_head_sha == original_head
+    assert auth.scoped_pr_grants._follow[("cultivate", scope.scope_id)] == original_grants
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    committed = _commit_remediation(state, invoke, "fix after rebase")
+    pushed = invoke("repo_push")
+    assert pushed.status == "success", pushed.content
+    assert json.loads(pushed.content)["ok"] is True
+    push = next(argv for argv in calls if "push" in argv)
+    assert f"--force-with-lease={scope.destination_ref}:{original_head}" in push
+    assert f"--force-with-lease={scope.destination_ref}:{committed}" not in push
+    assert _git(origin, "rev-parse", scope.destination_ref) == committed
+
+
+def _rebased_turn(tmp_path, monkeypatch):
+    turn = _remediation_turn(tmp_path, monkeypatch, behind_base=True)
+    result = turn[-1]("repo_rebase")
+    assert result.status == "success", result.content
+    assert json.loads(result.content)["ok"]
+    return turn
+
+
+def _assert_rebase_followons_refused(scope, state, auth):
+    from mimir.plugins.core import policy_scope
+
+    with policy_scope(auth._plugin_slot_policy):
+        codes = []
+        assert _live_scoped_pr_lease(scope, state, refusal_codes=codes) is None
+        assert codes == ["lease_head_mismatch"]
+        for name in ("repo_diff", "repo_test", "repo_commit", "repo_push"):
+            decision = ToolRegistry().authorize_tool(
+                name, auth, enforce=True, policy=auth._plugin_slot_policy,
+                arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+            )
+            assert not decision.allowed, name
+            assert decision.as_log_fields()["refusal_reason"] == "lease_head_mismatch"
+
+
+@pytest.mark.parametrize("identity", ["recovery_id", "path"])
+def test_rebase_continuity_refuses_different_lease(tmp_path, monkeypatch, identity):
+    _, scope, state, auth, _ = _rebased_turn(tmp_path, monkeypatch)
+    lease = state.checkout_lease
+    # Make disk and memory agree on the foreign lease, so the proof's lease
+    # binding, rather than a metadata mismatch, must refuse it.
+    if identity == "recovery_id":
+        object.__setattr__(lease, "recovery_id", lease.recovery_id + "-other")
+    else:
+        moved = lease.path.with_name(lease.path.name + "-other")
+        lease.path.rename(moved)
+        object.__setattr__(lease, "path", moved)
+    metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+    raw = json.loads(metadata.read_text())
+    raw["recovery_id"] = lease.recovery_id
+    raw["path"] = str(lease.path)
+    metadata.write_text(json.dumps(raw))
+    _assert_rebase_followons_refused(scope, state, auth)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("pr_number", 8), ("canonical_repo", "other/repo"), ("scope_id", "other-scope"),
+], ids=["different-pr", "different-repository", "different-scope"])
+def test_rebase_continuity_refuses_different_target(tmp_path, monkeypatch, field, value):
+    from mimir.plugins.core import policy_scope
+
+    _, scope, state, auth, _ = _rebased_turn(tmp_path, monkeypatch)
+    # All ordinary live-lease identity checks still match. Only the host's
+    # continuity proof knows this is not the target that performed the rebase.
+    object.__setattr__(scope, field, value)
+    object.__setattr__(state.checkout_lease, field, value)
+    metadata = state.checkout_lease.path / ".git/mimir-pr-checkout-lease.json"
+    raw = json.loads(metadata.read_text())
+    raw[field] = value
+    metadata.write_text(json.dumps(raw))
+    with policy_scope(auth._plugin_slot_policy):
+        codes = []
+        assert _live_scoped_pr_lease(scope, state, refusal_codes=codes) is None
+        assert codes == ["lease_head_mismatch"]
+
+
+def test_rebase_continuity_refuses_non_base_rebase(tmp_path, monkeypatch):
+    origin, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, behind_base=True)
+    source = scope.canonical_root
+    from pathlib import Path
+    (Path(source) / "later-base.txt").write_text("not the observed base\n")
+    _git(source, "add", "later-base.txt")
+    _git(source, "commit", "-qm", "move base during turn")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    assert _git(origin, "rev-parse", "main") != scope.observed_base_sha
+    result = invoke("repo_rebase")
+    assert result.status == "success", result.content
+    assert json.loads(result.content)["ok"]
+    assert state._scoped_rebase is None
+    _assert_rebase_followons_refused(scope, state, auth)
+
+
+def test_rebase_continuity_revoked_by_later_non_base_rebase(tmp_path, monkeypatch):
+    _, scope, state, auth, invoke = _rebased_turn(tmp_path, monkeypatch)
+    from pathlib import Path
+    source = Path(scope.canonical_root)
+    (source / "base-only.txt").write_text("changed base\n")
+    _git(source, "commit", "-qam", "base moves again")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    result = invoke("repo_rebase")
+    assert result.status == "success", result.content
+    assert json.loads(result.content)["ok"]
+    assert state._scoped_rebase is None
+    _assert_rebase_followons_refused(scope, state, auth)
+
+
+def test_rebase_continuity_refuses_shell_rebase_even_with_matching_metadata(tmp_path, monkeypatch):
+    from mimir_cultivate.repository import _metadata
+
+    _, scope, state, auth, _ = _remediation_turn(tmp_path, monkeypatch, behind_base=True)
+    lease = state.checkout_lease
+    _git(lease.path, "-c", "user.name=mimir", "-c", "user.email=mimir@example.test",
+         "rebase", scope.observed_base_sha)
+    head = _git(lease.path, "rev-parse", "HEAD")
+    state.record_git_head(scope.scope_id, head)
+    # A shell writer can forge checkout metadata, but not host-only evidence.
+    for key, value in {"head_sha": head, "base_sha": scope.observed_base_sha,
+                       "verified_base_sha": scope.observed_base_sha, "lineage": {head: True}}.items():
+        object.__setattr__(lease, key, value)
+    (lease.path / ".git/mimir-pr-checkout-lease.json").write_text(json.dumps(_metadata(lease)))
+    _assert_rebase_followons_refused(scope, state, auth)
+
+
+@pytest.mark.parametrize("invalid", ["base", "verified_base", "anchor", "tainted_lineage", "timeout", "output_limit"])
+def test_rebase_continuity_fails_closed_on_invalid_evidence(tmp_path, monkeypatch, invalid):
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate import repository
+
+    _, scope, state, auth, _ = _rebased_turn(tmp_path, monkeypatch)
+    lease = state.checkout_lease
+    if invalid == "base":
+        object.__setattr__(lease, "base_sha", scope.observed_head_sha)
+        object.__setattr__(lease, "verified_base_sha", lease.base_sha)
+        # Isolate base confinement from the separate lineage validator.
+        from mimir import access_control
+        monkeypatch.setattr(access_control, "_lease_has_clean_lineage", lambda *_: True)
+    elif invalid == "verified_base":
+        object.__setattr__(lease, "verified_base_sha", None)
+    elif invalid == "anchor":
+        object.__setattr__(state, "_scoped_rebase", (state._scoped_rebase[0], scope.observed_head_sha))
+    elif invalid == "tainted_lineage":
+        metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text())
+        raw["lineage"][lease.head_sha] = False
+        metadata.write_text(json.dumps(raw))
+    else:
+        run = repository.hardened_git_command
+
+        def failed_probe(path, args, **kwargs):
+            result = run(path, args, **kwargs)
+            if args == ("merge-base", "--is-ancestor", state._scoped_rebase[1], lease.head_sha):
+                return replace(result, **{"timed_out" if invalid == "timeout" else "output_limited": True})
+            return result
+
+        monkeypatch.setattr(repository, "hardened_git_command", failed_probe)
+    with policy_scope(auth._plugin_slot_policy):
+        codes = []
+        assert _live_scoped_pr_lease(scope, state, refusal_codes=codes) is None
+        assert codes == ["lease_head_mismatch"]
+
+
+@pytest.mark.parametrize("operation", ["attach", "revoke"])
+def test_rebase_continuity_cleared_when_lease_binding_changes(tmp_path, monkeypatch, operation):
+    _, _, state, _, _ = _rebased_turn(tmp_path, monkeypatch)
+    assert state._scoped_rebase is not None
+    if operation == "attach":
+        state.attach_checkout_lease(state.checkout_lease)
+    else:
+        state.revoke_checkout_lease(state.checkout_lease)
+    assert state._scoped_rebase is None
 
 
 @pytest.mark.parametrize("attestation_unavailable", [False, True])

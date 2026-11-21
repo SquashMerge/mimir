@@ -298,7 +298,7 @@ async def test_missing_login_image_payload_uses_real_health_and_refuses_before_s
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     generation = "12345678-1234-4234-8234-123456789abc"
     status = {"version": 1, "launch_generation": generation, "checked_at_ms": time.time_ns() // 1_000_000,
-              "daemon_state": "ready", "daemon_version": "2.2.7", "login_state": "missing",
+              "daemon_state": "ready", "daemon_version": "2.3.0", "login_state": "missing",
               "login_expires_at_ms": None, "telemetry_state": "off"}
     snapshot = make_launch_snapshot(resolve_daemon_credentials(dict(os.environ)), generation).to_dict()
     monkeypatch.setattr(health_module, "resolve_activation", lambda env: DaemonActivation(True, "enabled"))
@@ -325,8 +325,57 @@ def test_positive_image_proofs_keep_session_fixture_boundaries_and_evidence():
     assert '"spawn-euid=1002"' in namespace["SPAWN_PROOF"]
     assert 'proposal["sha256"]' in namespace["SPAWN_PROOF"] or 'proposal.get("sha256")' in namespace["SPAWN_PROOF"]
     script = PROOF.read_text()
+    assert script.index("'-c', FACTORY_PLUGIN_PROOF, user='mimir'") < script.index("input_text=DAEMON_FIXTURE")
     assert script.index("'-c', MISSING_LOGIN_PROOF, user='mimir'") < script.index("input_text=DAEMON_FIXTURE")
     assert "chmod 0755 /usr/local/bin/opencode" not in script
+
+
+@pytest.mark.parametrize(("version", "uid", "accept"), [
+    pytest.param("2.3.0", 1001, True, id="accept_opencode_2_3_0"),
+    pytest.param("2.2.7", 1001, False, id="reject_opencode_2_2_7"),
+    pytest.param("2.3.0", 0, False, id="reject_root_uid"),
+])
+async def test_native_image_factory_registration_payload(version, uid, accept, capsys):
+    pytest.importorskip("mimir_cultivate", reason="daemon transport belongs to Cultivate")
+    import json
+    from types import SimpleNamespace
+
+    root = Path(__file__).parent / "fixtures/worklink/opencode_2_3_0"
+    captured = json.loads((root / "factory-result.json").read_text())
+    namespace = {"__name__": "image_factory_registration"}
+    exec(runpy.run_path(str(PROOF))["FACTORY_PLUGIN_PROOF"], namespace)
+
+    class Client:
+        def __init__(self, **connection):
+            assert connection == {"base_url": "http://127.0.0.1:1234", "username": "opencode", "password": "synthetic"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+        async def info(self):
+            return {"version": version}
+
+        async def _request(self, method, path):
+            assert method == "GET"
+            data = {"/api/plugin": captured["plugins"], "/api/agent": captured["agents"],
+                    "/api/skill": [{"id": s} for s in captured["skills"]],
+                    "/api/command": [{"name": c} for c in captured["commands"]]}
+            return {"data": data[path]}
+
+    def load_api(paths, *, uid, controller):
+        assert uid == 1001 and controller is True
+        return {"url": "http://127.0.0.1:1234", "username": "opencode", "password": "synthetic"}
+
+    namespace.update(OpenCodeDaemonClient=Client, load_api=load_api, os=SimpleNamespace(geteuid=lambda: uid))
+    if accept:
+        await namespace["main"]()
+        assert "factory registration passed" in capsys.readouterr().out
+    else:
+        with pytest.raises(AssertionError):
+            await namespace["main"]()
 
 
 def test_wheel_identity_checks_metadata_and_cultivate_pair(tmp_path: Path) -> None:
@@ -355,4 +404,3 @@ def test_pypi_refuses_mismatched_versions_before_docker_build(tmp_path: Path, mo
     with pytest.raises(ValueError, match="same exact version"):
         namespace["prove_pypi"](tmp_path / "agent.whl", tmp_path / "cultivate.whl")
     assert calls == [["docker", "info"]]
-

@@ -829,15 +829,16 @@ def _run_metadata():
     }
 
 
+@pytest.mark.parametrize("run_status", ["completed", "in_progress", "queued", "waiting", "pending", "requested", None])
 @pytest.mark.parametrize("conclusion", ["failure", "timed_out", "startup_failure", "action_required", "cancelled"])
 @pytest.mark.parametrize("run_id", [None, 123])
 @pytest.mark.parametrize("repo_case", ["owner/repo", "Owner/Repo"])
-def test_job_log_binds_metadata_before_capture(monkeypatch, conclusion, run_id, repo_case):
+def test_job_log_binds_metadata_before_capture(monkeypatch, conclusion, run_id, repo_case, run_status):
     from mimir_cultivate import ci as ci_logs
 
     job = {**_job_metadata(), "conclusion": conclusion}
     job["run_url"] = f"https://api.github.com/repos/{repo_case}/actions/runs/123"
-    run = {**_run_metadata(), "repository": {"full_name": repo_case}}
+    run = {**_run_metadata(), "repository": {"full_name": repo_case}, "status": run_status}
     session = Session([Response(job), Response(run)])
     calls = []
 
@@ -867,29 +868,45 @@ def test_job_log_binds_metadata_before_capture(monkeypatch, conclusion, run_id, 
     ("job", "run_url", "https://api.github.com/repos/owner/repo/actions/runs/123/extra"),
     ("job", "run_url", "https://evil.example/repos/owner/repo/actions/runs/123"),
     ("job", "run_url", None),
-    ("job", "status", "in_progress"), ("job", "status", None),
     *[("job", "conclusion", value) for value in ["success", "neutral", "skipped", "stale", None]],
     ("run", "id", 124), ("run", "id", "123"), ("run", "id", 123.0), ("run", "id", None),
     ("run", "repository", {"full_name": "other/repo"}),
     ("run", "repository", None), ("run", "repository", {}),
     ("run", "head_sha", "c" * 40), ("run", "head_sha", None),
-    ("run", "status", "in_progress"), ("run", "status", "queued"), ("run", "status", None),
 ])
-def test_job_log_rejects_each_independent_binding_or_state(monkeypatch, target, field, value):
+@pytest.mark.parametrize("run_status", ["completed", "in_progress", "queued"])
+def test_job_log_rejects_each_independent_binding_or_state(monkeypatch, target, field, value, run_status):
     from mimir_cultivate import ci as ci_logs
 
     job, run = _job_metadata(), _run_metadata()
+    run["status"] = run_status
     (job if target == "job" else run)[field] = value
     monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("capture before validation"))
     session = Session([Response(job), Response(run)])
-    message = "run is still in progress" if target == "run" and field == "status" else None
-    if target == "job" and field in {"status", "conclusion"}:
-        message = "^job is not a completed failing job$"
+    message = (
+        "^job is not a completed failing job$" if field == "conclusion"
+        else f"^{target} is outside the scoped repository/run/head$"
+    )
+
+    with pytest.raises(ForgeError, match=message):
+        GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+    assert len(session.calls) == (1 if target == "job" and field != "conclusion" else 2)
+
+
+@pytest.mark.parametrize("job_status", ["in_progress", "queued", None])
+@pytest.mark.parametrize("run_status", ["completed", "in_progress", "queued"])
+def test_job_log_refuses_unfinished_job(monkeypatch, job_status, run_status):
+    from mimir_cultivate import ci as ci_logs
     from mimir_cultivate.forge import ForgeReadUnavailable
 
-    with pytest.raises(ForgeError, match=message) as raised:
+    # Keep a failing conclusion so it cannot mask a missing completion check.
+    job = {**_job_metadata(), "status": job_status}
+    run = {**_run_metadata(), "status": run_status}
+    session = Session([Response(job), Response(run)])
+    monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("unfinished job captured"))
+    with pytest.raises(ForgeReadUnavailable, match="^job is still running; retry after it completes$"):
         GitHubForgeClient(session=session).get_job_log(_scope(), 456)
-    assert isinstance(raised.value, ForgeReadUnavailable) is (target == "run" and field == "status")
+    assert len(session.calls) == 2
 
 
 @pytest.mark.parametrize("job_id,run_id", [

@@ -22,6 +22,8 @@ import pytest
 import asyncio
 from importlib.metadata import PackageNotFoundError, version
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 pytestmark = pytest.mark.usefixtures("authorized_fake_backend_gate")
 
 
@@ -109,7 +111,7 @@ print(json.dumps(results))
         inode = lock.stat().st_ino
         child = subprocess.run(
             [sys.executable, "-c", script, str(tmp_path)],
-            capture_output=True, text=True, check=True, timeout=30,
+            capture_output=True, text=True, check=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS,
         )
         assert json.loads(child.stdout) == [not pruning, False]
         with factory_checkout_interlock(tmp_path / "other", pruning=True) as other:
@@ -1391,6 +1393,8 @@ def _orchestrator_runner(
             return checkout_result
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
             return cp(args, stdout=issue_json)
+        if args == ["chainlink", "locks", "list", "--json"]:
+            return cp(args, stdout='{"locks":{}}')
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
@@ -2294,9 +2298,12 @@ def test_publication_replacement_interleaving(tmp_path: Path, monkeypatch, fence
 
         registry = BackendRegistry(WorklinkConfig())
         registry.register(FakeBackend())
+        # Exercise publication's independent fence with the controller-liveness
+        # lease bypassed: a reliable live-controller lock must not be what makes
+        # this test (or its negative control) discriminate.
         result = asyncio.run(WorklinkRunner(
             home=tmp_path, repo=repo, runner=runner, registry=registry,
-        ).run(441, backend_name="fake", test_command="echo ok"))
+        )._run_under_issue_lock(441, backend_name="fake", test_command="echo ok"))
         if attempt == 2 and fenced:
             assert result.status == "refused"
             assert result.reason == "publication_intent_exists"
@@ -3433,6 +3440,62 @@ def test_deadline_before_worker_collection_records_timeout(
         with worker_exec._jobs_lock:
             for identifier in identifiers:
                 worker_exec._exited.discard(identifier)
+
+
+def test_end_of_run_release_contention_clears_within_retry_budget(tmp_path: Path) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    calls, sleeps = [], []
+
+    def runner(args):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(
+            args, 128 if len(calls) < 3 else 0, "",
+            "Another git process seems to be running" if len(calls) < 3 else "",
+        )
+
+    claims = ChainlinkClaims(agent_id="worker", home_path=tmp_path, runner=runner, sleeper=sleeps.append)
+    state = tmp_path / "state/worklink/runs/2152.json"
+    state.parent.mkdir(parents=True)
+    state.write_text("{}")
+    assert orchestrator._release_issue_and_clear_run_state(claims, home=tmp_path, issue_id=2152, attempt=1)
+    assert calls == [["chainlink", "locks", "release", "2152"]] * 3
+    assert sleeps == [0.1, 0.2]
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("operation", ["run", "reattach"])
+def test_leaf_controller_refuses_busy_issue_lock(tmp_path, monkeypatch, operation):
+    from mimir_cultivate.worklink.factory_state import factory_issue_resource_lock
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("busy controller lease admitted another run")
+
+    monkeypatch.setattr(WorklinkRunner, "_run_under_issue_lock" if operation == "run"
+                        else "_reattach_under_issue_lock", forbidden)
+    with factory_issue_resource_lock(tmp_path, 2152) as acquired:
+        assert acquired
+        result = asyncio.run(getattr(WorklinkRunner(home=tmp_path, repo=tmp_path), operation)(2152))
+    assert result.status == "refused" and result.reason == "issue resource lock unavailable"
+
+
+@pytest.mark.parametrize("operation", ["run", "reattach"])
+def test_leaf_controller_holds_issue_lock_before_run_state(tmp_path, monkeypatch, operation):
+    claims = ChainlinkClaims(
+        agent_id="poller", home_path=tmp_path,
+        runner=lambda args: subprocess.CompletedProcess(args, 0, json.dumps({
+            "locks": {"2152": {"agent_id": "mimir-worklink"}},
+        }), "") if args[1:3] == ["locks", "list"] else pytest.fail("released live controller"),
+    )
+
+    async def body(self, issue_id, **kwargs):
+        assert not (tmp_path / "state/worklink/runs/2152.json").exists()
+        assert claims.reconcile_orphan_locks() == []
+        return WorklinkRunResult(issue_id, None, "refused")
+
+    monkeypatch.setattr(WorklinkRunner, "_run_under_issue_lock" if operation == "run"
+                        else "_reattach_under_issue_lock", body)
+    asyncio.run(getattr(WorklinkRunner(home=tmp_path, repo=tmp_path), operation)(2152))
 
 
 def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_path: Path) -> None:
@@ -12035,7 +12098,7 @@ print(json.dumps([str(path) for path in pruned]))
 """
         child = subprocess.run(
             [sys.executable, "-c", script, str(tmp_path), str(repo)],
-            capture_output=True, text=True, timeout=30, check=True,
+            capture_output=True, text=True, timeout=SUBPROCESS_HANG_GUARD_SECONDS, check=True,
         )
         return json.loads(child.stdout)
     historical = {"reason": "opaque and nonauthoritative"}
@@ -12497,6 +12560,10 @@ def test_factory_recovery_launch_start(
             events.append("released")
 
     class Compute:
+        async def rearm_session(self, selected: LaunchHandle) -> str:
+            assert selected == retained.handle
+            return "reattach"
+
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             events.append("launch")
             assert spec.attempt == retained.attempt
@@ -12759,6 +12826,10 @@ def test_factory_recovery_binds_work_item_to_retained_run_id(
             events.append("released")
 
     class Compute:
+        async def rearm_session(self, handle: LaunchHandle) -> str:
+            assert handle == retained.handle
+            return "reattach"
+
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             launched.append(spec)
             return LaunchHandle("opencode_daemon", "ses_test2", opencode_session_id="ses_test2", launch_generation="test-generation")
@@ -13649,6 +13720,35 @@ def test_authorized_publication_ignores_hostile_checkout_git_metadata(tmp_path: 
     ).returncode != 0
 
 
+@pytest.fixture
+def attempt_delete_boundary(monkeypatch):
+    """Model foreign-owned bytecode: only the executor may unlink it."""
+    from mimir._rmtree import rmtree_missing_ok
+    from mimir_cultivate.worklink.worker_client import WorkerClient
+
+    active = False
+    deleted = []
+    real_unlink = os.unlink
+
+    def unlink(path, *, dir_fd=None):
+        if os.fsdecode(path).endswith(".pyc") and not active:
+            raise PermissionError("worker-owned bytecode")
+        return real_unlink(path, dir_fd=dir_fd)
+
+    def delete(client):
+        nonlocal active
+        deleted.append((client.path_checkout, client.issue_id, client.attempt))
+        active = True
+        try:
+            rmtree_missing_ok(client.path_checkout)
+        finally:
+            active = False
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    monkeypatch.setattr(WorkerClient, "delete_attempt", delete)
+    return deleted
+
+
 @pytest.mark.parametrize(
     ("scenario", "delete_checkout"),
     [
@@ -13666,6 +13766,7 @@ def test_worker_capabilities_close_in_order_and_retain_non_success(
     tmp_path: Path,
     scenario: str,
     delete_checkout: bool,
+    attempt_delete_boundary,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
 
@@ -13688,22 +13789,25 @@ def test_worker_capabilities_close_in_order_and_retain_non_success(
     if scenario == "publication_exception":
         with pytest.raises(RuntimeError, match="publication close failed"):
             orchestrator._close_attempt_capabilities(
-                Publication(), Authorization(), checkout, delete_checkout=delete_checkout
+                Publication(), Authorization(), checkout, delete_checkout=delete_checkout,
+                issue_id=41, attempt=2,
             )
     else:
         orchestrator._close_attempt_capabilities(
-            Publication(), Authorization(), checkout, delete_checkout=delete_checkout
+            Publication(), Authorization(), checkout, delete_checkout=delete_checkout,
+            issue_id=41, attempt=2,
         )
 
     assert closed == ["publication", "authorization"]
     assert checkout.exists() is (not delete_checkout)
     assert boundary.exists()
+    assert attempt_delete_boundary == ([(checkout, 41, 2)] if delete_checkout else [])
     if not delete_checkout:
         assert (checkout / "output.txt").read_text() == "worker output\n"
 
 
 def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attempt_delete_boundary,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
 
@@ -13723,7 +13827,9 @@ def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
         real_unlink(path, dir_fd=dir_fd)
 
     monkeypatch.setattr(orchestrator.os, "unlink", unlink)
-    orchestrator._close_attempt_capabilities(None, None, checkout, delete_checkout=True)
+    orchestrator._close_attempt_capabilities(
+        None, None, checkout, delete_checkout=True, issue_id=41, attempt=2,
+    )
 
     assert raced
     assert not checkout.exists()
@@ -13746,11 +13852,13 @@ def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
         "branch_cleanup_exception",
         "cleanup_failure",
         "cleanup_cancel",
+        "attempt_delete_failure",
     ],
 )
 def test_authorized_runner_closes_real_attempt_capabilities(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str,
     request: pytest.FixtureRequest,
+    attempt_delete_boundary,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
     from mimir_cultivate.worklink.compute import (
@@ -13769,6 +13877,20 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     sibling_marker = sibling_checkout / "sibling-canary"
     sibling_marker.write_text("keep me\n")
     (checkout / ".git" / "objects").mkdir(parents=True)
+    cache = checkout / "__pycache__"
+    cache.mkdir()
+    (cache / "poller.cpython-311.pyc").write_bytes(b"worker bytecode")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_marker = outside / "canary"
+    outside_marker.write_text("outside must survive")
+    (checkout / "external-link").symlink_to(outside, target_is_directory=True)
+    events = []
+    monkeypatch.setattr(orchestrator, "_log_event", lambda kind, **kw: events.append((kind, kw)))
+    if scenario == "attempt_delete_failure":
+        def fail_delete(client):
+            raise PermissionError("executor deletion denied")
+        monkeypatch.setattr("mimir_cultivate.worklink.worker_client.WorkerClient.delete_attempt", fail_delete)
     lifecycle = []
     checkout_kwargs = {}
     bound_specs = []
@@ -14100,7 +14222,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     assert publication.closed == 1
     assert authorization.closed == 0
     authorization.close()
-    expected_published = scenario in {"success", "branch_cleanup_exception", "cleanup_failure"}
+    expected_published = scenario in {"success", "branch_cleanup_exception", "cleanup_failure", "attempt_delete_failure"}
     expected_blocked = scenario in {
         "blocked",
         "commit_exception",
@@ -14110,8 +14232,18 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     assert result.status == (
         "completed" if expected_published else ("blocked" if expected_blocked else "failed")
     ), result.reason
-    assert checkout.exists() is (not expected_published)
+    assert checkout.exists() is (not expected_published or scenario == "attempt_delete_failure")
     assert sibling_marker.read_text() == "keep me\n"
+    assert outside_marker.read_text() == "outside must survive"
+    if scenario == "attempt_delete_failure":
+        assert ("worklink_cleanup_failed", {
+            "issue_id": 1410, "attempt": 1, "cleanup": "attempt_capabilities",
+            "error": "executor deletion denied",
+        }) in events
+        assert ["chainlink", "locks", "release", "1410"] in calls
+        assert load_run_state(tmp_path, 1410) is None
+    elif expected_published:
+        assert attempt_delete_boundary == [(checkout, 1410, 1)]
     expected_launches = {
         "work_spec_exception": 0,
         "pre_launch_exception": 1,
@@ -14123,6 +14255,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         "success": 3,
         "branch_cleanup_exception": 3,
         "cleanup_failure": 3,
+        "attempt_delete_failure": 3,
         "push_exception": 3,
         "pr_exception": 3,
     }

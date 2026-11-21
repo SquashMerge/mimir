@@ -26,7 +26,7 @@ def test_shipped_skill_example_matches_canonical_opencode_inventory() -> None:
     example = yaml.safe_load(skill.split("```yaml\n", 1)[1].split("```", 1)[0])
     entry = next(row for row in example["tool_pins"] if row["name"] == "opencode")
     pin = next(pin for pin in default_tool_pins() if pin.name == "opencode")
-    assert entry["pin"] == pin.pin == "2.2.7"
+    assert entry["pin"] == pin.pin == "2.3.0"
     assert entry["package"] == pin.package == "@opencode/cli"
     assert entry["smoke"] == pin.smoke == "opencode --version"
     assert "opencode-ai" not in skill
@@ -35,7 +35,7 @@ def test_shipped_skill_example_matches_canonical_opencode_inventory() -> None:
 
 def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
-    assert pins["opencode"].pin == "2.2.7"
+    assert pins["opencode"].pin == "2.3.0"
 
     expected = {
         "chainlink", "mermaid-cli", "osv-scanner", "gogcli",

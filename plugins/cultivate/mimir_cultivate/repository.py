@@ -810,6 +810,29 @@ def _report_lease_acquired(
 
 
 @dataclass(frozen=True)
+class InterruptedGitOperation:
+    kind: str
+    branch: str
+    original_head: str
+
+    @property
+    def abort_tool(self) -> str:
+        return f"repo_{self.kind}_abort"
+
+
+class InterruptedCheckoutRefusal(RuntimeError):
+    """A retained checkout needs recovery but cannot be safely admitted."""
+
+
+def _retained_branch(path: Path, runner: Runner) -> str:
+    try:
+        return _run(runner, ["git", "-C", str(path), "symbolic-ref", "--quiet", "--short", "HEAD"],
+                    "retained PR checkout is detached without an interrupted rebase or merge")
+    except RuntimeError as exc:
+        raise InterruptedCheckoutRefusal(str(exc)) from exc
+
+
+@dataclass(frozen=True)
 class PRCheckoutLease:
     canonical_repo: str
     canonical_origin: str
@@ -831,6 +854,11 @@ class PRCheckoutLease:
     # A missing or malformed lineage is never evidence of a clean local commit.
     lineage: dict[str, bool] | None = None
     verified_base_sha: str | None = None
+    # Turn-local recovery authority, never reconstructed from lease metadata.
+    interrupted_operation: InterruptedGitOperation | None = None
+
+    def recovery_checkout_state(self, scope: RepoPRActionScope) -> tuple[str, str] | None:
+        return recovery_checkout_state(self, scope)
 
     @property
     def write_root(self) -> Path:
@@ -1347,10 +1375,10 @@ def _recover_pr_checkout_lease_unlocked(
         runner, ["git", "-C", str(path), "config", "--get", "remote.origin.url"],
         "recovered PR checkout has no origin",
     )
-    branch = _run(
-        runner, ["git", "-C", str(path), "symbolic-ref", "--quiet", "--short", "HEAD"],
-        "recovered PR checkout is detached",
-    )
+    interrupted = interrupted_pr_checkout(lease, scope, runner=runner)
+    branch = interrupted.branch if interrupted else _retained_branch(path, runner)
+    if interrupted:
+        head = interrupted.original_head
     # Recovery grants no push authority: preserve divergent fixes for explicit
     # reconciliation, enforcing checkout identity and a fresh remote head instead.
     if (
@@ -1387,6 +1415,7 @@ def _recover_pr_checkout_lease_unlocked(
     lease = replace(
         lease, expires_at=datetime.now(UTC) + ttl,
         recovery_id=uuid.uuid4().hex,
+        interrupted_operation=interrupted,
     )
     _attest_resume_candidate(lease, scope, head, review_state, attest_resume, prior=prior)
     try:
@@ -1923,7 +1952,12 @@ def _retained_candidate_head(
         runner, ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
         "retained PR checkout has no HEAD",
     ).lower()
-    return head
+    interrupted = interrupted_pr_checkout(_lease_from_recorded_metadata(path, root), scope, runner=runner)
+    if interrupted is None:
+        branch = _retained_branch(path, runner)
+        if branch != scope.head_ref:
+            raise RuntimeError("retained PR checkout identity mismatch: belongs to another branch")
+    return interrupted.original_head if interrupted else head
 
 
 def _foreign_candidate_head(
@@ -1954,12 +1988,13 @@ def _foreign_candidate_head(
         ["git", "-C", str(lease.path), "config", "--get", "remote.origin.url"],
         "retained PR checkout has no origin",
     )
-    branch = _run(
-        runner,
-        ["git", "-C", str(lease.path), "symbolic-ref", "--quiet", "--short", "HEAD"],
-        "retained PR checkout is detached",
-    )
-    if origin != scope.canonical_origin or branch != scope.head_ref:
+    if origin != scope.canonical_origin:
+        return head, False
+    interrupted = interrupted_pr_checkout(lease, scope, runner=runner)
+    branch = interrupted.branch if interrupted else _retained_branch(lease.path, runner)
+    if interrupted:
+        head = interrupted.original_head
+    if branch != scope.head_ref:
         return head, False
     _assert_self_contained_checkout(lease.path, runner=runner)
     observed_head = scope.observed_head_sha.lower()
@@ -2009,6 +2044,81 @@ def _foreign_candidate_head(
     if published.returncode == 0 and published.stdout.strip().lower() == observed_head:
         return head, True
     return head, False
+
+
+def interrupted_pr_checkout(
+    lease: PRCheckoutLease, scope: RepoPRActionScope, *, runner: Runner = _default_runner,
+) -> InterruptedGitOperation | None:
+    """Prove an interrupted operation belongs to this exact PR, not any detached HEAD."""
+    git_dir = lease.path / ".git"
+    rebases = [git_dir / name for name in ("rebase-merge", "rebase-apply")
+               if (git_dir / name).exists()]
+    merge = (git_dir / "MERGE_HEAD").exists()
+    if not rebases and not merge:
+        return None
+    if (
+        lease.owner != scope.principal
+        or lease.canonical_repo != scope.canonical_repo
+        or lease.canonical_origin != scope.canonical_origin
+        or lease.pr_number != scope.pr_number
+        or lease.destination_ref != scope.destination_ref
+        or lease.source_root.resolve(strict=True) != Path(scope.canonical_root).resolve(strict=True)
+    ):
+        raise InterruptedCheckoutRefusal("interrupted PR checkout lease identity mismatch")
+    _safe_lease_path(lease.lease_root, lease.path, must_exist=True)
+    _assert_self_contained_checkout(lease.path, runner=runner)
+    if _run(runner, ["git", "-C", str(lease.path), "config", "--get", "remote.origin.url"],
+            "retained PR checkout has no origin") != scope.canonical_origin:
+        raise InterruptedCheckoutRefusal("interrupted PR checkout origin mismatch")
+    if len(rebases) + int(merge) != 1:
+        raise InterruptedCheckoutRefusal("ambiguous interrupted Git operation")
+    if rebases:
+        directory = rebases[0]
+        if directory.is_symlink() or not directory.is_dir():
+            raise InterruptedCheckoutRefusal("invalid interrupted rebase metadata")
+        values = []
+        for name in ("head-name", "orig-head"):
+            path = directory / name
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024:
+                raise InterruptedCheckoutRefusal("invalid interrupted rebase metadata")
+            values.append(path.read_text(encoding="utf-8").strip())
+        branch_ref, original_head = values
+        if branch_ref != f"refs/heads/{scope.head_ref}":
+            raise InterruptedCheckoutRefusal(f"interrupted rebase belongs to {branch_ref}, not PR branch {scope.head_ref}")
+        kind = "rebase"
+    else:
+        branch_ref = _run(runner, ["git", "-C", str(lease.path), "symbolic-ref", "--quiet", "HEAD"],
+                          "interrupted merge has no branch")
+        if branch_ref != f"refs/heads/{scope.head_ref}":
+            raise InterruptedCheckoutRefusal(f"interrupted merge belongs to {branch_ref}, not PR branch {scope.head_ref}")
+        original_head = _run(runner, ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+                             "interrupted merge has no HEAD")
+        kind = "merge"
+    branch_head = _run(runner, ["git", "-C", str(lease.path), "rev-parse", "--verify",
+                               f"{branch_ref}^{{commit}}"], "interrupted operation branch is missing")
+    if not re.fullmatch(r"[0-9a-f]{40}", original_head) or branch_head != original_head:
+        raise InterruptedCheckoutRefusal("interrupted operation original HEAD differs from its PR branch")
+    return InterruptedGitOperation(kind, scope.head_ref, original_head)
+
+
+def recovery_checkout_state(lease: PRCheckoutLease, scope: RepoPRActionScope) -> tuple[str, str] | None:
+    """Return the proven pre-operation identity only for server-admitted recovery."""
+    admitted = lease.interrupted_operation
+    if admitted is None:
+        return None
+    observed = interrupted_pr_checkout(lease, scope)
+    if observed != admitted:
+        raise RuntimeError(f"interrupted operation changed; call {admitted.abort_tool}")
+    return observed.branch, observed.original_head
+
+
+def _refuse_recovery(lease: PRCheckoutLease | None) -> None:
+    interrupted = getattr(lease, "interrupted_operation", None)
+    if interrupted is not None:
+        raise GitRefusal("checkout_recovery_required",
+                         f"interrupted {interrupted.kind} on {interrupted.branch}; "
+                         f"call {interrupted.abort_tool} before other repository tools",
+                         execution_started=False)
 
 
 def _is_own_unpublished_candidate(
@@ -2073,6 +2183,7 @@ def _rebind_foreign_candidate(
     attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> PRCheckoutLease:
     """Move a proven same-PR lease onto the current immutable turn scope."""
+    interrupted = interrupted_pr_checkout(lease, scope, runner=runner)
     _run(
         runner,
         [
@@ -2110,11 +2221,12 @@ def _rebind_foreign_candidate(
             (base_ancestry.stderr or base_ancestry.stdout).strip()
             or "PR checkout lease current base ancestry check failed"
         )
-    if _run(
+    actual_head = interrupted.original_head if interrupted else _run(
         runner,
         ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
         "retained PR checkout has no HEAD",
-    ).lower() != head:
+    ).lower()
+    if actual_head != head:
         raise RuntimeError("retained PR checkout HEAD changed during lease recovery")
     ancestry = runner([
         "git", "-C", str(lease.path), "merge-base", "--is-ancestor", remote_head, head,
@@ -2136,6 +2248,7 @@ def _rebind_foreign_candidate(
         pr_number=scope.pr_number,
         lineage=lease.lineage,
         verified_base_sha=actual_base,
+        interrupted_operation=interrupted,
     )
     _attest_resume_candidate(rebound, scope, head, review_state, attest_resume, prior=lease)
     metadata_path = lease.path / _METADATA
@@ -2549,6 +2662,8 @@ def acquire_pr_checkout_lease(
         # on a different base cannot attest even if its recorded lineage is clean.
         for path, _head in tuple(candidates):
             existing = _lease_from_recorded_metadata(path, root)
+            if interrupted_pr_checkout(existing, scope, runner=runner) is not None:
+                continue
             if _discard_divergent_candidate(
                 existing, scope, runner=runner,
                 notices=review_state.checkout_recovery_notices if review_state else None,
@@ -3568,6 +3683,24 @@ class RepoGitTools:
             for marker in ("rebase-merge", "rebase-apply", "MERGE_HEAD")
         )
 
+    def _interruption_receipt(self, kind: str, target: str):
+        """Prepare recovery authority only before our own attested operation."""
+        from mimir.access_control import ScopedPRGrants, pr_checkout_lease_attestation
+        from .policy import InterruptedPROperation
+
+        context = self._auth_context
+        grants = getattr(context, "scoped_pr_grants", None)
+        if (not isinstance(grants, ScopedPRGrants)
+                or not pr_checkout_lease_attestation(context, self._scope, self._state.checkout_lease).ok
+                or self._has_in_progress_merge_or_rebase()):
+            return None
+        lease = self._state.checkout_lease
+        return InterruptedPROperation(
+            self._scope.scope_id, (str(lease.path), lease.recovery_id), grants.nonce,
+            self._scope.observed_head_sha.lower(), self._scope.observed_base_sha.lower(),
+            self._scope.base_ref, target.lower(), self._expected_head, kind,
+        )
+
     def _assert_checkout_identity(self, *, allow_in_progress: bool = False) -> None:
         top = self._command(("rev-parse", "--show-toplevel")).stdout.strip()
         if Path(top).resolve(strict=False) != self._root:
@@ -3593,6 +3726,24 @@ class RepoGitTools:
         self._expected_head = self._command(("rev-parse", "--verify", "HEAD")).stdout.strip().lower()
         if self._state is not None:
             self._state.record_git_head(self._scope.scope_id, self._expected_head)
+
+    def _finish_recovery(
+        self, recovery: InterruptedGitOperation | None, *, continued: bool = False,
+    ) -> None:
+        if recovery is None:
+            return
+        lease = self._state.checkout_lease
+        branch = self._command(("symbolic-ref", "--quiet", "--short", "HEAD")).stdout.strip()
+        if branch != self._scope.head_ref:
+            raise GitRefusal("checkout_recovery_required", "abort did not restore the PR branch")
+        # Check all ordinary identity/head invariants before lifting recovery.
+        self._assert_checkout_identity()
+        def runner(args: list[str]) -> GitProcessResult:
+            return self._command(tuple(args[3:]))
+        head, valid = _foreign_candidate_head(lease, self._scope, owner=self._scope.principal, runner=runner)
+        if not valid or (not continued and head != recovery.original_head):
+            raise GitRefusal("checkout_recovery_required", "post-abort PR lease validation failed")
+        object.__setattr__(lease, "interrupted_operation", None)
 
     def _record_local_head(
         self, previous: str, *, verified_base: str | None = None,
@@ -3787,6 +3938,8 @@ class RepoGitTools:
 
     def validated_checkout_root(self) -> Path:
         """Revalidate the lease and Git identity immediately before non-Git use."""
+        if self._state is not None:
+            _refuse_recovery(self._state.checkout_lease)
         root = self._validate_lease()
         if root != self._root:
             raise GitRefusal("cross_pr_checkout", "checkout lease changed during access")
@@ -3820,6 +3973,18 @@ class RepoGitTools:
 
     def execute(self, operation: GitOperation) -> GitOperationResult:
         """Authorize one typed operation and execute only server-built argv."""
+        recovery = self._state.checkout_lease.interrupted_operation if self._state is not None else None
+        if recovery is not None:
+            continuing = (
+                isinstance(operation, GitRebase) and recovery.kind == "rebase"
+                and self._scope.event_type == "pr_mergeability_conflicting"
+            )
+            if not isinstance(operation, (GitStatus, GitUnmerged, GitRebaseAbort, GitMergeAbort)) and not continuing:
+                _refuse_recovery(self._state.checkout_lease)
+            try:
+                recovery_checkout_state(self._state.checkout_lease, self._scope)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise GitRefusal("checkout_recovery_required", str(exc), execution_started=False) from exc
         if self._retained and not isinstance(
             operation, (GitStatus, GitDiff, GitStage, GitCommit),
         ):
@@ -3944,9 +4109,12 @@ class RepoGitTools:
             result = self._command(("commit", "-m", operation.message), identity=True)
             self._refresh_expected_head()
             self._record_local_head(previous)
+            if self._state is not None:
+                object.__setattr__(self._state, "interrupted_operation", None)
         elif isinstance(operation, GitMerge):
             self._require("repo_merge", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             previous = self._expected_head
+            receipt = self._interruption_receipt("merge", self._state.checkout_lease.base_sha)
             try:
                 result = self._command(
                     ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha),
@@ -3958,6 +4126,9 @@ class RepoGitTools:
                 self._refresh_expected_head()
                 self._record_local_head(previous)
                 previous = self._expected_head
+                # This second merge is not onto the scoped base; it cannot
+                # receive interrupted-base recovery authority.
+                receipt = None
                 publication_merge = self._command(
                     ("merge", "--no-edit", "--", self._scope.observed_head_sha),
                     identity=True,
@@ -3967,6 +4138,8 @@ class RepoGitTools:
                     result.stderr + publication_merge.stderr,
                 )
             except GitRefusal as exc:
+                if receipt is not None and self._has_in_progress_merge_or_rebase():
+                    object.__setattr__(self._state, "interrupted_operation", receipt)
                 if exc.code != "git_failed":
                     raise
                 unmerged = self._unmerged_paths()
@@ -3984,8 +4157,11 @@ class RepoGitTools:
         elif isinstance(operation, GitMergeAbort):
             self._require("repo_merge_abort", RepoPRAction.WRITE)
             result = self._command(("merge", "--abort"))
+            self._finish_recovery(recovery)
+            object.__setattr__(self._state, "interrupted_operation", None)
         elif isinstance(operation, GitRebase):
             self._require("repo_rebase", RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            object.__setattr__(self._state, "_scoped_rebase", None)
             previous = self._expected_head
             if not _history_rewrite_push_permitted(self._scope):
                 raise GitRefusal(
@@ -4033,19 +4209,42 @@ class RepoGitTools:
                     f"Head verification: {head_verification}"
                 )
                 self._command(("commit", "--amend", "-m", evidence), identity=True)
+                receipt = self._state.interrupted_operation
+                if receipt is not None:
+                    verified_base = receipt.target
             else:
-                result = self._command(
-                    ("rebase", "--", verified_base), identity=True,
-                )
+                receipt = self._interruption_receipt("rebase", verified_base)
+                try:
+                    result = self._command(
+                        ("rebase", "--", verified_base), identity=True,
+                    )
+                except GitRefusal:
+                    if receipt is not None and self._has_in_progress_merge_or_rebase():
+                        object.__setattr__(self._state, "interrupted_operation", receipt)
+                    raise
             self._refresh_expected_head()
             self._record_local_head(previous, verified_base=verified_base, rewrite=True)
+            object.__setattr__(self._state, "interrupted_operation", None)
+            # Only this successful typed operation can establish continuity.
+            # Keep the remote observation/grant head untouched: force-with-lease
+            # must still compare against the PR's original published head.
+            if verified_base == self._scope.observed_base_sha.lower():
+                from .policy import _scoped_rebase_binding
+
+                object.__setattr__(self._state, "_scoped_rebase", (
+                    _scoped_rebase_binding(self._scope, self._state.checkout_lease),
+                    self._expected_head,
+                ))
             if continuing:
                 self._state.record_conflict_evidence(
                     self._scope.scope_id, self._expected_head,
                 )
+                self._finish_recovery(recovery, continued=True)
         elif isinstance(operation, GitRebaseAbort):
             self._require("repo_rebase_abort", RepoPRAction.WRITE)
             result = self._command(("rebase", "--abort"))
+            self._finish_recovery(recovery)
+            object.__setattr__(self._state, "interrupted_operation", None)
         elif isinstance(operation, GitRevert):
             self._require("repo_revert", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             previous = self._expected_head
@@ -5479,6 +5678,7 @@ def _retained_refusal(operation: str) -> ToolPolicyRefusal:
 def _publish_attested_lease_result(
     runtime: ToolRuntime[AuthContext] | None,
     state: RepoReviewState,
+    *, tool_name: str | None = None,
 ) -> None:
     """Publish exact-scope provenance when the checkout remains author-attested."""
     from mimir.access_control import (
@@ -5504,6 +5704,16 @@ def _publish_attested_lease_result(
         or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
     ):
         return
+    if tool_name in {"repo_status", "repo_unmerged"} and state.interrupted_operation is not None:
+        from .policy import _live_scoped_pr_lease
+
+        grants = getattr(context, "scoped_pr_grants", None)
+        if (getattr(context.ifc_state, "pr_checkout_author_trust", {}).get(scope.scope_id) is True
+                and _live_scoped_pr_lease(
+                    scope, state, tool_name=tool_name, turn_nonce=getattr(grants, "nonce", None),
+                ) is state.checkout_lease):
+            _publish_attested_scope_result(runtime, scope, scope.observed_head_sha)
+            return
     attestation = pr_checkout_lease_attestation(context, scope, state.checkout_lease)
     if not attestation.ok:
         log_pr_checkout_lease_attestation_refused(context, scope, attestation.reason)
@@ -5632,7 +5842,12 @@ def _execute(
                     state.action_scope.canonical_repo, state.action_scope.pr_number,
                     previous_head,
                 )
-        _publish_attested_lease_result(runtime, state)
+        _publish_attested_lease_result(
+            runtime, state, tool_name=(
+                "repo_status" if isinstance(operation, GitStatus) else
+                "repo_unmerged" if isinstance(operation, GitUnmerged) else None
+            ),
+        )
         return result
     except (GitRefusal, ToolException, RuntimeError, ValueError) as exc:
         cause_code = getattr(exc, "code", None)
@@ -5705,9 +5920,28 @@ def checkout_scoped_pr(
     runtime: ToolRuntime[AuthContext],
 ) -> dict[str, Any]:
     """Shared checkout implementation for the host and the callable tool."""
+    from mimir._deepagents_subagent_auth import is_delegated_execution
     from .forge import _client, pr_trust_verdict, remediation_checkout_preflight
 
     context = getattr(runtime, "context", None) if runtime is not None else None
+    if is_delegated_execution() and context is not None:
+        # Check every shared carrier before preflight can remint a scope or
+        # acquisition can replace/revoke an existing lease. First acquisition
+        # remains available to a delegate; its lease belongs to the shared turn.
+        states = [context.repo_review_state]
+        for registry in (context.repo_pr_scope_registry, context.server_discovered_pr_states):
+            if registry is not None:
+                states.extend(registry.review_states)
+        if any(
+            state is not None and state.checkout_lease is not None
+            and isinstance(repository, str) and state.repo.casefold() == repository.casefold()
+            and state.pr_number == pull_request
+            for state in states
+        ):
+            raise ToolPolicyRefusal(
+                "repository checkout rejected: checkout lifecycle belongs to the parent turn "
+                "while it holds a lease for this PR; use the parent's existing checkout"
+            )
     state, stopped = remediation_checkout_preflight(context, repository, pull_request)
     if stopped is not None:
         return {
@@ -5801,9 +6035,23 @@ def checkout_scoped_pr(
         detail = _redact_git_output(str(exc))
         if state.checkout_lease is not None:
             _publish_attested_lease_result(runtime, state)
+        # Admission refusals are a no-checkout result for the host, not a turn
+        # crash. Preserve transport retries and metadata-persistence faults.
+        if (getattr(runtime, "pre_turn_checkout", False) and isinstance(exc, RuntimeError)
+                and not isinstance(exc, GitTransportError)):
+            return {"status": "attestation_refused", "reason": "checkout_state_mismatch", "message": detail}
         raise ToolException(f"repository checkout rejected: {detail}") from exc
     resolve_author_trust()
     _publish_attested_lease_result(runtime, state)
+    if getattr(lease, "interrupted_operation", None) is not None:
+        interrupted = lease.interrupted_operation
+        unmerged = asdict(RepoGitTools(state).execute(GitUnmerged()))
+        return {
+            "status": "recovery", "path": str(lease.path), "scope_id": lease.scope_id,
+            "head_sha": lease.head_sha, "candidate_commits": candidates,
+            "interrupted_operation": asdict(interrupted), "repo_unmerged": unmerged,
+            "message": f"Interrupted {interrupted.kind} on {interrupted.branch}; call {interrupted.abort_tool}.",
+        }
     return {
         "status": "resumed" if candidates else "checked_out",
         "path": str(lease.path),
@@ -5820,20 +6068,59 @@ def repo_cleanup(
     pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Revoke and remove this turn's exact active checkout lease."""
+    """Remove this turn's lease; delegated requests are deferred to turn end."""
+    from mimir._deepagents_subagent_auth import is_delegated_execution
+
     if _retained_scope(runtime, repository, pull_request) is not None:
         raise _retained_refusal("repo_cleanup")
     state = _state(runtime, repository, pull_request)
     lease = state.checkout_lease
     if lease is None:
         raise ToolPolicyRefusal("repository cleanup rejected: no active checkout lease")
+    _refuse_recovery(lease)
     _publish_attested_lease_result(runtime, state)
+    if is_delegated_execution():
+        state.defer_checkout_cleanup()
+        return {"status": "deferred", "scope_id": state.action_scope.scope_id}
     try:
         removed = cleanup_pr_checkout_lease(lease, review_state=state)
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
         raise ToolException(f"repository cleanup rejected: {detail}") from exc
     return {"status": "cleaned", "removed": removed, "scope_id": state.action_scope.scope_id}
+
+
+def cleanup_deferred_pr_checkouts(context: AuthContext) -> None:
+    """Drain delegate requests only after the parent finishes using its grants.
+
+    Reuse exact-lease cleanup, including unpublished-work preservation. Leases
+    with no cleanup request keep their existing recovery/reaper lifecycle.
+    """
+    states = [context.repo_review_state]
+    for registry in (context.repo_pr_scope_registry, context.server_discovered_pr_states):
+        if registry is not None:
+            states.extend(registry.review_states)
+    seen: set[int] = set()
+    for state in states:
+        if state is None or id(state) in seen:
+            continue
+        seen.add(id(state))
+        if state.checkout_cleanup_deferred and state.checkout_lease is not None:
+            try:
+                cleanup_pr_checkout_lease(state.checkout_lease, review_state=state)
+            except (OSError, RuntimeError, ValueError) as exc:
+                # Leave the lease/request for the unchanged expiry reaper.
+                # One failure must not strand the other deferred requests.
+                from mimir.event_logger import log_event_sync
+
+                try:
+                    log_event_sync(
+                        "pr_checkout_deferred_cleanup_failed",
+                        scope_id=state.action_scope.scope_id,
+                        error=_redact_git_output(str(exc)),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not strand cleanup
+                    log.warning("pr_checkout_deferred_cleanup_failed: %s", state.action_scope.scope_id)
 
 
 @tool

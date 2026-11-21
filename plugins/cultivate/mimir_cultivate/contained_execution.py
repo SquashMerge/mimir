@@ -58,28 +58,44 @@ class CollectedExecutionResult:
 
 
 HEAVY_LOCK_ENV = "MIMIR_HEAVY_LOCK_FILE"
+HEAVY_LOCK_TIMEOUT_ENV = "MIMIR_HEAVY_LOCK_TIMEOUT"
 _HEAVY_LOCK_PATH = re.compile(r"/[A-Za-z0-9._/-]{1,1023}\Z")
 _CONTROLLER_HOME = "/home/mimir"
 
 
+def validate_heavy_lock_timeout(value: str) -> str:
+    """Validate the shared lease's total queue-and-run budget, in seconds."""
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
+        raise ValueError(f"{HEAVY_LOCK_TIMEOUT_ENV} must be ASCII digits in range 60..86400")
+    # Bound conversion even for very long inputs, while allowing leading zeros.
+    significant = value.lstrip("0") or "0"
+    if len(significant) > 5 or not 60 <= int(significant) <= 86400:
+        raise ValueError(f"{HEAVY_LOCK_TIMEOUT_ENV} must be ASCII digits in range 60..86400")
+    return value
+
+
 def heavy_lock_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The operator's shared heavy-run lease path, for every Worklink command.
+    """The operator's shared heavy-run lease settings, for every Worklink command.
 
     scripts/heavy_run.sh serializes heavy commands across the host and its
-    containers through a directory both can write. The controller's setting is
-    the only MIMIR_* name a worker receives: it is a path, not a credential, and
-    without it builders and gates cannot join the operator's lease. Unset or
-    empty means no lease. A malformed or controller-home path fails closed
-    rather than silently running heavy work outside the lease.
+    containers through a directory both can write. The controller's lease path
+    and optional timeout are not credentials. Without the path, builders and
+    gates cannot join the operator's lease. An unset or empty path means no
+    lease (and no forwarded timeout). A malformed or controller-home path, or
+    an invalid timeout for a configured lease, fails closed.
     """
-    value = (os.environ if environ is None else environ).get(HEAVY_LOCK_ENV, "")
+    environ = os.environ if environ is None else environ
+    value = environ.get(HEAVY_LOCK_ENV, "")
     if not value:
         return {}
     normalized = posixpath.normpath(value)
     if (_HEAVY_LOCK_PATH.fullmatch(value) is None or normalized != value
             or normalized == _CONTROLLER_HOME or normalized.startswith(_CONTROLLER_HOME + "/")):
         raise ValueError(f"{HEAVY_LOCK_ENV} must be a normalized absolute path outside {_CONTROLLER_HOME}")
-    return {HEAVY_LOCK_ENV: value}
+    result = {HEAVY_LOCK_ENV: value}
+    if HEAVY_LOCK_TIMEOUT_ENV in environ:
+        result[HEAVY_LOCK_TIMEOUT_ENV] = validate_heavy_lock_timeout(environ[HEAVY_LOCK_TIMEOUT_ENV])
+    return result
 
 
 def base_worker_environment(identifier: str) -> dict[str, str]:

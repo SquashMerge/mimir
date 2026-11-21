@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 FACTORY_VERSION = "0.14.1"
-OPENCODE_VERSION = "2.2.7"
+OPENCODE_VERSION = "2.3.0"
 from mimir.plugin_dockerfile import main as assemble_main, verify_pins
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
@@ -56,7 +56,7 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
 
     def normal(text: str) -> str:
         text = " ".join(text.replace("\\\n", " ").replace('"', "").replace("'", "").split())
-        return (text.replace("opencode-ai@1.18.21", "@opencode/cli@2.2.7 @openai/codex@0.139.0")
+        return (text.replace("opencode-ai@1.18.21", "@opencode/cli@2.3.0 @openai/codex@0.139.0")
                 .replace("opencode-feature-factory@", "opencode2-feature-factory@")
                 .replace("opencode-project-memory@0.1.0 opencode-openai-codex-auth@4.4.0 opencode-anthropic-auth@0.0.13",
                          "@devtheops/opencode-plugin-otel@2.1.0"))
@@ -73,7 +73,7 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
          "poppler-utils tesseract-ocr tesseract-ocr-eng libjemalloc2",
          "curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -",
          "apt-get install -y --no-install-recommends nodejs",
-          "npm install --global --prefix /opt/mimir-opencode", "@opencode/cli@2.2.7", "@openai/codex@0.139.0",
+          "npm install --global --prefix /opt/mimir-opencode", "@opencode/cli@2.3.0", "@openai/codex@0.139.0",
           "feature-factory@${FACTORY_VERSION}", "opencode2-feature-factory@${FACTORY_VERSION}",
           "@devtheops/opencode-plugin-otel@2.1.0", "apt-get clean", "rm -rf /var/lib/apt/lists/*"),
         ("groupadd --gid 1001 mimir", "groupadd --gid 1002 worklink",
@@ -1074,7 +1074,7 @@ def test_legacy_routes_do_not_install_claude(tmp_path, enabled):
     assert len(installs) == int(enabled)
     assert not any("claude" in " ".join(argv) for argv in commands)
     if enabled == "1":
-        assert installs[0][4:] == [str(tmp_path / "opt/mimir-opencode"), "@opencode/cli@2.2.7",
+        assert installs[0][4:] == [str(tmp_path / "opt/mimir-opencode"), f"@opencode/cli@{OPENCODE_VERSION}",
                                   "@openai/codex@0.139.0", "feature-factory@0.14.1",
                                   "opencode2-feature-factory@0.14.1", "@devtheops/opencode-plugin-otel@2.1.0"]
 

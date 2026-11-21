@@ -78,12 +78,22 @@ async def test_leaf_production_create_prompt_model_and_permissions(tmp_path):
             "model": {"providerID": "openai", "id": "gpt-test", "variant": "high"},
             "permissions": [
                 {"action": "external_directory", "resource": "*", "effect": "deny"},
+                {"action": "question", "resource": "*", "effect": "deny"},
                 {"action": "shell", "resource": "*", "effect": "deny"},
                 {"action": "shell", "resource": "git *", "effect": "allow"},
                 {"action": "shell", "resource": "uv *", "effect": "allow"}],
         }
         prompt = next(body for _, route, _, body in daemon.requests if route.endswith("/prompt"))
-        assert prompt == {"text": "rules first\n\nbuild", "resume": True}
+        assert prompt == {"text": spec.session_request.text, "resume": True}
+        assert prompt["text"].endswith("rules first\n\nbuild")
+        listed_patterns = [
+            line.removeprefix("- `").removesuffix("`")
+            for line in prompt["text"].splitlines() if line.startswith("- `")
+        ]
+        assert listed_patterns == [
+            rule["resource"] for rule in create["permissions"]
+            if rule["action"] == "shell" and rule["effect"] == "allow"
+        ]
         assert spec.local_argv is None and spec.env == {}
         assert "worker_projections" not in spec.backend_config
         assert raw.backend_status == "success"
@@ -189,6 +199,7 @@ async def test_contained_spawn_wire_agent_and_broad_shell(tmp_path, monkeypatch,
             assert "agent" not in create
         assert create["permissions"] == [
             {"action": "external_directory", "resource": "*", "effect": "deny"},
+            {"action": "question", "resource": "*", "effect": "deny"},
             {"action": "shell", "resource": "*", "effect": "allow"}]
         assert "variant" not in create["model"]
 

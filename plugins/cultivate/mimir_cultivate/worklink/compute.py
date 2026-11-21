@@ -150,9 +150,12 @@ class ComputeBackend(Protocol):
 
 
 class ComputeCleanupError(RuntimeError):
-    def __init__(self, handle: LaunchHandle) -> None:
+    def __init__(self, handle: LaunchHandle, detail: str = "") -> None:
+        from mimir_cultivate.opencode import redact_daemon_output
+
         worker = "daemon session" if handle.substrate == "opencode_daemon" else "contained worker"
-        super().__init__(f"{worker} quiescence unverified; retain checkout and recovery state")
+        super().__init__(f"{worker} quiescence unverified; retain checkout and recovery state" +
+                         (": " + redact_daemon_output(detail)[:8192] if detail else ""))
         self.handle = handle
 
 
@@ -205,6 +208,9 @@ class OpenCodeDaemonComputeBackend:
 
     async def recover_admission(self, generation: str) -> LaunchHandle | None:
         return await self._client.session_recover_admission(generation)
+
+    async def rearm_session(self, handle: LaunchHandle) -> str:
+        return await self._client.session_rearm(handle)
 
     def bind_retained_checkout(self, checkout: Path, *, issue_id: int, attempt: int) -> None:
         """Bind a new controller to retained correlation without admitting input."""
@@ -347,6 +353,9 @@ class OpenCodeDaemonComputeBackend:
         outcome = await self._observe(handle)
         return outcome.stdout
 
+    async def session_tree_activity(self, handle: LaunchHandle) -> dict[str, Any]:
+        return await self._client.session_tree_activity(handle)
+
     def job_alive(self, handle: LaunchHandle) -> bool:
         """Conservative supervision hint; only observation proves a host outcome."""
         return handle.substrate == self.name and handle.identifier not in self._quiescent
@@ -370,14 +379,14 @@ class OpenCodeDaemonComputeBackend:
         try:
             await self._client.session_cancel(handle)
         except (OSError, RuntimeError, ValueError) as exc:
-            raise ComputeCleanupError(handle) from exc
+            raise ComputeCleanupError(handle, str(exc)) from exc
         self._quiescent.add(handle.identifier)
 
     async def cleanup(self, handle: LaunchHandle) -> None:
         try:
             await self._client.session_release(handle)
         except (OSError, RuntimeError, ValueError) as exc:
-            raise ComputeCleanupError(handle) from exc
+            raise ComputeCleanupError(handle, str(exc)) from exc
         self._deadlines.pop(handle.identifier, None)
 
 

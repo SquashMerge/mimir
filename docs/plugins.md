@@ -143,7 +143,7 @@ tokens are single-use, and sharing one login across deployments can revoke
 the entire token family. Log in separately for **each** deployment. This is the
 agent's login: the controller also seeds the Worklink daemon's credential store.
 
-On legacy routes, Worklink uses a separate OpenCode 2.2.7 daemon, supervised by the
+On legacy routes, Worklink uses a separate OpenCode 2.3.0 daemon, supervised by the
 `worklink-opencode` s6 longrun as `worklink` (uid 1002). Setup starts the container
 and waits at most 60 seconds for local daemon readiness. The Mimir workload is
 gated, but the daemon remains available when login is missing. As `mimir`, the
@@ -250,8 +250,11 @@ setup back-fills the field. Explicit conflicting values require `--force` or
 manual reconciliation.
 Pass `--heavy-lock-dir <host dir>` to join a heavy-run lease shared with other
 agents on the same host. Setup mounts the directory into the agent at
-`/mimir-heavy-locks` and sets `MIMIR_HEAVY_LOCK_FILE=/mimir-heavy-locks/heavy.lock`;
-Worklink passes that one path to builder sessions, gates and `repo_test` legs,
+`/mimir-heavy-locks` and sets `MIMIR_HEAVY_LOCK_FILE=/mimir-heavy-locks/heavy.lock`
+and `MIMIR_HEAVY_LOCK_TIMEOUT=14400`. Override the timeout with
+`--heavy-lock-timeout <seconds>` (ASCII digits, 60..86400). It covers queueing
+for the lease plus running the command, not just execution time. Worklink passes
+both settings to builder sessions, gates and `repo_test` legs,
 which otherwise receive no `MIMIR_*` settings. Commands join the lease through
 `scripts/heavy_run.sh` (an atomic-`mkdir` directory lease with heartbeats, which
 works across a VM bind mount where kernel `lockf` locks do not); the repository's
@@ -260,7 +263,9 @@ container uids 1001 and 1002; on Linux hosts that means mode `0777`, not a
 sticky `1777`, because waiters retire other holders' stale leases. Each lease
 generation is created `0777` with `0644` files regardless of the holder's
 umask, so participants need no shared group. `none`
-clears the setting; omitting the flag on a rerun preserves it.
+for `--heavy-lock-dir` clears both settings; omitting the flags on a rerun
+preserves them. Without a shared directory, no timeout is written. Outside setup,
+an unset timeout is not forwarded, so `heavy_run`'s own default applies.
 
 `--embedding local` (the default) selects `voyageai/voyage-4-nano` at 1024
 dimensions on CPU. Its query and document vectors share Voyage 4's embedding

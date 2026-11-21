@@ -97,6 +97,7 @@ from ..access_control import (
     ServicePrincipal,
     ServiceShellBindingRule,
     _OPERATOR_SHELL_BINDING_ISSUER,
+    _OWN_PR_REVIEW_REFUSAL,
     _declared_command_execution_argv,
     _issue_operator_shell_binding,
     _live_untrusted_active_ingest,
@@ -3611,7 +3612,8 @@ def _scoped_pr_refusal_text(authorization: Any) -> str:
             and detail == "Call repo_checkout(repository, pull_request) for this repository and PR first."):
         return detail
     if (getattr(authorization, "reason", None) in {"repo_pr_grant_denied", "repo_pr_scope_denied"}
-            and isinstance(detail, str) and detail.startswith("scope does not grant ")
+            and isinstance(detail, str)
+            and (detail.startswith("scope does not grant ") or detail == _OWN_PR_REVIEW_REFUSAL)
             and len(detail) <= 160 and "\n" not in detail):
         return detail
     return "scoped PR grant refused before execution"

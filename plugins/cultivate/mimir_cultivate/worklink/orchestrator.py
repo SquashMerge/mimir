@@ -1109,6 +1109,25 @@ class WorklinkRunner:
         base_branch: str | None = None,
         autonomous: bool = False,
     ) -> WorklinkRunResult:
+        # Fence reconciliation even before admission publishes durable run state.
+        with factory_issue_resource_lock(self.home, issue_id) as acquired:
+            if not acquired:
+                return WorklinkRunResult(issue_id, None, "refused", reason="issue resource lock unavailable")
+            return await self._run_under_issue_lock(
+                issue_id, backend_name=backend_name, dry_run=dry_run,
+                test_command=test_command, base_branch=base_branch, autonomous=autonomous,
+            )
+
+    async def _run_under_issue_lock(
+        self,
+        issue_id: int,
+        *,
+        backend_name: str | None = None,
+        dry_run: bool = False,
+        test_command: str | None = None,
+        base_branch: str | None = None,
+        autonomous: bool = False,
+    ) -> WorklinkRunResult:
         incident_owner = self._begin_incident_invocation(autonomous)
         if autonomous and not dry_run:
             admission_reason = _autonomous_leaf_block_reason(self.home, issue_id)
@@ -1767,6 +1786,8 @@ class WorklinkRunner:
                             lease.authorization if lease is not None else None,
                             lease.path if lease is not None else None,
                             delete_checkout=delete_authorized_checkout,
+                            issue_id=issue.issue_id,
+                            attempt=record.attempt,
                         )
                     except Exception as exc:  # noqa: BLE001 - teardown must continue
                         _log_event(
@@ -2558,6 +2579,14 @@ class WorklinkRunner:
         )
 
     async def reattach(
+        self, issue_id: int, *, autonomous: bool = False
+    ) -> WorklinkRunResult:
+        with factory_issue_resource_lock(self.home, issue_id) as acquired:
+            if not acquired:
+                return WorklinkRunResult(issue_id, None, "refused", reason="issue resource lock unavailable")
+            return await self._reattach_under_issue_lock(issue_id, autonomous=autonomous)
+
+    async def _reattach_under_issue_lock(
         self, issue_id: int, *, autonomous: bool = False
     ) -> WorklinkRunResult:
         """Observe an owned durable session without admitting another input.
@@ -3991,17 +4020,29 @@ class WorklinkRunner:
             return await self._finish_factory_070(issue=issue, claim_record=claim_record, claims=claims,
                 backend=backend, compute=compute, factory_record=retained, test_cmd=test_cmd,
                 runner=runner, started_at=datetime.now(UTC))
-        if daemon_host and pre.status == "running":
+        fresh_running = False
+        recovery = None
+        if daemon_host and (pre.status == "running" or pre.is_parked):
+            recovery = await compute.rearm_session(handle)
+            fresh_running = pre.status == "running" and recovery == "fresh"
+        if recovery == "continued" and pre.is_parked:
+            return await self._supervise_factory_070(issue=issue, claim_record=claim_record, claims=claims,
+                backend=backend, compute=compute, factory_record=retained, test_cmd=test_cmd,
+                runner=runner, started_at=datetime.now(UTC), recovery_session=handle.opencode_session_id,
+                autonomous=autonomous)
+        if daemon_host and pre.status == "running" and not fresh_running:
             return await self._supervise_factory_070(issue=issue, claim_record=claim_record, claims=claims,
                 backend=backend, compute=compute, factory_record=retained, test_cmd=test_cmd,
                 runner=runner, started_at=datetime.now(UTC), initial_status=pre, autonomous=autonomous)
-        if not pre.is_parked and not (retained.host == "claude_code" and pre.status == "running"):
+        fresh_running = fresh_running or (retained.host == "claude_code" and pre.status == "running")
+        if not pre.is_parked and not fresh_running:
             raise WorklinkError("factory recovery status is not resumable")
         if retained.run_id != epic_run_id(retained.issue_id):
             raise WorklinkError("fresh host recovery requires a canonical factory run id")
-        if pre.is_parked and pre.park_snapshot is None:
+        if pre.park_snapshot is None and not fresh_running:
             raise WorklinkError("factory recovery requires a published park snapshot")
-        pre.require_recovery_next()
+        if not fresh_running:
+            pre.require_recovery_next()
         prior_park_time = (retained.observed_at if retained.status is not None and retained.status.is_parked
                            and retained.status.park_snapshot == pre.park_snapshot else None)
         epic_environment = dict(os.environ)
@@ -4033,14 +4074,16 @@ class WorklinkRunner:
                 retained = replace(retained, controller_phase="parked")
                 save_factory_record(self.home, retained)
                 self._archive_factory_park(next(iter(prior.values())), retained)
-        if daemon_host:
+        if daemon_host and not fresh_running:
             await _cancel_and_cleanup_factory_handle(compute, handle)
         if pre.lock_session is not None:
             await _await_factory_control(backend.lock, retained.run_id, "release", session=retained.session,
                                    sandbox=sandbox, launcher=retained.launcher)
         released = await asyncio.to_thread(backend.status, retained.run_id, sandbox=sandbox, launcher=retained.launcher)
         _require_factory_status(released, retained)
-        if (released.status != pre.status or released.lock != "absent" or released.lock_session is not None
+        if (released.status != pre.status
+                or (not released.is_parked and not (fresh_running and released.status == "running"))
+                or released.lock != "absent" or released.lock_session is not None
                 or released.next != pre.next
                 or _opaque_json_bytes(released.terminal_result) != _opaque_json_bytes(pre.terminal_result)):
             raise WorklinkError("factory recovery could not verify the old host lock was released")
@@ -4226,7 +4269,8 @@ class WorklinkRunner:
             try:
                 await compute.cancel(handle)
             except BaseException as exc:
-                factory_record = replace(factory_record, controller_error=_factory_controller_error(exc))
+                factory_record = replace(factory_record, children_reaped=False,
+                                         controller_error=_factory_controller_error(exc))
                 save_factory_record(self.home, factory_record)
                 _write_factory_host_evidence(self.home, factory_record, "failed", _factory_controller_error(exc))
                 raise
@@ -4482,6 +4526,24 @@ class WorklinkRunner:
                 and wait_task.result().session_outcome is not None
                 and wait_task.result().session_outcome.execution_state == "succeeded")
 
+        async def idle_park_reason() -> str | None:
+            if handle.substrate != "opencode_daemon":
+                return f"factory driver idle: no progress since {last_change_at}"
+            activity = await compute.session_tree_activity(handle)
+            # A descendant specialist's shell is useful work even while its
+            # session is quiet (#105); the activity reader excludes driver shells.
+            # Forms are not heartbeats: do not mask #2164 with their timestamps
+            # (or updates to a driver waiting for the blocked specialist).
+            if activity["running_shell"]:
+                return None
+            updated = activity["last_activity_at_ms"] / 1000
+            if not activity["pending_form"] and datetime.now(UTC).timestamp() - updated < idle_after:
+                return None
+            timestamp = datetime.fromtimestamp(updated, UTC).isoformat()
+            suffix = "; pending form is not progress" if activity["pending_form"] else ""
+            return (f"factory driver idle: no progress since {last_change_at}; "
+                    f"last session activity at {timestamp} from {activity['last_activity_session_id']}{suffix}")
+
         async def missed_poll(exc: Exception) -> None:
             nonlocal error_polls, error_incident, status, wait_task
             # Only a verified ending may leave supervision. A control-plane
@@ -4546,13 +4608,17 @@ class WorklinkRunner:
                     )
                 ):
                     if loop.time() < park_deadline:
-                        end_stale_episode("driver_idle")
-                        reason = f"factory driver idle: no progress since {last_change_at}"
+                        try:
+                            reason = await idle_park_reason()
+                        except Exception as exc:
+                            await missed_poll(exc)
+                            continue
+                        if reason is not None:
+                            end_stale_episode("driver_idle")
                     else:
                         reason = _factory_budget_park_reason(last_status, factory_record)
-                    return await park_for_reason(
-                        last_status, reason
-                    )
+                    if reason is not None:
+                        return await park_for_reason(last_status, reason)
                 if (recovery_session is not None or host_lock_pending) and loop.time() >= startup_deadline:
                     return await repark_startup_failure(
                         "factory driver did not acquire the run lock before startup deadline"
@@ -4807,9 +4873,14 @@ class WorklinkRunner:
                                 and now - last_change >= idle_after
                                 and compute.job_alive(handle)
                             ):
-                                reason = f"factory driver idle: no progress since {last_change_at}"
-                                end_stale_episode("driver_idle")
-                                return await park_for_reason(status, reason)
+                                try:
+                                    reason = await idle_park_reason()
+                                except Exception as exc:
+                                    await missed_poll(exc)
+                                    continue
+                                if reason is not None:
+                                    end_stale_episode("driver_idle")
+                                    return await park_for_reason(status, reason)
                     if (
                         stale_failure is None
                         and dead_windows >= 2
@@ -5943,6 +6014,8 @@ def _close_attempt_capabilities(
     checkout: Path | None,
     *,
     delete_checkout: bool,
+    issue_id: int,
+    attempt: int,
 ) -> None:
     try:
         if publication is not None:
@@ -5953,9 +6026,14 @@ def _close_attempt_capabilities(
                 authorization.close()
         finally:
             if delete_checkout and checkout is not None:
-                # Path-addressed attempts are siblings under one repository root.
-                # Delete only this attempt; removing the parent destroys concurrent runs.
-                rmtree_missing_ok(checkout)
+                from .worker_client import WorkerClient
+
+                # Worker-owned content is opaque to controller-side cleanup.
+                # The executor confines deletion to this one issued attempt.
+                WorkerClient.for_path_checkout(
+                    checkout, issue_id=issue_id, attempt=attempt,
+                    run_uid=get_identities().worklink_uid,
+                ).delete_attempt()
 
 
 def _release_issue_and_clear_run_state(
@@ -5966,7 +6044,12 @@ def _release_issue_and_clear_run_state(
     attempt: int,
     trigger_ready_scan: bool = False,
 ) -> bool:
-    """Release a claim, clear local state, then notify waiting autonomous work."""
+    """Release with bounded contention retry, clear state, then notify the queue.
+
+    Unconfirmed release is not a free slot. Once terminal cleanup clears the
+    run state and drops the controller lease, the dispatcher can reconcile it.
+    Retained recovery state remains a fence against that reconciliation.
+    """
     try:
         released = claims.release_issue(issue_id)
     except BaseException as exc:

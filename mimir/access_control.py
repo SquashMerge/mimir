@@ -7661,10 +7661,23 @@ class SinkGate:
                 )
                 if target_in_lease:
                     service_target_allowed = True
-                    if not _repo_review_action_allowed(
-                        review_state, _registered_review_action("write", auth_context),
-                    ):
+                    write_action = _registered_review_action("write", auth_context)
+                    if not _repo_review_action_allowed(review_state, write_action):
                         github_repo_scope_refusal = "repo_pr_write_not_granted"
+                    else:
+                        lease = getattr(review_state, "checkout_lease", None)
+                        git_dir = Path(lease.path) / ".git"
+                        if (getattr(lease, "interrupted_operation", None) is not None
+                                or getattr(review_state, "interrupted_operation", None) is not None
+                                or any((git_dir / marker).exists() for marker in (
+                                    "MERGE_HEAD", "rebase-merge", "rebase-apply",
+                                ))):
+                            protocol = selected_policy_registry().scoped_actions.get(scope.owner)
+                            if not _valid_scoped_pr_grant(
+                                auth_context, scope.owner, write_action, protocol,
+                                scope, review_state, tool_name=tool_name,
+                            ):
+                                github_repo_scope_refusal = "repo_pr_write_not_granted"
                 elif scope is not None:
                     lease = getattr(review_state, "checkout_lease", None)
                     roots = (
@@ -9216,8 +9229,12 @@ class ToolAuthorization:
     result_integrity: str = "untrusted"
     argument_egress: str = "taint_gated"
     repo_pr_action_scope: Any = field(default=None, repr=False)
+    # Pre-execution attestation: failed Git operations may detach/move HEAD or
+    # remove recovery metadata before their diagnostics are classified.
+    repo_pr_diagnostics_bound: bool = False
     forge_scope_mismatch: dict[str, Any] | None = None
     policy: Any = field(default=None, repr=False, compare=False)
+    grant_refusal_reason: str | None = None
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
@@ -9236,12 +9253,15 @@ class ToolAuthorization:
             "granted_actions": sorted(
                 getattr(scope, "allowed_operations", frozenset())
             ),
-            "refusal_reason": self.reason if not self.allowed else None,
+            "refusal_reason": self.grant_refusal_reason or (self.reason if not self.allowed else None),
             "forge_scope_mismatch": self.forge_scope_mismatch,
         }
 
 
 _SCOPED_PR_ISSUER = object()
+_PR_OPERATION_DIAGNOSTICS = frozenset({
+    "repo_rebase", "repo_merge", "repo_rebase_abort", "repo_merge_abort",
+})
 
 
 @dataclass(frozen=True)
@@ -9397,17 +9417,26 @@ def framework_checkout_resumable(
 def _valid_scoped_pr_grant(
     auth_context: AuthContext | None, owner: str | None, action: Any,
     protocol: Any, scope: Any, review_state: Any, *, tool_name: str | None = None,
+    diagnostics: list[str] | None = None,
 ) -> bool:
-    grants = getattr(auth_context, "scoped_pr_grants", None)
-    if (not isinstance(grants, ScopedPRGrants)
-              or protocol is None or protocol.owner != owner
-              or grants._protocols.get(owner) is not protocol
-             or type(action) is not protocol.action_type
-              or (getattr(protocol, "trusted_scope", None) is not None
-                  and type(scope) is not protocol.trusted_scope.scope_type)
-              or scope is None or getattr(scope, "owner", None) != owner
-             or grants.principal != getattr(auth_context, "canonical_principal", None)):
+    def refuse(code: str) -> bool:
+        if diagnostics is not None:
+            diagnostics.append(code)
         return False
+
+    grants = getattr(auth_context, "scoped_pr_grants", None)
+    if not isinstance(grants, ScopedPRGrants):
+        return refuse("grants_missing")
+    if protocol is None or protocol.owner != owner or grants._protocols.get(owner) is not protocol:
+        return refuse("grant_protocol_mismatch")
+    if type(action) is not protocol.action_type:
+        return refuse("grant_action_type_mismatch")
+    if (scope is None or getattr(scope, "owner", None) != owner
+            or (getattr(protocol, "trusted_scope", None) is not None
+                and type(scope) is not protocol.trusted_scope.scope_type)):
+        return refuse("grant_scope_type_mismatch")
+    if grants.principal != getattr(auth_context, "canonical_principal", None):
+        return refuse("grant_principal_mismatch")
     slot_policy = getattr(auth_context, "_plugin_slot_policy", None)
     if (slot_policy is not None and owner in slot_policy.state_slots
             and slot_policy.scoped_actions.get(owner) is protocol):
@@ -9422,10 +9451,10 @@ def _valid_scoped_pr_grant(
         if registered_state is None and registry is not None:
             registered_state = registry.resolve(scope.canonical_repo, scope.pr_number)
         if registered_state is not review_state or review_state.action_scope is not scope:
-            return False
+            return refuse("review_state_superseded")
     designated_checkout = getattr(protocol, "checkout_tool", None)
     if designated_checkout is not None and tool_name is None:
-        return False
+        return refuse("grant_tool_missing")
     is_checkout = action is protocol.checkout_action and (
         designated_checkout is None or tool_name == designated_checkout
     )
@@ -9437,23 +9466,68 @@ def _valid_scoped_pr_grant(
         # itself attested this turn. It is validated as that lease's follow-on.
         is_checkout = False
         grant = grants.get(owner, scope, action.value, checkout=False)
-    if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
-            or grant.owner != owner or grant.principal != grants.principal
-            or grant.turn_nonce != grants.nonce or time.monotonic() >= grant.expires_at
-            or grant.scope_id != scope.scope_id or grant.repository != scope.canonical_repo
-            or grant.pull_request != scope.pr_number or grant.head != scope.observed_head_sha):
-        return False
+    if grant is None:
+        return refuse("grant_missing")
+    for invalid, code in (
+        (grant._issuer is not _SCOPED_PR_ISSUER, "grant_issuer_mismatch"),
+        (grant.owner != owner, "grant_owner_mismatch"),
+        (grant.principal != grants.principal, "grant_principal_mismatch"),
+        (grant.turn_nonce != grants.nonce, "grant_turn_mismatch"),
+        (time.monotonic() >= grant.expires_at, "grant_expired"),
+        (grant.scope_id != scope.scope_id, "grant_scope_mismatch"),
+        (grant.repository != scope.canonical_repo, "grant_repository_mismatch"),
+        (grant.pull_request != scope.pr_number, "grant_pr_mismatch"),
+        (grant.head != scope.observed_head_sha, "grant_head_mismatch"),
+    ):
+        if invalid:
+            return refuse(code)
     if is_checkout:
         if grant.lease_identity is not None:
-            return False
+            return refuse("checkout_grant_has_lease")
     else:
-        live = protocol.live_lease(scope, review_state) if protocol.live_lease is not None else None
-        if live is None or grant.lease_identity != (str(live.path), live.recovery_id):
+        live = None
+        codes: list[str] = []
+        live_lease = protocol.live_lease
+        if live_lease is not None:
+            # Older protocols keep their two-argument contract and gain no
+            # recovery bypass; diagnostics remain fixed, host-owned codes.
+            try:
+                parameters = inspect.signature(live_lease).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            recovery_args = {}
+            if "tool_name" in parameters:
+                recovery_args.update(tool_name=tool_name, turn_nonce=grants.nonce)
+            if "refusal_codes" in parameters:
+                recovery_args["refusal_codes"] = codes
+            live = live_lease(scope, review_state, **recovery_args)
+        if live is None:
+            # Never copy plugin/forge text into the audit reason.
+            code = codes[0] if codes and codes[0] in {"lease_invalid", "lease_head_mismatch"} else "lease_validation_failed"
+            return refuse(code)
+        if grant.lease_identity != (str(live.path), live.recovery_id):
+            return refuse("grant_lease_mismatch")
+        if _recovery_tool_refusal(review_state, tool_name):
             return False
     try:
-        return protocol.validate_scope(action, scope, grant) is True
+        if protocol.validate_scope(action, scope, grant) is not True:
+            return refuse("grant_scope_validation_failed")
+        return True
     except (TypeError, ValueError, AttributeError):
-        return False
+        return refuse("grant_scope_validation_failed")
+
+
+def _recovery_tool_refusal(review_state: Any, tool_name: str | None) -> str | None:
+    interrupted = getattr(getattr(review_state, "checkout_lease", None), "interrupted_operation", None)
+    if interrupted is None or tool_name is None or not tool_name.startswith("repo_"):
+        return None
+    if tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"}:
+        return None
+    scope = getattr(review_state, "action_scope", None)
+    if (tool_name == "repo_rebase" and interrupted.kind == "rebase"
+            and getattr(scope, "event_type", None) == "pr_mergeability_conflicting"):
+        return None
+    return f"Interrupted {interrupted.kind} on {interrupted.branch}; call {interrupted.abort_tool} first."
 
 
 def register_server_discovered_review_grant(auth_context: AuthContext, state: Any) -> None:
@@ -9537,6 +9611,12 @@ def resolve_registered_review_state(
     return state
 
 
+_OWN_PR_REVIEW_REFUSAL = (
+    "You authored this PR; GitHub forbids reviewing your own PR. Use pr_comment for findings. "
+    "Expected policy, not a capability gap; don't escalate."
+)
+
+
 def authorize_repo_pr_tool(
     tool_name: str,
     scope: Any,
@@ -9596,9 +9676,12 @@ def authorize_repo_pr_tool(
     missing_actions = tuple(
         action for action in required_actions if action not in granted_actions
     )
+    grant_diagnostics: list[str] = []
     grant_valid = not registered_plugin or _valid_scoped_pr_grant(
         auth_context, owner, action, protocol, scope, review_state, tool_name=tool_name,
+        diagnostics=grant_diagnostics,
     )
+    recovery_refusal = _recovery_tool_refusal(review_state, tool_name)
     in_scope = (
         scope is not None
         and not missing_actions
@@ -9628,10 +9711,30 @@ def authorize_repo_pr_tool(
             review_state, tool_name=protocol.checkout_tool,
         )
     )
+    # Server-issued scopes bind principal to the agent's forge identity. The
+    # write action distinguishes remediation (including CI's reduced set) from
+    # review scopes. This changes guidance only, never the authorization above.
+    own_pr_review = (
+        missing_actions == ("pr.review",)
+        and "repo.write" in granted_actions
+        and bool(getattr(scope, "principal", None))
+        and getattr(scope, "pull_request_author", None) == scope.principal
+    )
+    diagnostics_bound = False
+    if (in_scope and registered_plugin and owner == "cultivate"
+            and tool_name in _PR_OPERATION_DIAGNOSTICS
+            and getattr(auth_context.ifc_state, "pr_checkout_author_trust", {}).get(scope.scope_id) is True
+            and scope.head_remote == "origin" and scope.head_repo == scope.canonical_repo):
+        hooks = selected_policy_registry().policy_consumer_hooks
+        diagnostics_bound = (
+            hooks is not None and f"refs/heads/{scope.base_ref}" in hooks.protected_refs
+            and (getattr(review_state, "interrupted_operation", None) is not None
+                 or _attested_pr_checkout_lease(auth_context, scope, review_state.checkout_lease))
+        )
     return ToolAuthorization(
         tool_name=tool_name,
         decision=OperationDecision.RESOURCE_SCOPED,
-        allowed=in_scope or not enforce,
+        allowed=bool((in_scope or not enforce) and not recovery_refusal),
         reason=None if in_scope else (
             "repo_pr_grant_denied" if registered_plugin and (
                 scope is None or missing_actions or not grant_valid
@@ -9644,14 +9747,19 @@ def authorize_repo_pr_tool(
         is_shadow_decision=not enforce and not in_scope,
         would_block=not in_scope,
         refusal_detail=(
-            f"scope does not grant {', '.join(missing_actions)}"
-            if report_required_actions and missing_actions
-            else "Call repo_checkout(repository, pull_request) for this repository and PR first."
-            if checkout_first
-            else None
+            recovery_refusal or (
+                (_OWN_PR_REVIEW_REFUSAL if own_pr_review
+                 else f"scope does not grant {', '.join(missing_actions)}")
+                if report_required_actions and missing_actions
+                else "Call repo_checkout(repository, pull_request) for this repository and PR first."
+                if checkout_first
+                else None
+            )
         ),
         flow_direction=flow_direction,
         repo_pr_action_scope=scope,
+        repo_pr_diagnostics_bound=diagnostics_bound,
+        grant_refusal_reason=grant_diagnostics[0] if grant_diagnostics else None,
     )
 
 
@@ -11175,6 +11283,9 @@ def _pr_checkout_lease_attestation(
     if not recorded_head:
         return verdict(False, LeaseAttestationReason.MISSING_RECORDED_HEAD)
     observed_state = _observed_checkout_state(path)
+    recovery_state = getattr(lease, "recovery_checkout_state", None)
+    if callable(recovery_state):
+        observed_state = recovery_state(scope) or observed_state
     if observed_state is None:
         reason = _lease_refusal_reason.get()
         return verdict(False, reason or LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
@@ -11584,6 +11695,9 @@ def protected_result_source(
         if scope is not None or lease is not None:
             lease_attestation = pr_checkout_lease_attestation(auth_context, scope, lease)
             trusted_lease = lease_attestation.ok
+            # Recovery attests the pre-operation branch, never interrupted files.
+            if getattr(getattr(review_state, "checkout_lease", None), "interrupted_operation", None) is not None:
+                trusted_lease = False
             if not trusted_lease:
                 log_pr_checkout_lease_attestation_refused(
                     auth_context, scope if scope is not None else lease,
@@ -12096,7 +12210,16 @@ def _provider_pr_lease_result_is_bound(
         )
     return (
         state is not None and getattr(state, "action_scope", None) is scope
-        and (_forge_pr_result_labels_itself(registered) or _attested_pr_checkout_lease(
+        and (_forge_pr_result_labels_itself(registered) or (
+            registered.owner == "cultivate"
+            and tool_name in {"repo_status", "repo_unmerged"}
+            and getattr(state, "interrupted_operation", None) is not None
+            and _valid_scoped_pr_grant(
+                auth_context, registered.owner, registered.typed_action,
+                selected_policy_registry().scoped_actions.get(registered.owner),
+                scope, state, tool_name=tool_name,
+            )
+        ) or _attested_pr_checkout_lease(
             auth_context, scope, getattr(state, "checkout_lease", None),
         ))
     )
@@ -12336,14 +12459,19 @@ def _bound_repository_checkout_failure(
     tool_name: str, arguments: dict[str, Any],
     authorization: ToolAuthorization, registered: Any, failed: bool,
 ) -> bool:
-    """Bind configured-repo failure diagnostics without requiring a checkout lease.
+    """Bind checkout failures or pre-attested Git-operation diagnostics.
 
     A refused checkout may never acquire a lease. Success still requires the
     ordinary lease binding; the caller must retain any published content labels.
     """
     scope = authorization.repo_pr_action_scope
     return (
-        registered.owner == "cultivate" and tool_name == "repo_checkout"
+        registered.owner == "cultivate"
+        and (tool_name == "repo_checkout" or (
+            tool_name in _PR_OPERATION_DIAGNOSTICS
+            and authorization.tool_name == tool_name
+            and authorization.repo_pr_diagnostics_bound
+        ))
         and registered.resource_scope == "repo_pr"
         and "repo_actions" in registered.memberships
         and authorization.allowed and not authorization.would_block
@@ -12554,6 +12682,20 @@ def classify_protected_result(
             labels = InformationFlowLabels()
             for source in sources:
                 labels = labels.with_source(source)
+            if tool_name in _PR_OPERATION_DIAGNOSTICS and sources:
+                scope = authorization.repo_pr_action_scope
+                if all(
+                    source.integrity == "trusted" and source.domain == "repository"
+                    and source.resource_id == (
+                        f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}"
+                    ) for source in sources
+                ):
+                    # Preserve the existing bounded failure-provenance audit;
+                    # the early diagnostic binding must not skip this status.
+                    _log_retained_repository_failure(
+                        tool_name, result, scope.canonical_repo, scope.pr_number,
+                        scope.observed_head_sha,
+                    )
             return labels if sources else None
         if tool_name == "repo_cleanup":
             if _bound_repository_cleanup_result(

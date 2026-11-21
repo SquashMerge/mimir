@@ -46,6 +46,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.timing import SUBPROCESS_HANG_GUARD_SECONDS
+
 _ROOT = Path(__file__).resolve().parent.parent
 _SKILL_ROOT = _ROOT / "mimir" / "optional-skills"
 _CULTIVATE_SKILLS = _ROOT / "plugins/cultivate/mimir_cultivate/defaults/skills"
@@ -246,7 +248,8 @@ def test_chainlink_binary_selection_from_manifest(
             "poller = runpy.run_path(sys.argv[1]); "
             "print(poller['_chainlink_bin']())"
         ), str(skill / "scripts" / "poller.py")],
-        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+        cwd=tmp_path, env=env, capture_output=True, text=True,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == expected
@@ -298,7 +301,7 @@ def test_import_repair_detects_symlinked_editable_venv(
         env={"PATH": os.environ.get("PATH", "")},
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=SUBPROCESS_HANG_GUARD_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr

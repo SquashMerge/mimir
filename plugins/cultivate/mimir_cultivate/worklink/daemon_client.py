@@ -197,9 +197,127 @@ class OpenCodeDaemonClient:
             raise DaemonClientError("session identity mismatch")
         return True
 
+    async def session_info(self, session_id: str) -> dict[str, Any]:
+        result = _object(await self._request("GET", f"/api/session/{_identifier(session_id, 'ses')}"))
+        data = _object(result.get("data"))
+        if data.get("id") != session_id:
+            raise DaemonClientError("session identity mismatch")
+        return data
+
+    async def session_tree(self, session_id: str) -> list[dict[str, Any]]:
+        """One bounded walker for activity, questions, and cancellation.
+
+        ``children`` includes archived/moved descendants and owns pagination,
+        opaque cursors, adaptive page sizing, and direct parent validation.
+        Keep cross-page/parent identity and whole-tree bounds here.
+        """
+        tree = [await self.session_info(session_id)]
+        seen = {session_id}
+        size = len(json.dumps(tree[0]).encode())
+        for parent in tree:
+            for child in await self.children(parent["id"]):
+                if child["id"] in seen:
+                    raise DaemonClientError("invalid session descendant tree")
+                seen.add(child["id"])
+                tree.append(child)
+                size += len(json.dumps(child).encode())
+                if len(tree) > 4096 or size > 16 * MAX_ITEM_BYTES:
+                    raise DaemonClientError("session tree exceeds bound")
+        return tree
+
+    async def children(self, session_id: str) -> list[dict[str, Any]]:
+        """All direct children, including archived/moved sessions, with bounded pagination."""
+        _identifier(session_id, "ses")
+        children: dict[str, dict[str, Any]] = {}
+        cursors: set[str] = set()
+        cursor = None
+        limit = 100
+        size = 0
+        pages_read = occurrences = bytes_read = 0
+        while True:
+            # Native cursors retain the original query; do not repeat parent/order.
+            params = {"cursor": cursor, "limit": str(limit)} if cursor is not None else {
+                "parentID": session_id, "order": "asc", "limit": str(limit)}
+            try:
+                result = await self._request("GET", "/api/session", params=params)
+            except DaemonClientError as exc:
+                if exc.reason != "item too large" or limit == 1:
+                    raise
+                limit = max(1, limit // 4)
+                continue
+            if (not isinstance(result, dict) or not isinstance(result.get("data"), list)
+                    or any(not isinstance(child, dict) for child in result["data"])):
+                raise DaemonClientError("invalid session page")
+            # Deduplication bounds retained state, not pagination work. Charge
+            # every page (even empty ones), occurrence, and full response body.
+            pages_read += 1
+            occurrences += len(result["data"])
+            bytes_read += len(json.dumps(result).encode())
+            if (pages_read > 2 * 4096 or occurrences > 2 * 4096
+                    or bytes_read > 16 * MAX_ITEM_BYTES):
+                raise DaemonClientError("session children exceed bound")
+            for child in result["data"]:
+                try:
+                    _identifier(child.get("id"), "ses")
+                except ValueError:
+                    raise DaemonClientError("invalid child session identity") from None
+                if child.get("parentID") != session_id:
+                    raise DaemonClientError("foreign child session")
+                # Active sessions can move past a mutable cursor anchor and be
+                # returned again. Validate every occurrence, then keep the latest.
+                previous = children.get(child["id"])
+                if previous is not None:
+                    size -= len(json.dumps(previous).encode())
+                children[child["id"]] = child
+                size += len(json.dumps(child).encode())
+                if len(children) > 4096 or size > 16 * MAX_ITEM_BYTES:
+                    raise DaemonClientError("session children exceed bound")
+            page = result.get("cursor")
+            if (not isinstance(page, dict) or set(page) != {"previous", "next"} or any(
+                    v is not None and (not isinstance(v, str) or len(v.encode()) > 4096)
+                    for v in page.values())):
+                raise DaemonClientError("invalid session page")
+            cursor = page["next"]
+            if cursor is None:
+                return list(children.values())
+            if cursor in cursors:
+                raise DaemonClientError("repeated session cursor")
+            cursors.add(cursor)
+
+    async def pending_forms(self, session_id: str) -> list[dict[str, Any]]:
+        result = _object(await self._request("GET", self._path(session_id, "form")))
+        self._list(result)
+        for form in result["data"]:
+            if form.get("sessionID") != session_id:
+                raise DaemonClientError("foreign session form")
+        return result["data"]
+
     async def set_environment(self, session_id: str, variables: Mapping[str, str]) -> None:
         await self._request("PUT", self._path(session_id, "environment"),
                             payload={"variables": dict(variables)}, status=204)
+
+    async def forms(self, session_id: str) -> list[dict[str, Any]]:
+        """Pending Form.Info entries only. Worklink deliberately has no reply API."""
+        result = _object(await self._request("GET", self._path(session_id, "form")))
+        self._list(result)
+        seen = set()
+        for form in result["data"]:
+            try:
+                _identifier(form.get("id"), "frm")
+            except ValueError:
+                raise DaemonClientError("invalid form identity") from None
+            if (form.get("sessionID") != session_id or form["id"] in seen
+                    or not isinstance(form.get("title"), str)
+                    or not isinstance(form.get("metadata", {}), dict)
+                    or not isinstance(form.get("fields"), list) or not form["fields"]):
+                raise DaemonClientError("invalid session form")
+            for field in form["fields"]:
+                if (not isinstance(field, dict) or not isinstance(field.get("key"), str)
+                        or field.get("type") not in {"string", "number", "integer", "boolean", "multiselect", "external"}
+                        or any(not isinstance(field[key], str) for key in ("title", "description") if key in field)):
+                    raise DaemonClientError("invalid form field")
+            seen.add(form["id"])
+        return result["data"]
 
     async def prompt(self, session_id: str, text: str, *, resume: bool = True) -> dict[str, Any]:
         result = _object(await self._request("POST", self._path(session_id, "prompt"),

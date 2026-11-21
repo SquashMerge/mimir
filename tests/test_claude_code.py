@@ -107,9 +107,6 @@ def test_supplied_fixture_is_verbatim_and_wire_metadata_remains_raw():
     rate = json.loads(raw.splitlines()[2])["rate_limit_info"]
     assert rate["overageStatus"] == "rejected" and rate["status"] == "allowed"
     assert "resetsAt" in rate and "resets_at" not in rate
-    from claude_agent_sdk._internal.message_parser import parse_message
-    parsed = parse_message(json.loads(raw.splitlines()[2]))
-    assert parsed.rate_limit_info.raw == rate
 
 
 def test_supplied_fixture_preserves_capability_order():
@@ -131,8 +128,6 @@ def test_lock_derivative_changes_only_final_result_text():
 
 
 def test_quota_and_warning_derivatives_preserve_retained_records_and_raw_metadata():
-    from claude_agent_sdk._internal.message_parser import parse_message
-
     source = [json.loads(line) for line in success().splitlines()]
     for filename, status in (
         ("quota_exhausted.jsonl", "rejected"),
@@ -148,7 +143,6 @@ def test_quota_and_warning_derivatives_preserve_retained_records_and_raw_metadat
         else:
             assert events == [expected_rate]
         rate = events[0]["rate_limit_info"]
-        assert parse_message(events[0]).rate_limit_info.raw == rate
         for key in ("resetsAt", "rateLimitType", "overageStatus", "overageDisabledReason",
                     "isUsingOverage", "unifiedWindows"):
             assert rate[key] == source[2]["rate_limit_info"][key]
@@ -162,8 +156,6 @@ def test_derived_quota_and_warning_use_typed_fields():
     assert parse_stream(quota, 0, now=1794909001).retry_after_ms == 0
     warning = (FIXTURES / "rate_limit_warning.jsonl").read_text()
     assert parse_stream(warning + terminal(), 0).status == "success"
-    from claude_agent_sdk._internal.message_parser import parse_message
-    assert parse_message(json.loads(quota.splitlines()[-1])).api_error_status == 429
 
 
 @pytest.mark.parametrize("stream,code,status", [

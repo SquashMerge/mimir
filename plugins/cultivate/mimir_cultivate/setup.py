@@ -794,8 +794,26 @@ def _heavy_lock_dir(args: argparse.Namespace, previous: dict) -> str | None:
     return value
 
 
+def _heavy_lock_timeout(args: argparse.Namespace, previous: dict, heavy_lock_dir: str | None) -> str | None:
+    from .contained_execution import validate_heavy_lock_timeout
+
+    value = getattr(args, "heavy_lock_timeout", None)
+    if value is None:
+        if heavy_lock_dir is None:
+            return None
+        value = previous.get("heavy_lock_timeout")
+        if value is None:
+            value = "14400"
+    try:
+        timeout = validate_heavy_lock_timeout(value)
+    except ValueError as exc:
+        raise SetupError(f"--heavy-lock-timeout (or heavy_lock_timeout in manifest.json): {exc}") from None
+    return timeout if heavy_lock_dir is not None else None
+
+
 def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, codex: bool = False,
-                   heavy_lock_dir: str | None = None, worklink_host: str = "opencode") -> str:
+                   heavy_lock_dir: str | None = None, heavy_lock_timeout: str | None = "14400",
+                   worklink_host: str = "opencode") -> str:
     """Modify the scaffold structurally; fail closed on incompatible shapes."""
     if worklink_host not in {"opencode", "claude_code"}:
         raise SetupError("Worklink host must be opencode or claude_code.")
@@ -837,6 +855,9 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
             # Agent only: init never chowns or chmods a directory other agents share.
             agent_volumes.append(f"{heavy_lock_dir}:{HEAVY_LOCK_MOUNT}")
             environment["MIMIR_HEAVY_LOCK_FILE"] = f"{HEAVY_LOCK_MOUNT}/heavy.lock"
+            from .contained_execution import validate_heavy_lock_timeout
+
+            environment["MIMIR_HEAVY_LOCK_TIMEOUT"] = validate_heavy_lock_timeout(heavy_lock_timeout)
         agent["volumes"] = agent_volumes
         agent.setdefault("depends_on", {})["init"] = {"condition": "service_completed_successfully"}
         doc["services"]["init"] = {
@@ -1696,7 +1717,10 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     setup.add_argument("--heavy-lock-dir",
                        help="Absolute host directory shared with other agents for heavy-run leases "
                             "(scripts/heavy_run.sh); mounted at " + HEAVY_LOCK_MOUNT + " with MIMIR_HEAVY_LOCK_FILE set. "
-                            "none clears; omit to preserve the saved directory.")
+                            "none clears the directory and timeout; omit to preserve the saved directory.")
+    setup.add_argument("--heavy-lock-timeout", metavar="seconds",
+                       help="Heavy-run timeout covering queueing plus running: ASCII digits, 60..86400 "
+                            "(default: 14400); omit to preserve the saved timeout. Only written with a shared directory.")
     setup.add_argument("--mimir-version", help="Exact common PyPI release of mimir-agent and mimir-cultivate; omit to preserve the saved version (fresh setup: latest common stable, then prerelease).")
     setup.add_argument("--platform", choices=tuple(_DOCKER_ARCHITECTURES),
                        help="Docker target platform (linux/amd64 or linux/arm64; default: host architecture, or saved platform on rerun).")
@@ -1820,6 +1844,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         if gate != "ci":
             raise SetupError("--quick-gate-command is only valid with --worklink-gate ci.")
     heavy_lock_dir = _heavy_lock_dir(args, previous)
+    heavy_lock_timeout = _heavy_lock_timeout(args, previous, heavy_lock_dir)
     spec = preflight_spec or _field(args, "model_spec", "Model spec: choose claude-code:model or codex-plus:model for a subscription, "
                                    "or API-backed openai:model or anthropic:model; used for agent turns.")
     _check_route(previous, spec)
@@ -1971,7 +1996,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     provenance = ("# MIMIR_INSTALL_MODE=pypi MIMIR_VERSION=" + mimir_version + " MIMIR_AGENT_SHA256="
                   + release.agent.sha256 + " MIMIR_CULTIVATE_SHA256=" + release.cultivate.sha256 + "\n")
     compose = provenance + render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex,
-                                          heavy_lock_dir=heavy_lock_dir, worklink_host=host)
+                                          heavy_lock_dir=heavy_lock_dir, heavy_lock_timeout=heavy_lock_timeout,
+                                          worklink_host=host)
     generated = {"compose.yml": compose, ".gitignore": "*\n", "build_context.py": context_helper,
                  "provision.py": provision, "compose.provision.yml": provenance + _PROVISION_COMPOSE}
     _check_generated(deploy, generated, previous, force=bool(getattr(args, "force", False)))
@@ -2033,6 +2059,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
                    "previous_saga_model_spec": previous.get("saga_model_spec"),
                    "system_packages": system_packages, "heavy_lock_dir": heavy_lock_dir,
+                   "heavy_lock_timeout": heavy_lock_timeout,
                    "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id,
                     "mimir_install_mode": "pypi", "mimir_version": mimir_version, "wheels": wheels,
                     "toolchain_version": version, "layer_tag": layer_tag, "docker_platform": docker_platform,

@@ -317,9 +317,10 @@ authorization and IFC.
 - provenance metadata.
 
 Unproven and migrated data defaults to owner/visibility `legacy_admin`.
-Derived ACLs use `intersect_acl()`: mixed owners/domains, missing provenance,
-unknown visibility, or any legacy ambiguity collapses to the fail-closed
-`legacy_admin` ACL.
+Derived ACLs use `intersect_acl()`: mixed owners/domains, empty, missing, or
+non-mapping provenance (including JSON `null`, lists, strings, numbers, and
+booleans), unknown visibility, or any legacy ambiguity collapses to the
+fail-closed `legacy_admin` ACL regardless of source order.
 
 `get_authorization_scope()` accepts only an actual `AuthContext`; a caller-made
 `AuthorizationScope` is a query value, not authority. `authorization_predicate()`
@@ -489,7 +490,11 @@ channel/operator cells (oldest idle cell evicted first). ACP cells also end with
 the session. Reaching the source cap fails closed and needs a new session or
 idle expiry. Labels remain append-only within the turn and still restrict
 sensitivity and audiences. The previously vetoed call is not replayed; retry it
-explicitly. New untrusted sources re-taint. ACP also advances the
+explicitly. New untrusted sources re-taint, including a change to any owner
+attestation field (canonical principal, raw author or source channel). Identical
+provenance reinjection stays covered; a fresh read still re-taints. Acknowledgement
+hashes use a versioned identity: older or unknown formats do not match and require
+fresh review, with no legacy-hash fallback. ACP also advances the
 proxy ingest boundary, invalidating existing `allow_session` Hands grants;
 the next Hands call still needs a fresh human response. This is separate from
 egress `approve_declassification` and does not itself grant execution permission.

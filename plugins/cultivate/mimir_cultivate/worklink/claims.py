@@ -25,11 +25,16 @@ from typing import Any, Callable, Iterable, Sequence
 from .checkout import _default_runner
 from .control import operator_stop_requested
 from .dispatch_failures import _find_latest_evidence_file_for_issue, record_leaf_transition_best_effort
-from .factory_state import FactoryRecordError, FactoryRunRecord, _require_safe_directory, load_factory_record
+from .factory_state import (
+    FactoryRecordError, FactoryRunRecord, _require_safe_directory,
+    factory_issue_resource_lock, load_factory_record, load_factory_records_for_issue,
+)
+from .run_state import run_state_path
 from mimir._atomic import atomic_write_json
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 WORKLINK_EPIC_LABEL = "worklink:epic"
+WORKLINK_LOCK_CLAIMANT = "mimir-worklink"
 
 # Standalone callers without a Worklink config get the same finite safety
 # budget as a missing or malformed defaults.max_claim_attempts setting.
@@ -98,6 +103,10 @@ class AttemptBudget:
 
 class _ChainlinkContentionExhausted(RuntimeError):
     pass
+
+
+class _OrphanLockProtected(RuntimeError):
+    """A reconciliation candidate is no longer safe to release."""
 
 
 def scope_active_worklink_lock_ids(
@@ -434,6 +443,16 @@ def _claim_is_newer(candidate: ClaimRecord, current: ClaimRecord) -> bool:
     return cand_anchor > cur_anchor
 
 
+def _lock_table_entries(data: Any) -> Iterable[tuple[str | None, Any]]:
+    """Accept shared lock table shapes; only mapping keys can identify issues."""
+    locks = data.get("locks") if isinstance(data, dict) else data
+    if isinstance(locks, dict):
+        return locks.items()
+    if isinstance(locks, list):
+        return ((None, value) for value in locks)
+    raise ValueError("invalid lock table shape")
+
+
 def _lock_issue_id(lock: dict[str, Any]) -> int | None:
     for key in ("issue_id", "id", "issue"):
         raw = lock.get(key)
@@ -675,16 +694,20 @@ class ChainlinkClaims:
         home_path: Path | None,
         before_claim: Callable[[], None] | None = None,
         after_claim: Callable[[subprocess.CompletedProcess[str]], ClaimResult] | None = None,
+        before_attempt: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str] | ClaimResult:
         """Run with bounded contention; claim finalization may stay under the mutex.
 
         Local mutex waits and external Git contention share one bounded budget.
-        The callbacks run once around the successful claim command.
+        Claim callbacks run once; before_attempt revalidates reconciliation on
+        every retry, including after releasing the mutex during backoff.
         """
         issue_id = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
         if _CLAIM_CRITICAL_SECTION.get():
             result: subprocess.CompletedProcess[str] | None = None
             for attempt in range(1, self.contention_max_attempts + 1):
+                if before_attempt is not None:
+                    before_attempt()
                 result = self.runner([self.chainlink_bin, *args])
                 if not _is_git_contention(result):
                     if attempt > 1 and result.returncode == 0:
@@ -722,6 +745,8 @@ class ChainlinkClaims:
                 if not prepared and before_claim is not None:
                     before_claim()
                 prepared = True
+                if before_attempt is not None:
+                    before_attempt()
                 result = self.runner([self.chainlink_bin, *args])
                 if not _is_git_contention(result):
                     if attempt > 1 and result.returncode == 0:
@@ -738,6 +763,8 @@ class ChainlinkClaims:
                             if not prepared and before_claim is not None:
                                 before_claim()
                             prepared = True
+                            if before_attempt is not None:
+                                before_attempt()
                             result = self.runner([self.chainlink_bin, *args])
                             if not _is_git_contention(result):
                                 if attempt > 1 and result.returncode == 0:
@@ -828,9 +855,94 @@ class ChainlinkClaims:
         return ReviewReadyEvidence(path=path, payload=payload)
 
     def release_issue(self, issue_id: int) -> bool:
-        """Attempt to release ``issue_id`` and report whether Chainlink confirmed it."""
+        """Release with the shared bounded contention backoff, never force/steal.
+
+        A non-contention refusal is left for a later orphan-lock reconciliation.
+        Do not stack another retry budget around ``_run`` here.
+        """
         result = self._run("locks", "release", str(issue_id), check=False)
         return result.returncode == 0
+
+    def _reconciliation_locks(self, result: subprocess.CompletedProcess[str]) -> dict[int, dict[str, Any]]:
+        if result.returncode != 0:
+            raise RuntimeError("reconciliation lock table unavailable")
+        data = json.loads(result.stdout)
+        try:
+            entries = _lock_table_entries(data)
+        except ValueError as exc:
+            raise ValueError("reconciliation lock table has an invalid shape") from exc
+        records: dict[int, dict[str, Any]] = {}
+        for key, value in entries:
+            if not isinstance(value, dict):
+                raise ValueError("reconciliation lock omitted claimant")
+            issue_id = _lock_issue_id(value)
+            if issue_id is None and key is not None:
+                issue_id = int(key)
+            if issue_id is None or issue_id < 1 or issue_id in records:
+                raise ValueError("reconciliation lock has an invalid issue identity")
+            records[issue_id] = value
+        return records
+
+    def reconcile_orphan_locks(self, *, should_stop: Callable[[], bool] = lambda: False) -> list[int]:
+        """Release only our locks with no retained state or live controller.
+
+        Hold the same per-issue lease as controllers through revalidation and
+        release, then re-read ownership under the claim mutex. Presence of even
+        malformed run state is a fence. Factory records are checked for leaves
+        too, so label drift cannot authorize release of an unfinished epic.
+        No TTL, label mutation or forceful lock stealing is involved.
+        """
+        if self.home_path is None:
+            return []
+        home = self.home_path
+        released: list[int] = []
+        try:
+            candidates = self._reconciliation_locks(self._run("locks", "list", "--json"))
+        except (OSError, RuntimeError, ValueError):
+            return released
+        for issue_id, lock in candidates.items():
+            if should_stop():
+                break
+            if lock.get("agent_id") != WORKLINK_LOCK_CLAIMANT:
+                continue
+            try:
+                with factory_issue_resource_lock(home, issue_id) as acquired:
+                    if not acquired:
+                        continue
+
+                    def verify() -> None:
+                        # Revalidate under the mutex before EVERY release attempt.
+                        current = self._reconciliation_locks(self.runner([
+                            self.chainlink_bin, "locks", "list", "--json",
+                        ])).get(issue_id, {})
+                        if current.get("agent_id") != WORKLINK_LOCK_CLAIMANT:
+                            raise _OrphanLockProtected("claimant_changed")
+                        _require_safe_directory(run_state_path(home, issue_id).parent, create=False)
+                        try:
+                            run_state_path(home, issue_id).lstat()
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise _OrphanLockProtected("run_state_retained")
+                        records = load_factory_records_for_issue(home, issue_id)
+                        if any(r.status is None or not r.status.valid or not r.status.is_terminal for r in records):
+                            raise _OrphanLockProtected("factory_not_terminal")
+
+                    result = self._run_with_retry(
+                        "locks", "release", str(issue_id), home_path=home, before_attempt=verify,
+                    )
+                    if result.returncode != 0:
+                        continue
+                    released.append(issue_id)
+                    reason = "no_run_state_or_live_controller_factory_absent_or_terminal"
+                    log.info("Worklink orphan lock released: issue_id=%s claimant=%s reason=%s",
+                             issue_id, WORKLINK_LOCK_CLAIMANT, reason)
+                    if self.event_logger is not None:
+                        self.event_logger("worklink_lock_reconciled", issue_id=issue_id,
+                                          claimant=WORKLINK_LOCK_CLAIMANT, reason=reason)
+            except (OSError, RuntimeError, ValueError) as exc:
+                log.debug("Worklink orphan lock reconciliation skipped: issue_id=%s reason=%s", issue_id, exc)
+        return released
 
     def release_owned_claims_for_shutdown(
         self,
@@ -1445,15 +1557,13 @@ class ChainlinkClaims:
             data = json.loads(result.stdout or "{}")
         except json.JSONDecodeError as exc:
             raise RuntimeError("chainlink locks list --json returned invalid JSON") from exc
-        locks = data.get("locks", data if isinstance(data, list) else {})
+        try:
+            entries = _lock_table_entries(data)
+        except ValueError as exc:
+            raise RuntimeError("chainlink locks list --json returned unexpected shape") from exc
         ids: set[int] = set()
-        if isinstance(locks, dict):
-            iterable = locks.items()
-        elif isinstance(locks, list):
-            iterable = enumerate(locks)
-        else:
-            raise RuntimeError("chainlink locks list --json returned unexpected shape")
-        for index, (key, value) in enumerate(iterable):
+        anonymous = 0
+        for key, value in entries:
             raw = _lock_issue_id(value) if isinstance(value, dict) else None
             if raw is None:
                 try:
@@ -1461,8 +1571,13 @@ class ChainlinkClaims:
                 except (TypeError, ValueError):
                     if require_identity:
                         raise RuntimeError("chainlink locks list --json omitted issue identity")
-                    raw = -(index + 1)
+                    anonymous += 1
+                    continue
             ids.add(raw)
+        # Allocate only after reading every identity, below all parsed IDs (even
+        # negative ones), so anonymous reservations never disappear in the set.
+        floor = min(0, min(ids, default=0))
+        ids.update(range(floor - anonymous, floor))
         return ids
 
     def _issue_comments(self, issue_id: int, *, strict: bool = False) -> list[str]:
