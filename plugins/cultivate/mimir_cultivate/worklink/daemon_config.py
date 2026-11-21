@@ -280,7 +280,7 @@ def daemon_configuration(
             "disabledTraces": [] if capture else ["session", "llm", "tool"],
             "capturePromptInLogs": capture, "captureModelContext": capture,
         }
-    factory: dict[str, object] = {"package": "opencode2-feature-factory@0.14.1"}
+    factory: dict[str, object] = {"package": "opencode2-feature-factory@0.14.2"}
     config: dict[str, object] = {"plugins": [
         factory, {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": options},
     ]}

@@ -830,7 +830,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
-    assert FACTORY_VERSION == "0.14.1"
+    assert FACTORY_VERSION == "0.14.2"
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
 
@@ -840,7 +840,7 @@ def test_admit_rejects_nonexistent_entrypoint(tmp_path: Path) -> None:
         FeatureFactoryBackend(entrypoint=str(tmp_path / "factory.js")).admit()
 
 
-@pytest.mark.parametrize("dependency", [None, "^0.14.1", "0.12.1", "*", {"version": "0.14.1"}])
+@pytest.mark.parametrize("dependency", [None, "^0.14.2", "0.14.1", "*", {"version": "0.14.2"}])
 def test_resolver_requires_exact_adapter_dependency(tmp_path, dependency):
     entrypoint = package_entrypoint(tmp_path)
     manifest = entrypoint.parents[2] / "opencode2-feature-factory/package.json"
@@ -870,17 +870,18 @@ def test_resolver_refuses_managed_v1_but_ignores_optional_claude(tmp_path):
         ("opencode2-feature-factory", "opencode2-feature-factory"),
     ],
 )
+@pytest.mark.parametrize("installed_version", ["0.10.11", "0.14.1", "^0.14.2"])
 def test_admit_rejects_either_package_version_mismatch(
     tmp_path: Path,
     package: str,
     expected_name: str,
+    installed_version: str,
 ) -> None:
     entrypoint = package_entrypoint(tmp_path)
     manifest = entrypoint.parents[2] / package / "package.json"
-    manifest.write_text(
-        json.dumps({"name": expected_name, "version": "0.10.11"}),
-        encoding="utf-8",
-    )
+    data = json.loads(manifest.read_text())
+    data["version"] = installed_version
+    manifest.write_text(json.dumps(data), encoding="utf-8")
     calls: list[tuple[str, ...]] = []
 
     def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
