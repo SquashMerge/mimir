@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import shutil
 import stat
 import subprocess
@@ -91,3 +92,64 @@ def test_mirrored_git_executes_after_dropping_uid() -> None:
             )
             assert result.stdout.startswith("git version ")
             assert shutil.which("gh", path=sanitized) is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory permissions")
+def test_unreadable_path_entry_does_not_break_fixture_or_tools() -> None:
+    # Run the actual context manager unprivileged even when the suite is root.
+    # Embedding its source avoids giving that uid access to private pytest data.
+    options = {}
+    if os.geteuid() == 0:
+        import pwd
+
+        worker = pwd.getpwnam("nobody")
+        options = {"user": worker.pw_uid, "group": worker.pw_gid, "extra_groups": []}
+    with tempfile.TemporaryDirectory(prefix="mimir-unreadable-path-", dir="/tmp") as temporary:
+        root = Path(temporary)
+        root.chmod(0o755)
+        unreadable = root / "private"
+        unreadable.mkdir()
+        (unreadable / "factory.js").write_text("private")
+        unreadable.chmod(0)
+        try:
+            script = (
+                "import os, tempfile, subprocess\n"
+                "from pathlib import Path\n"
+                "from contextlib import contextmanager\n"
+                f"_HOST_CODING_CLIS = {_HOST_CODING_CLIS!r}\n"
+                + inspect.getsource(_coding_cli_path)
+                + f"\noriginal = {str(unreadable)!r} + os.pathsep + '/usr/bin:/bin'\n"
+                "assert not os.access(original.split(os.pathsep)[0], os.R_OK)\n"
+                "with _coding_cli_path(original) as sanitized:\n"
+                " assert sanitized.split(os.pathsep)[0] == original.split(os.pathsep)[0]\n"
+                " result = subprocess.run(['sh', '-c', 'echo test-ran'], env={'PATH': sanitized}, "
+                "capture_output=True, text=True, check=True)\n"
+                " assert result.stdout.strip() == 'test-ran'\n"
+            )
+            result = subprocess.run(
+                ["/usr/bin/python3", "-c", script], cwd="/",
+                capture_output=True, text=True, **options,
+            )
+            assert result.returncode == 0, result.stderr
+        finally:
+            unreadable.chmod(0o700)
+
+
+@pytest.mark.parametrize("operation", ["is_file", "access", "iterdir"])
+@pytest.mark.parametrize("error", [PermissionError, OSError])
+def test_uninspectable_path_entry_is_preserved(tmp_path, monkeypatch, operation, error):
+    source = tmp_path / "bin"
+    source.mkdir()
+    cli = source / "gh"
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+
+    def fail(*args, **kwargs):
+        raise error("uninspectable PATH")
+
+    if operation == "access":
+        monkeypatch.setattr(os, operation, fail)
+    else:
+        monkeypatch.setattr(Path, operation, fail)
+    with _coding_cli_path(str(source)) as sanitized:
+        assert sanitized == str(source)

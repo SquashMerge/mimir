@@ -1020,6 +1020,16 @@ gate output, evidence, artifacts, and their retention locations stay where they
 were. With the variable unset, existing scratch paths and environment behavior
 are unchanged.
 
+Factory completion tests use the same closed worker environment as leaf gates,
+including `PATH=/usr/local/bin:/usr/bin:/bin`, never the controller's PATH.
+If at least 95% of tests error and at least 95% of the observed error phases are
+setup, evidence records an environment failure with the first setup error.
+Oversized JUnit reports remain diagnostic-only (`report_error: junit_oversize`):
+bounded header/error data may still identify the environment failure, but cannot
+supersede the command's verdict. Retention saves a prefix limited to 20 MB or the
+remaining artifact budget (reserving manifest space), whichever is smaller, with `junit_truncated` in the
+manifest and `retention_truncated: true`; oversize is not a retention write error.
+
 #### Checkout and tools
 
 - Provision a dedicated clone for `WORKLINK_REPO`; do not use the checkout from

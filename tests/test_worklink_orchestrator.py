@@ -11661,7 +11661,7 @@ def test_factory_completion_with_real_evidence_and_wrapped_runner(
     completion_runner = _completion_runner(sandbox, case="success")
     gate_calls = []
 
-    def worker_gate(checkout, argv, *, env, timeout=30, output_limit=1024 * 1024, allow_output_truncation=False):
+    def worker_gate(checkout, argv, *, env, timeout=30, output_limit=1024 * 1024, allow_output_truncation=False, identifier=None):
         if argv[:1] == ["git"]:
             assert checkout == sandbox.parents[1]
             result = controller(argv)

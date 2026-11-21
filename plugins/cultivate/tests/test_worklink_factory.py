@@ -45,6 +45,8 @@ def _executor_in_process(
     monkeypatch.setattr(worker_exec, "get_identities", lambda: identities)
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
+    from mimir_cultivate import contained_execution
+    monkeypatch.setattr(contained_execution, "_RUNTIME_HOME_ROOT", homes)
     monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
 
     # The test has no root-owned socket or uid-changing privileges. Keep the
@@ -111,6 +113,38 @@ def test_provider_renders_default_work_order_without_override(tmp_path: Path) ->
     assert "Implement the factory" in rendered
     assert "uv run pytest -q" in rendered
     _assert_publication_rule(rendered)
+
+
+@pytest.mark.asyncio
+async def test_factory_completion_gate_spawns_with_leaf_worker_environment(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink.compute import _enabled_child_env
+
+    monkeypatch.setenv("PATH", "/home/mimir/.cargo/bin:/home/mimir/bin:/usr/bin")
+    monkeypatch.setenv("GITHUB_TOKEN", "controller-token")
+    command = "printf '%s' \"$PATH\""
+    spec = WorkSpec(2183, 1, "", "main", "branch", "", None, command,
+                    "feature_factory", 30, local_checkout=tmp_path)
+    report_dir = tmp_path / "reports"
+    captured = {}
+
+    def spawn(checkout, argv, *, env, **kwargs):
+        captured.update(env)
+        assert Path(env["XDG_CACHE_HOME"]).parent.name == kwargs["identifier"]
+        return subprocess.run(argv, env=env, capture_output=True)
+
+    monkeypatch.setattr(worker_client, "run_factory_control", spawn)
+    result = await evidence._run_compute_gate(
+        command, checkout=tmp_path, work_spec=spec,
+        compute=LocalSubprocessComputeBackend(), report_dir=report_dir,
+    )
+    leaf = replace(spec, backend_config={"pass_env": ()})
+    expected = _enabled_child_env(leaf, "leaf")
+    assert result.exit_code == 0
+    assert result.stdout == expected["PATH"] == captured["PATH"]
+    assert "/home/mimir" not in captured["PATH"]
+    assert "GITHUB_TOKEN" not in captured
+    for name in ("USER", "LOGNAME", "SHELL", "LANG", "LC_ALL"):
+        assert captured[name] == expected[name]
 
 
 def _assert_publication_rule(order: str) -> None:
@@ -454,6 +488,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         return replace(current, status="running")
     monkeypatch.setattr(FeatureFactoryBackend, "initialize", initialize)
     sandbox = checkout / ".factory-sandboxes" / "chainlink-1949"
+    monkeypatch.setenv("PATH", "/home/mimir/.cargo/bin:" + os.environ["PATH"])
     with _executor_in_process(tmp_path, monkeypatch, root, short_socket_dir) as requests:
         result = await orchestrator.WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(1949)
         record = load_factory_record(tmp_path, "chainlink-1949")
@@ -548,6 +583,14 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         assert any(request["argv"] == [
             "/bin/sh", "-c", f"cd {result.checkout} && {gate_command}",
         ] for request in requests)
+        from mimir_cultivate.contained_execution import base_worker_environment
+
+        gate_requests = [request for request in requests if request["argv"] == [
+            "/bin/sh", "-c", f"cd {result.checkout} && {gate_command}",
+        ]]
+        for request in gate_requests:
+            assert request["env"]["PATH"] == base_worker_environment("gate")["PATH"]
+            assert "/home/mimir" not in request["env"]["PATH"]
     evidence_path = result.evidence_path or next((tmp_path / "state" / "worklink" / "evidence").rglob("*.json"))
     payload = json.loads(evidence_path.read_text())
     assert payload["checkout"] == str(result.checkout)

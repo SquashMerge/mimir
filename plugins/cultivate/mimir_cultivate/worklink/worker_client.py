@@ -91,6 +91,7 @@ def run_factory_control(
     timeout: float = 30, output_limit: int = 1024 * 1024,
     initialize: bool = False,
     allow_output_truncation: bool = False,
+    identifier: str | None = None,
 ) -> FactoryControlResult:
     """Run retained-tree operations as its owner, without refreshing runtime auth.
 
@@ -133,7 +134,7 @@ def run_factory_control(
             process = await client.launch(
                 local_checkout=root, argv=argv,
                 env=filter_otlp_env({key: value for key, value in env.items() if key != "HOME"}),
-                identifier=str(uuid.uuid4()), timeout_s=timeout,
+                identifier=identifier or str(uuid.uuid4()), timeout_s=timeout,
                 stdout_sink=stdout, stderr_sink=stderr,
             )
             code = await process.wait()
