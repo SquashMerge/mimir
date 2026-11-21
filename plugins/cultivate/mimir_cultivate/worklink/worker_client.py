@@ -32,7 +32,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v22-claude-retained-recovery"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v23-leaf-retirement"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
@@ -240,6 +240,8 @@ class WorkerProcess:
     process_start_ticks: int | None = None
     children_reaped: bool = False
     _requires_children_reaped: bool = False
+    executor_instance_id: str | None = None
+    executor_process_epoch: str | None = None
 
     async def wait(self) -> int:
         if self.returncode is None:
@@ -798,8 +800,18 @@ class WorkerClient:
             ticks = response.get("process_start_ticks")
             if ticks is not None and (type(ticks) is not int or ticks < 0):
                 raise RuntimeError("worker executor returned an invalid process identity")
+            instance = response.get("executor_instance_id")
+            if instance is not None:
+                _validate_identifier(instance)
+            epoch = response.get("executor_process_epoch")
+            from .run_state import valid_process_epoch
+
+            if epoch is not None and (instance is None or not valid_process_epoch(epoch)):
+                raise RuntimeError("worker executor returned an invalid process epoch")
             return WorkerProcess(
                 identifier, int(response["pid"]), sock, process_start_ticks=ticks,
+                executor_instance_id=instance,
+                executor_process_epoch=epoch,
                 _requires_children_reaped=(
                     retirement == "contained_process_tree"
                     or home_projection_profile != "none"
@@ -840,6 +852,29 @@ class WorkerClient:
                 raise RuntimeError("worker executor response identity mismatch")
             if response.get("status") != "cancelled":
                 raise RuntimeError("worker executor returned an invalid cancel response")
+        finally:
+            sock.close()
+
+    async def verify_leaf_retired(
+        self, identifier: str, executor_instance_id: str, shim_pid: int, process_start_ticks: int,
+        executor_process_epoch: str | None = None,
+    ) -> None:
+        """Read-only proof; never signal or trust an unknown worker by itself."""
+        _validate_identifier(identifier)
+        _validate_identifier(executor_instance_id)
+        request = {
+            "version": 1, "op": "verify_leaf_retired", "id": identifier,
+            "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            "executor_instance_id": executor_instance_id,
+            "executor_process_epoch": executor_process_epoch,
+            "shim_pid": shim_pid, "process_start_ticks": process_start_ticks,
+        }
+        sock = await asyncio.to_thread(self._connect, CANCEL_SOCKET_TIMEOUT_S)
+        try:
+            sock.send(json.dumps(request, separators=(",", ":")).encode())
+            response = json.loads(await asyncio.to_thread(sock.recv, 4096))
+            if response != {"id": identifier, "status": "retired"}:
+                raise RuntimeError("contained leaf retirement is unverified")
         finally:
             sock.close()
 

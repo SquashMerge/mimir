@@ -1018,6 +1018,8 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
     checkout.mkdir(parents=True)
     requests: list[dict[str, object]] = []
     fd_counts: list[int] = []
+    instance_id = str(uuid.uuid4())
+    process_epoch = f"{uuid.uuid4()}:42"
 
     class Peer:
         def connect(self, _path: str) -> None:
@@ -1037,6 +1039,8 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
                 "status": "started",
                 "pid": 123,
                 "process_start_ticks": 456,
+                "executor_instance_id": instance_id,
+                "executor_process_epoch": process_epoch,
             }).encode()
 
         def close(self) -> None:
@@ -1063,6 +1067,8 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
 
     request = requests[0]
     assert process.process_start_ticks == 456
+    assert process.executor_instance_id == instance_id
+    assert process.executor_process_epoch == process_epoch
     assert request["op"] == ("launch_factory" if factory else "launch_path")
     assert request["path"] == str(checkout)
     assert request["run_uid"] == (synthetic_worklink_identities.worklink_uid if factory else 1002)

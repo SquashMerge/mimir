@@ -13,6 +13,7 @@ from mimir.event_logger import log_durable_event_sync
 from .worklink.control import (
     Runner,
     archive_worklink_factory_records,
+    clear_worklink_leaf_state,
     stop_worklink,
     worklink_status,
 )
@@ -46,6 +47,13 @@ def add_argparse(
     stop_p = worklink_sub.add_parser("stop", help="Safely stop one live leaf Worklink run.")
     stop_p.add_argument("issue_id", type=int, help="Chainlink issue id to stop.")
     stop_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
+    leaf_p = worklink_sub.add_parser(
+        "clear-leaf-state", help="Clear retained leaf state only after verified worker retirement."
+    )
+    leaf_p.add_argument("issue_id", type=int)
+    leaf_p.add_argument("--worker-id", required=True, help="Exact recorded worker UUID.")
+    leaf_p.add_argument("--home", type=Path, default=None, help="Agent home.")
 
     archive_p = worklink_sub.add_parser(
         "archive-factory-run", help="Archive retained factory state for one epic."
@@ -179,6 +187,9 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     if args.worklink_action == "stop":
         return _stop(args)
+
+    if args.worklink_action == "clear-leaf-state":
+        return _clear_leaf_state(args)
 
     if args.worklink_action == "archive-factory-run":
         return _archive_factory_run(args)
@@ -528,6 +539,21 @@ def _archive_factory_run(args: argparse.Namespace) -> int:
         print(f"worklink:epic #{args.issue_id}: no retained factory record")
         return 1
     print(f"worklink:epic #{args.issue_id}: archived {len(archived)} factory record(s)")
+    return 0
+
+
+def _clear_leaf_state(args: argparse.Namespace) -> int:
+    from mimir.event_logger import init_logger
+
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    init_logger(home / "logs/events.jsonl", session_id=f"worklink-clear-leaf-{args.issue_id}")
+    try:
+        clear_worklink_leaf_state(home, args.issue_id, worker_id=args.worker_id,
+                                 event_logger=log_durable_event_sync)
+    except (RuntimeError, OSError, ValueError) as exc:
+        print(f"worklink #{args.issue_id}: leaf state clear refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"worklink #{args.issue_id}: leaf state cleared (claims and labels unchanged)")
     return 0
 
 

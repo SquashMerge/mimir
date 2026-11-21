@@ -1919,6 +1919,59 @@ def test_worklink_rereads_issue_comments_before_claiming(tmp_path: Path) -> None
     assert ["git", "-C", str(worktree), "checkout", "-B", "issue/441-a2", "abc123"] in calls
 
 
+@pytest.mark.parametrize("live_tree", [False, True])
+def test_executor_restart_reconcile_controls_fresh_admission(tmp_path, monkeypatch, live_tree):
+    import socket
+    import uuid
+    from mimir_cultivate.worklink import control, worker_client, worker_exec
+
+    repo = tmp_path / "repo"
+    worktree = tmp_path / ".worklink/repo/441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    state = WorklinkRunState(
+        issue_id=441, attempt=1, backend="claude_code", compute_name="local_subprocess",
+        handle_substrate="local_subprocess", handle_identifier=str(uuid.uuid4()),
+        shim_pid=4321, process_start_ticks=99, executor_instance_id=str(uuid.uuid4()),
+        branch="issue/441-a1", base_ref="main", local_base="main", repo=str(repo),
+        repo_url="", test_command=None, started_at=datetime.now(UTC).isoformat())
+    save_run_state(tmp_path, state)
+    monkeypatch.setattr(control, "process_is_alive", lambda _: False)
+    monkeypatch.setattr(worker_exec, "_jobs", {})
+    monkeypatch.setattr(worker_exec, "_exited", set())
+    monkeypatch.setattr(worker_exec, "_launching", set())
+    monkeypatch.setattr(worker_exec, "EXECUTOR_INSTANCE_ID", str(uuid.uuid4()))
+    monkeypatch.setattr(worker_exec, "_leaf_tree_verified_dead", lambda *args: not live_tree)
+    threads = []
+
+    def connect(*args):
+        client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client.settimeout(5)
+        thread = threading.Thread(target=worker_exec.handle_connection, args=(server,))
+        threads.append(thread)
+        thread.start()
+        return client
+
+    monkeypatch.setattr(worker_client.WorkerClient, "_connect", connect)
+    try:
+        control.reconcile_run_states(tmp_path, runner=runner)
+        registry = BackendRegistry(WorklinkConfig())
+        registry.register(FakeBackend())
+        result = asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+                441, backend_name="fake", test_command="echo ok"))
+        assert result.status == ("refused" if live_tree else "completed"), result.reason
+        if live_tree:
+            assert load_run_state(tmp_path, 441) == state
+            assert not any(isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"] for args in calls)
+        else:
+            assert ["chainlink", "locks", "claim", "441"] in calls
+            assert load_run_state(tmp_path, 441) is None
+    finally:
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+
 def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
@@ -14765,7 +14818,7 @@ def _claude_selection_case(tmp_path, monkeypatch, *, dry_run):
     monkeypatch.setattr(orch, "_create_backend_checkout", issue_checkout)
     result = asyncio.run(WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
         441, backend_name=backend.name, test_command="uv run pytest -q", dry_run=dry_run))
-    assert requested_uids == [4242]
+    assert requested_uids == [4242], result
     assert not any(isinstance(call, list) and call[:2] == ["claude", "-p"] for call in calls)
     return result, checkout_requests
 
