@@ -393,9 +393,11 @@ def test_retired_sweep_errors_are_nonfatal_and_sanitized(tmp_path: Path, monkeyp
     finally:
         os.close(fd)
     lines = capsys.readouterr().err.splitlines()
-    # Acquisition sweeps each lease name (slot 1, slot 2, intent); only slot 1
-    # has a retired directory, but a failing scan fails once per name.
-    expected = {"already-removed": 0, "delete": 1, "scan": 3} if operation == "acquire" else \
+    # Acquisition sweeps both slot names, then releases its queue ticket, which
+    # retires and removes the ticket directory and sweeps that name too. So a
+    # failing delete warns for slot 1's leftover and for the retired ticket, and
+    # a failing scan warns for each sweep (slot 1, slot 2, ticket twice).
+    expected = {"already-removed": 0, "delete": 2, "scan": 4} if operation == "acquire" else \
         {"already-removed": 0, "delete": 2, "scan": 2}
     assert len(lines) == expected[fault]
     for line in lines:
@@ -909,7 +911,7 @@ def test_waiting_large_job_runs_alone_before_later_medium_jobs(tmp_path: Path, s
     _wait(entered["m1"].exists)
     # No tier means large: v1 callers keep running alone.
     large = start(sys.executable, "-c", _marking_payload(entered["large"], release["large"]))
-    _wait(_slot(tmp_path, "intent").exists)
+    _wait(_slot(tmp_path, "lease2").is_dir)  # At the queue head, it holds the free slot.
     m2 = start(sys.executable, "-c", _marking_payload(entered["m2"], release["m2"]), MIMIR_HEAVY_TIER="medium")
     heartbeat = _slot(tmp_path, "lease") / "heartbeat"
     seen = int(heartbeat.read_text())
@@ -962,7 +964,7 @@ def test_medium_takes_slot_two_only_beside_a_medium_slot_one(tmp_path: Path, mon
 
 
 @pytest.mark.parametrize("waiting_large", [False, True])
-def test_waiting_large_intent_blocks_new_medium_jobs(tmp_path: Path, monkeypatch, waiting_large) -> None:
+def test_legacy_large_intent_still_blocks_new_medium_jobs(tmp_path: Path, monkeypatch, waiting_large) -> None:
     module = _helper()
     intent = _slot(tmp_path, "intent")
     if waiting_large:
@@ -1021,3 +1023,135 @@ def test_documented_gap_a_slot_one_only_helper_can_join_a_slot_two_medium(tmp_pa
             os.close(fd)
         release["m2"].touch()
     assert m2.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+
+
+def test_jobs_start_in_arrival_order(tmp_path: Path, start) -> None:
+    # A large job holds the machine; three medium jobs queue behind it in order.
+    entered = {name: tmp_path / f"{name}-in" for name in ("large", "a", "b", "c")}
+    release = {name: tmp_path / f"{name}-release" for name in ("large", "a", "b", "c")}
+    large = start(sys.executable, "-c", _marking_payload(entered["large"], release["large"]))
+    _wait(entered["large"].exists)
+    queue = _slot(tmp_path, "queue")
+    children = [large]
+    for count, name in enumerate(("a", "b", "c"), start=1):
+        children.append(start(sys.executable, "-c", _marking_payload(entered[name], release[name]),
+                              MIMIR_HEAVY_TIER="medium"))
+        _wait(lambda: len([p for p in queue.iterdir() if p.name.isdigit()]) == count)
+    release["large"].touch()
+    _wait(lambda: entered["a"].exists() and entered["b"].exists())
+    assert not entered["c"].exists()  # Two medium slots, taken by the first two arrivals.
+    release["b"].touch()
+    _wait(entered["c"].exists)
+    for name in ("a", "c"):
+        release[name].touch()
+    for child in children:
+        assert child.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+
+
+def test_a_dead_waiters_ticket_goes_stale_and_does_not_block(tmp_path: Path, start) -> None:
+    queue = _slot(tmp_path, "queue")
+    queue.mkdir()
+    ticket = queue / "000000000001"
+    ticket.mkdir()
+    (ticket / "owner").write_text(json.dumps({"tier": "large", "role": "ticket"}))
+    (ticket / "heartbeat").write_text("3\n")  # Never advances: its helper is dead.
+    done = tmp_path / "ran"
+    child = start("touch", str(done), MIMIR_HEAVY_TIER="medium", MIMIR_HEAVY_STALE_SECONDS="1")
+    assert child.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0, child.stderr.read()
+    assert done.exists() and not ticket.exists()
+
+
+def _legacy_lease(path: Path, tier: str, role: str) -> None:
+    path.mkdir()
+    (path / "owner").write_text(json.dumps({"tier": tier, "role": role}))
+    (path / "heartbeat").write_text("1\n")
+
+
+def test_fifo_large_takes_no_slot_while_a_legacy_large_holds_the_intent(tmp_path: Path, monkeypatch) -> None:
+    # A pre-queue large helper holds the intent and slot 1 and waits for slot 2.
+    # Reserving the free slot 2 would form a cycle both sides keep alive.
+    module = _helper()
+    intent, slot1, slot2 = (_slot(tmp_path, name) for name in ("intent", "lease", "lease2"))
+    _legacy_lease(intent, "large", "intent")
+    _legacy_lease(slot1, "large", "slot1")
+    rounds = []
+
+    def fake_sleep(seconds):
+        rounds.append(seconds)
+        assert not slot2.exists(), "FIFO large reserved slot 2 beside a legacy large"
+        if len(rounds) == 50:  # The legacy job ran and released everything.
+            shutil.rmtree(intent)
+            shutil.rmtree(slot1)
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    held = module.Heartbeat()
+    module._acquire(str(tmp_path / "heavy.lock"), "large", 600, 1, held)
+    try:
+        assert len(rounds) == 50
+        assert set(held.held) == {slot1.absolute(), slot2.absolute()}
+    finally:
+        for path, fd in held.held.items():
+            module._release(path, fd)
+            os.close(fd)
+
+
+def test_fifo_large_gives_back_a_reserved_slot_when_a_legacy_intent_appears(tmp_path: Path, monkeypatch) -> None:
+    module = _helper()
+    intent, slot1, slot2 = (_slot(tmp_path, name) for name in ("intent", "lease", "lease2"))
+    _legacy_lease(slot1, "medium", "slot1")  # Slot 1 busy; the FIFO large reserves slot 2.
+    rounds = []
+
+    def fake_sleep(seconds):
+        rounds.append(seconds)
+        if len(rounds) == 5:
+            assert slot2.is_dir()  # Reserved while waiting for slot 1.
+            _legacy_lease(intent, "large", "intent")  # A pre-queue large starts waiting.
+        if len(rounds) == 10:
+            assert not slot2.exists(), "reserved slot was not given back"
+        if len(rounds) == 20:  # The medium and the legacy large are done.
+            shutil.rmtree(intent)
+            shutil.rmtree(slot1)
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    held = module.Heartbeat()
+    module._acquire(str(tmp_path / "heavy.lock"), "large", 600, 1, held)
+    try:
+        assert len(rounds) == 20
+        assert set(held.held) == {slot1.absolute(), slot2.absolute()}
+    finally:
+        for path, fd in held.held.items():
+            module._release(path, fd)
+            os.close(fd)
+
+
+def test_a_large_waiter_gives_back_its_reservation_when_a_ticket_lands_ahead(tmp_path: Path, monkeypatch) -> None:
+    # Ticket numbers come from a directory snapshot, so a delayed enqueuer can
+    # publish a number below a waiting job. The waiter that loses the head must
+    # not keep a reserved slot, or two large waiters could hold one slot each.
+    module = _helper()
+    slot1, slot2, queue = (_slot(tmp_path, name) for name in ("lease", "lease2", "queue"))
+    _legacy_lease(slot1, "medium", "slot1")  # Busy, so the large job reserves slot 2.
+    inserted = queue / "000000000000"
+    rounds = []
+
+    def fake_sleep(seconds):
+        rounds.append(seconds)
+        if len(rounds) == 5:
+            assert slot2.is_dir()
+            _legacy_lease(inserted, "large", "ticket")  # Published late, below ours.
+        if len(rounds) == 10:
+            assert not slot2.exists(), "a non-head waiter kept its reserved slot"
+        if len(rounds) == 15:
+            shutil.rmtree(inserted)
+            shutil.rmtree(slot1)
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    held = module.Heartbeat()
+    module._acquire(str(tmp_path / "heavy.lock"), "large", 600, 1, held)
+    try:
+        assert len(rounds) == 15
+        assert set(held.held) == {slot1.absolute(), slot2.absolute()}
+    finally:
+        for path, fd in held.held.items():
+            module._release(path, fd)
+            os.close(fd)
