@@ -259,7 +259,12 @@ def test_factory_backend_controls_use_retained_owner(tmp_path, monkeypatch, comm
     from mimir_cultivate.worklink.backends import feature_factory
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     entrypoint = tmp_path / "installed/bin/factory.js"
-    monkeypatch.setattr(feature_factory, "resolve_factory_entrypoint", lambda path: entrypoint)
+
+    def resolve(path, *, host):
+        assert host == "opencode"
+        return entrypoint
+
+    monkeypatch.setattr(feature_factory, "resolve_factory_entrypoint", resolve)
     sandbox = tmp_path / "repo/41-2/checkout/.factory-sandboxes/run"
     calls = []
     def control(path, argv, **kwargs):

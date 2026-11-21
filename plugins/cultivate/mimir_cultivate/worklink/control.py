@@ -51,7 +51,8 @@ def _operator_stop_path(home: Path, issue_id: int) -> Path:
 
 
 def operator_stop_requested(home: Path | None, issue_id: int, attempt: int | None, *,
-                            opencode_session_id: str | None = None) -> bool:
+                            opencode_session_id: str | None = None,
+                            lock_session: str | None = None) -> bool:
     """Only the stopped issue's exact claim attempt may use this marker."""
     if home is None or attempt is None:
         return False
@@ -59,15 +60,18 @@ def operator_stop_requested(home: Path | None, issue_id: int, attempt: int | Non
         data = json.loads(_operator_stop_path(home, issue_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
+    identity = lock_session or opencode_session_id
     return bool(isinstance(data, dict) and data.get("issue_id") == issue_id and data.get("attempt") == attempt
-                and (opencode_session_id is None or data.get("opencode_session_id") == opencode_session_id))
+                and (identity is None or data.get("lock_session", data.get("opencode_session_id")) == identity))
 
 
-def _mark_operator_stop(home: Path, issue_id: int, attempt: int, *, opencode_session_id: str | None = None) -> None:
+def _mark_operator_stop(home: Path, issue_id: int, attempt: int, *, opencode_session_id: str | None = None,
+                        lock_session: str | None = None) -> None:
     path = _operator_stop_path(home, issue_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, {"issue_id": issue_id, "attempt": attempt,
-                            **({"opencode_session_id": opencode_session_id} if opencode_session_id is not None else {})})
+                            **({"opencode_session_id": opencode_session_id} if opencode_session_id is not None else {}),
+                            **({"lock_session": lock_session} if lock_session is not None else {})})
 
 
 def clear_legacy_factory_stop(home: Path, issue_id: int, attempt: int) -> None:
@@ -79,7 +83,7 @@ def clear_legacy_factory_stop(home: Path, issue_id: int, attempt: int) -> None:
         except (OSError, ValueError):
             return
         if (isinstance(data, dict) and data.get("issue_id") == issue_id and data.get("attempt") == attempt
-                and "opencode_session_id" not in data):
+                and "opencode_session_id" not in data and "lock_session" not in data):
             path.unlink(missing_ok=True)
 
 
@@ -365,6 +369,22 @@ def stop_worklink(
                 _mark_operator_stop(home, issue_id, state.attempt)
                 return WorklinkStopResult(issue_id, True,
                     reason="recorded gate or CI waiter has exited; session terminal recovery via reattach is required")
+            if state.compute_name == "local_subprocess" and state.shim_pid is not None:
+                from .worker_client import WorkerClient
+
+                try:
+                    asyncio.run(WorkerClient(None).cancel(state.handle_identifier))
+                except (RuntimeError, OSError, ValueError):
+                    return WorklinkStopResult(issue_id, False,
+                        reason="contained worker retirement is unverified; recovery state and claim retained")
+                clear_run_state(home, issue_id)
+                release = run([chainlink_bin, "locks", "release", str(issue_id)])
+                unlabel = run([chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"])
+                run([chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:ready"])
+                return WorklinkStopResult(issue_id, True,
+                    state_cleared=load_run_state(home, issue_id) is None,
+                    claim_released=release.returncode == 0,
+                    label_cleared=unlabel.returncode == 0)
             clear_run_state(home, issue_id)
             state_cleared = load_run_state(home, issue_id) is None
             # Epic dispatch uses factory records, not leaf run state. A stale
@@ -390,7 +410,7 @@ def stop_worklink(
 
                     client = WorkerClient.for_path_checkout(Path(factory.session_checkout or factory.sandbox), issue_id=issue_id,
                         attempt=factory.attempt, run_uid=get_identities().worklink_uid)
-                    backend = FeatureFactoryBackend(entrypoint=factory.launcher)
+                    backend = FeatureFactoryBackend(entrypoint=factory.launcher, host=factory.host)
                     try:
                         actual = factory.handle.opencode_session_id
                         before = backend.status(factory.run_id, sandbox=Path(factory.sandbox), launcher=factory.launcher)
@@ -421,6 +441,54 @@ def stop_worklink(
                     save_factory_record(home, stopped)
                     _write_factory_host_evidence(home, stopped,
                         "interrupted", "operator requested stop; factory status: " + str(after.status))
+                    continue
+                if factory.host == "claude_code" and factory.handle is not None:
+                    from .worker_client import WorkerClient
+                    from .backends.feature_factory import FeatureFactoryBackend
+                    from .factory_state import load_factory_record
+                    from .orchestrator import (
+                        _factory_controller_error, _require_factory_status,
+                        _write_factory_host_evidence,
+                    )
+
+                    backend = FeatureFactoryBackend(entrypoint=factory.launcher, host=factory.host)
+                    try:
+                        before = backend.status(factory.run_id, sandbox=Path(factory.sandbox), launcher=factory.launcher)
+                        _require_factory_status(before, factory)
+                        if factory.lock_session is None or before.lock_session not in {None, factory.lock_session}:
+                            raise RuntimeError("factory host ownership changed")
+                        _mark_operator_stop(home, issue_id, factory.attempt,
+                                            lock_session=factory.lock_session)
+                        # A durable executor retirement proof survives loss of
+                        # the executor's in-memory worker tombstone. Without
+                        # that proof, unknown worker IDs must still fail closed.
+                        if not factory.children_reaped:
+                            asyncio.run(WorkerClient(None).cancel(factory.handle.identifier))
+                        after = backend.status(factory.run_id, sandbox=Path(factory.sandbox), launcher=factory.launcher)
+                        _require_factory_status(after, factory)
+                        latest = load_factory_record(home, factory.run_id)
+                        if (after.lock_session not in {None, factory.lock_session}
+                                or latest is None
+                                or any(getattr(latest, name) != getattr(factory, name) for name in (
+                                    "handle", "host", "lock_session", "launch_generation",
+                                    "attempt", "sandbox", "session", "launcher",
+                                ))):
+                            raise RuntimeError("factory host ownership changed during stop")
+                    except (RuntimeError, OSError, ValueError) as exc:
+                        detail = _factory_controller_error(f"contained retirement or ownership unverified: {exc}")
+                        # Never overwrite a concurrent record (or its durable
+                        # children_reaped proof) with the pre-cancellation copy.
+                        _write_factory_host_evidence(home, factory, "failed", detail)
+                        uncertain = True
+                        problems.append(f"factory {factory.run_id}: {detail}; state and claim retained")
+                        continue
+                    stopped = replace(latest.observed(after, datetime.now(UTC).isoformat()),
+                        controller_phase="terminal" if latest.controller_phase == "terminal" or after.is_terminal
+                            else "parked" if after.is_parked else "stopped",
+                        children_reaped=True, controller_error="operator requested stop")
+                    save_factory_record(home, stopped)
+                    _write_factory_host_evidence(home, stopped, "interrupted",
+                        "operator requested stop; factory status: " + str(after.status))
                     continue
                 if factory_process_is_alive(factory) and factory.handle is not None:
                     try:
@@ -585,6 +653,22 @@ def reconcile_run_states(
             alive.append(state)
             continue
         with _claim_mutex(home):
+            if state.shim_pid is not None:
+                from .worker_client import WorkerClient
+
+                try:
+                    # A missing supervisor does not prove that its descendants
+                    # exited. Only the executor can retire this exact worker.
+                    asyncio.run(WorkerClient(None).cancel(state.handle_identifier))
+                except (RuntimeError, OSError, ValueError) as exc:
+                    alive.append(state)
+                    _emit_reconcile_event(
+                        event_logger,
+                        "worklink_run_state_reconcile_failed",
+                        issue_id=state.issue_id,
+                        reason=f"contained worker retirement is unverified: {exc}",
+                    )
+                    continue
             publication_outcome, publication_reason = _checkout_has_unpublished_commits(
                 state, run_git
             )

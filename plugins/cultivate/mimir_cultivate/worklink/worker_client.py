@@ -32,12 +32,12 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v21-controller-busy-retained-recovery"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v22-claude-retained-recovery"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or install identities do not match; rebuild the image and restart the container"
 )
-_PROJECTION_PATHS: frozenset[str] = frozenset()
+_PROJECTION_PATHS = frozenset({".claude/.claude.json", ".claude/settings.json"})
 
 
 def worklink_checkout_root() -> Path:
@@ -91,6 +91,7 @@ def run_factory_control(
     timeout: float = 30, output_limit: int = 1024 * 1024,
     initialize: bool = False,
     allow_output_truncation: bool = False,
+    host: str = "opencode",
     identifier: str | None = None,
 ) -> FactoryControlResult:
     """Run retained-tree operations as its owner, without refreshing runtime auth.
@@ -122,7 +123,7 @@ def run_factory_control(
                 or Path(argv[2]).resolve() != Path(__file__).with_name("factory_control_output.py").resolve()
                 or argv[3] != "other"):
             raise ValueError("initial factory control requires the trusted output projector")
-        resolve_factory_entrypoint(entrypoint)
+        resolve_factory_entrypoint(entrypoint, host=host)
 
     async def run() -> FactoryControlResult:
         client = WorkerClient.for_factory_checkout(root, issue_id=issue, attempt=attempt)
@@ -206,6 +207,26 @@ class WorkerProjection:
             raise ValueError("worker projection must be a JSON object")
 
 
+def _validate_projection_profile(profile: str, projections: Sequence[WorkerProjection]) -> None:
+    profiles = {
+        "none": {},
+        "claude_leaf": {".claude/.claude.json": {"hasCompletedOnboarding": True},
+                        ".claude/settings.json": {"disableAllHooks": True}},
+        "claude_factory": {".claude/.claude.json": {"hasCompletedOnboarding": True}},
+    }
+    if not isinstance(profile, str) or profile not in profiles:
+        raise ValueError("unknown worker projection profile")
+    expected = profiles[profile]
+    if (len(projections) > 2 or len({p.path for p in projections}) != len(projections)
+            or {p.path for p in projections} != set(expected)):
+        raise ValueError("worker projections do not match selected profile")
+    for item in projections:
+        checked = WorkerProjection(item.path, item.document)
+        parsed = json.loads(checked.document)
+        if parsed != expected[checked.path] or any(type(v) is not bool for v in parsed.values()):
+            raise ValueError("worker projection must use generated configuration")
+
+
 @dataclass
 class WorkerProcess:
     identifier: str
@@ -216,6 +237,9 @@ class WorkerProcess:
     output_overflow: bool = False
     stdout_bytes: int = 0
     stderr_bytes: int = 0
+    process_start_ticks: int | None = None
+    children_reaped: bool = False
+    _requires_children_reaped: bool = False
 
     async def wait(self) -> int:
         if self.returncode is None:
@@ -245,6 +269,9 @@ class WorkerProcess:
                 raise RuntimeError(str(response["error"]))
             if response.get("id") != self.identifier or response.get("status") != "terminal":
                 raise RuntimeError("worker executor returned an invalid terminal result")
+            if self._requires_children_reaped and response.get("children_reaped") is not True:
+                raise RuntimeError("worker executor did not verify descendant retirement")
+            self.children_reaped = response.get("children_reaped") is True
             self.returncode = int(response["exit_code"])
             self.timed_out = response.get("timed_out") is True
             self.output_overflow = response.get("output_overflow") is True
@@ -644,6 +671,8 @@ class WorkerClient:
         argv: Sequence[str],
         env: Mapping[str, str],
         projections: Sequence[WorkerProjection] = (),
+        home_projection_profile: str = "none",
+        retirement: str = "process",
         identifier: str,
         timeout_s: float,
         stdout_sink: OutputSink | None = None,
@@ -661,13 +690,21 @@ class WorkerClient:
         if (
             not isinstance(argv, (list, tuple))
             or not argv
-            or any(not isinstance(value, str) or not value or "\x00" in value for value in argv)
+            or not argv[0]
+            or any(not isinstance(value, str) or "\x00" in value for value in argv)
         ):
             raise ValueError("worker command must contain non-empty strings")
-        if len(projections) > 2 or len({item.path for item in projections}) != len(projections):
-            raise ValueError("worker projections must use at most two unique destinations")
+        _validate_projection_profile(home_projection_profile, projections)
+        if not isinstance(retirement, str) or retirement not in {"process", "contained_process_tree"}:
+            raise ValueError("unknown worker retirement policy")
         if "HOME" in env:
             raise ValueError("worker HOME is assigned by the executor")
+        if "CLAUDE_CONFIG_DIR" in env:
+            raise ValueError("worker Claude config is assigned by the executor")
+        if home_projection_profile == "claude_leaf" and {
+            "GH_TOKEN", "GITHUB_TOKEN", "FACTORY_PUBLISHING_IDENTITY",
+        }.intersection(env):
+            raise ValueError("Claude leaf refuses epic credentials")
         if (
             isinstance(timeout_s, bool)
             or not isinstance(timeout_s, (int, float))
@@ -688,6 +725,8 @@ class WorkerClient:
             "op": self._launch_op,
             "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
             "id": identifier,
+            "home_projection_profile": home_projection_profile,
+            "retirement": retirement,
             "argv": list(argv),
             "env": filter_otlp_env(env),
             "projections": [
@@ -756,7 +795,17 @@ class WorkerClient:
                 raise RuntimeError("worker executor response identity mismatch")
             if response.get("status") != "started":
                 raise RuntimeError("worker executor returned an invalid launch response")
-            return WorkerProcess(identifier, int(response["pid"]), sock)
+            ticks = response.get("process_start_ticks")
+            if ticks is not None and (type(ticks) is not int or ticks < 0):
+                raise RuntimeError("worker executor returned an invalid process identity")
+            return WorkerProcess(
+                identifier, int(response["pid"]), sock, process_start_ticks=ticks,
+                _requires_children_reaped=(
+                    retirement == "contained_process_tree"
+                    or home_projection_profile != "none"
+                    or self._launch_op in {"launch_factory", "launch_factory_control"}
+                ),
+            )
         except Exception:
             sock.close()
             raise
@@ -796,6 +845,13 @@ class WorkerClient:
 
     async def cancel_factory_handle(self, handle: LaunchHandle) -> None:
         """Cancel only a recorded factory identity; the executor checks its live job."""
+        await self._factory_handle_operation(handle, "cancel_factory_handle")
+
+    async def admit_factory_handle(self, handle: LaunchHandle) -> None:
+        """Release a held host only after its caller has durably bound the handle."""
+        await self._factory_handle_operation(handle, "admit_factory_handle")
+
+    async def _factory_handle_operation(self, handle: LaunchHandle, operation: str) -> None:
         _validate_identifier(handle.identifier)
         if (
             handle.substrate != "local_subprocess"
@@ -804,7 +860,7 @@ class WorkerClient:
         ):
             raise ValueError("factory cancel requires a verified executor handle")
         request = {
-            "version": 1, "op": "cancel_factory_handle",
+            "version": 1, "op": operation,
             "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
             "handle": {
                 "substrate": handle.substrate, "identifier": handle.identifier,
@@ -823,7 +879,8 @@ class WorkerClient:
                 if "exact contract" in error or "stale root executor image" in error or "unsupported worker operation" in error:
                     raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
                 raise RuntimeError(error)
-            if response != {"id": handle.identifier, "status": "exited"}:
+            expected = "admitted" if operation == "admit_factory_handle" else "exited"
+            if response != {"id": handle.identifier, "status": expected}:
                 raise RuntimeError("worker executor returned an invalid factory cancel result")
         finally:
             sock.close()

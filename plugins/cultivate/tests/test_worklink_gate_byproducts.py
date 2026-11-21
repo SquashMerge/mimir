@@ -13,10 +13,11 @@ import pytest
 
 from mimir_cultivate.worklink import orchestrator
 from mimir_cultivate.worklink.backends.base import RawResult
+from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
 from mimir_cultivate.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir_cultivate.worklink.checkout import CheckoutLease
 from mimir_cultivate.worklink.claims import ClaimRecord
-from mimir_cultivate.worklink.compute import ComputeResult
+from mimir_cultivate.worklink.compute import ComputeResult, WorkSpec
 
 
 def _run(args, *, cwd=None, timeout=None, text=True):
@@ -122,10 +123,15 @@ async def test_finalize_publishes_only_builder_content(
     result = await orchestrator.WorklinkRunner(home=home, repo=repo)._finalize(
         issue=issue, claims=claims, claim_record=ClaimRecord(2039, 1, "agent", started),
         attempt=1, config=WorklinkConfig(defaults=WorklinkDefaults(max_new_untracked_files=3)),
-        backend=SimpleNamespace(name="feature_factory", interpret=interpret),
+        backend=SimpleNamespace(name="feature_factory", interpret=interpret,
+                                capabilities=FeatureFactoryBackend().capabilities),
         compute=None, compute_result=ComputeResult(0, "", ""), order=None,
         lease=CheckoutLease(2039, 1, repo, repo, "issue/2039-a1", "feature/plugins"),
-        spec=SimpleNamespace(backend_config={}, base_ref="feature/plugins", timeout_s=30),
+        spec=WorkSpec(
+            issue_id=2039, attempt=1, repo_url="repo", base_ref="feature/plugins", branch="issue/2039-a1",
+            prompt="", rules=None, test_command=gate, backend="feature_factory", timeout_s=30,
+            local_checkout=repo, execution=FeatureFactoryBackend().capabilities().execution,
+        ),
         started=started, test_cmd=gate, root_dirty_before=(), runner=_run,
         terminal_release=_Release(),
     )

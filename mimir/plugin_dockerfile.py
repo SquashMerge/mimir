@@ -28,13 +28,29 @@ _S6_FILES = (
 )
 
 
+def worklink_resources(host: str = "opencode") -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Select generated resources without removing legacy wheel members."""
+    if host not in {"opencode", "claude_code"}:
+        raise ValueError("Worklink host must be opencode or claude_code")
+    if host == "opencode":
+        return _CONTEXT_SCRIPTS, _S6_FILES
+    return (
+        tuple(name for name in _CONTEXT_SCRIPTS if name not in {
+            "worklink-opencode-service", "worklink-daemon-gate", "worklink-opencode-login",
+        }),
+        tuple(name for name in _S6_FILES if "worklink-opencode" not in name),
+    )
+
+
 def build_pypi_context(destination: Path, *, agent_wheel: Path, cultivate_wheel: Path,
-                       version: str, agent_sha256: str, cultivate_sha256: str) -> None:
+                       version: str, agent_sha256: str, cultivate_sha256: str,
+                       worklink_host: str = "opencode") -> None:
     """Materialize the closed image context from two verified release wheels.
 
     The destination must be empty. No checkout path is read; wheel members are
     copied by exact name rather than extracted from an untrusted archive.
     """
+    scripts, s6 = worklink_resources(worklink_host)
     if destination.exists() and any(destination.iterdir()):
         raise ValueError("Docker build context must be empty")
     inputs = (("mimir-agent", agent_wheel, agent_sha256),
@@ -44,9 +60,9 @@ def build_pypi_context(destination: Path, *, agent_wheel: Path, cultivate_wheel:
     resources = (
         (agent_wheel, "mimir/docker_context/Dockerfile", "Dockerfile"),
         *((agent_wheel, f"mimir/docker_context/deploy/s6-overlay/s6-rc.d/{name}",
-           f"deploy/s6-overlay/s6-rc.d/{name}") for name in _S6_FILES),
+           f"deploy/s6-overlay/s6-rc.d/{name}") for name in s6),
         *((cultivate_wheel, f"mimir_cultivate/docker/{name}",
-           f"plugins/cultivate/mimir_cultivate/docker/{name}") for name in _CONTEXT_SCRIPTS),
+           f"plugins/cultivate/mimir_cultivate/docker/{name}") for name in scripts),
     )
     opened = {}
     try:
@@ -85,7 +101,7 @@ def has_trusted_cultivate(candidates: tuple[PluginCandidate, ...]) -> bool:
                for c in candidates)
 
 
-def cultivate_scripts(candidate: PluginCandidate) -> dict[str, str]:
+def cultivate_scripts(candidate: PluginCandidate, *, worklink_host: str | None = None) -> dict[str, str]:
     """Read only inventoried resources from the selected first-party distribution."""
     if not has_trusted_cultivate((candidate,)):
         raise ValueError("trusted Docker scripts require the Cultivate distribution")
@@ -94,7 +110,8 @@ def cultivate_scripts(candidate: PluginCandidate) -> dict[str, str]:
         raise ValueError("Cultivate Docker resource inventory is missing")
     inventory = {str(path): path for path in dist.files}
     scripts = {}
-    for name in _CULTIVATE_SCRIPTS:
+    names = _CULTIVATE_SCRIPTS if worklink_host is None else worklink_resources(worklink_host)[0]
+    for name in names:
         relative = f"mimir_cultivate/docker/{name}"
         if relative not in inventory:
             raise ValueError(f"Cultivate Docker resource is missing: {relative}")

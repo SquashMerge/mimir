@@ -49,9 +49,29 @@ def opencode_available() -> bool:
 
 
 def startup_prerequisites() -> tuple[str, ...]:
+    if os.environ.get("MIMIR_MODEL_SPEC", "").startswith("claude-code:"):
+        from .claude_code import CLAUDE_EXECUTABLE
+        return () if os.access(CLAUDE_EXECUTABLE, os.X_OK) else (
+            "the managed Claude CLI is not installed",
+        )
     return () if opencode_available() else (
         "the opencode CLI is not installed or is not on PATH",
     )
+
+
+def register_spawn_secrets(scrubber: Any, values: Mapping[str, str]) -> None:
+    """Register controller credentials before any spawn output is persisted."""
+    from mimir.otel_credentials import is_sensitive_otlp_env
+    from .claude_code import EPIC_CREDENTIALS, OAUTH_ENV
+
+    for key, value in values.items():
+        if value and (
+            is_sensitive_otlp_env(key, value)
+            or key in {OAUTH_ENV, *EPIC_CREDENTIALS, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+        ):
+            scrubber.add_scalar(value)
+            scrubber.add_scalar(json.dumps(value, ensure_ascii=False)[1:-1])
+            scrubber.add_scalar(json.dumps(value, ensure_ascii=True)[1:-1])
 
 
 class SensitiveMaterialScrubber:
@@ -276,14 +296,25 @@ def resolve_daemon_model(env: Mapping[str, str], explicit_model: str | None = No
     return reference
 
 
+_execution_secrets = SensitiveMaterialScrubber(home="")
+
+
+def remember_execution_secrets(environ: Mapping[str, str]) -> None:
+    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "FACTORY_PUBLISHING_IDENTITY"):
+        value = environ.get(name)
+        if value:
+            _execution_secrets.add_scalar(value)
+            _execution_secrets.add_scalar(json.dumps(value)[1:-1])
+
+
 def redact_daemon_output(text: str) -> str:
     from mimir.otel_credentials import is_sensitive_otlp_env
     from mimir.redaction import redact_text
 
     for name, value in os.environ.items():
-        if value and is_sensitive_otlp_env(name, value):
+        if value and (is_sensitive_otlp_env(name, value) or name == "CLAUDE_CODE_OAUTH_TOKEN"):
             text = text.replace(value, "<redacted>")
-    return redact_text(text)
+    return redact_text(_execution_secrets.scrub_text(text))
 
 
 def _jwt_exp(token: str) -> int:
@@ -741,6 +772,8 @@ def write_spawn_artifacts(
         (directory / "proposal.json").write_text(
             json.dumps(proposal.as_dict(), ensure_ascii=True, sort_keys=True) + "\n", encoding="utf-8",
         )
+    for path in directory.iterdir():
+        path.chmod(0o600)
     return handle
 
 
@@ -848,10 +881,7 @@ async def _spawn_open_code_impl(
         home=home, checkout=seed, artifact_root=artifact_root,
         source_paths=(config_path, auth_path),
     )
-    from mimir.otel_credentials import is_sensitive_otlp_env
-    for key, value in os.environ.items():
-        if value and (is_sensitive_otlp_env(key, value) or key in {"GH_TOKEN", "GITHUB_TOKEN"}):
-            scrubber.add_scalar(value)
+    register_spawn_secrets(scrubber, os.environ)
     selected_artifact_root = Path(
         artifact_root or cfg.get("artifact_root") or (home / ".factory" / "runs")
     ).expanduser()

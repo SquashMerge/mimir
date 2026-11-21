@@ -37,6 +37,7 @@ from mimir_cultivate.worklink.worker_client import (
 )
 import mimir_cultivate.worklink.worker_exec as worker_exec
 from mimir_cultivate.worklink import identities
+from mimir_cultivate.worklink.execution_policy import OPENCODE_FACTORY
 from mimir_cultivate import install_identity
 from tests.stat_helpers import stat_with
 
@@ -1035,6 +1036,7 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
                 "id": requests[0]["id"],
                 "status": "started",
                 "pid": 123,
+                "process_start_ticks": 456,
             }).encode()
 
         def close(self) -> None:
@@ -1060,12 +1062,14 @@ async def test_path_client_requests_worker_uid_and_projects_provider_documents(
     process._socket.close()
 
     request = requests[0]
+    assert process.process_start_ticks == 456
     assert request["op"] == ("launch_factory" if factory else "launch_path")
     assert request["path"] == str(checkout)
     assert request["run_uid"] == (synthetic_worklink_identities.worklink_uid if factory else 1002)
     assert set(request) == worker_exec._PATH_LAUNCH_FIELDS
     assert fd_counts == [2]
     assert request["projections"] == []
+    assert request["retirement"] == "process"
 
 
 @pytest.mark.asyncio
@@ -1237,6 +1241,8 @@ async def test_client_names_stale_old_launch_contract_with_timeout(
         "argv", "env", "projections",
     }
     assert set(requests[0]) == old_launch_fields | {
+        "home_projection_profile",
+        "retirement",
         "timeout_s",
         "stdout_limit",
         "stderr_limit",
@@ -1303,6 +1309,51 @@ async def test_worker_process_requires_identity_bound_terminal_result(monkeypatc
     process = WorkerProcess(identifier, 12, Peer())
     with pytest.raises(RuntimeError, match="invalid terminal"):
         await process.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proof", [None, False, 1, "true", True])
+async def test_worker_process_requires_executor_descendant_proof(proof):
+    identifier = str(uuid.uuid4())
+
+    class Peer:
+        closed = False
+
+        def recv(self, size):
+            return json.dumps({
+                "id": identifier, "status": "terminal", "exit_code": 0,
+                "timed_out": False, "output_overflow": False,
+                "stdout_bytes": 0, "stderr_bytes": 0, "children_reaped": proof,
+            }).encode()
+
+        def close(self):
+            self.closed = True
+
+    peer = Peer()
+    process = WorkerProcess(identifier, 123, peer, _requires_children_reaped=True)
+    if proof is True:
+        assert await process.wait() == 0
+        assert process.children_reaped and peer.closed
+    else:
+        with pytest.raises(RuntimeError, match="did not verify descendant retirement"):
+            await process.wait()
+        assert process.returncode is None
+        assert not process.children_reaped and not peer.closed
+
+
+def test_supervisor_stop_request_is_idempotent():
+    packets = []
+
+    class Peer:
+        def send(self, packet, flags):
+            packets.append(packet)
+
+    process = worker_exec._FactoryProcess(None, Peer(), lambda packet: None)
+    process.request_stop()
+    deadline = process.stop_deadline
+    process.request_stop()
+    assert packets == [b"stop"]
+    assert process.stop_deadline == deadline
 
 
 def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, monkeypatch) -> None:
@@ -1716,7 +1767,7 @@ def test_executor_rejects_mismatched_launch_protocol_identity(identity) -> None:
         "inode": 2,
         "argv": ["true"],
         "env": {},
-        "projections": [],
+        "projections": [], "home_projection_profile": "none", "retirement": "process",
         "timeout_s": 30,
         "stdout_limit": 100,
         "stderr_limit": 100,
@@ -1795,7 +1846,7 @@ def test_path_launch_git_environment_at_spawn(
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
         "id": identifier, "issue": 41, "attempt": 2,
         "path": str(checkout), "run_uid": worker_exec.get_identities().worklink_uid,
-        "argv": ["worker"], "env": supplied.copy(), "projections": [],
+        "argv": ["worker"], "env": supplied.copy(), "projections": [], "home_projection_profile": "none", "retirement": "process",
         "timeout_s": 5, "stdout_limit": 4096, "stderr_limit": 4096,
     }
     homes = tmp_path / "homes"
@@ -2105,7 +2156,7 @@ def test_duplicate_worker_id_is_refused_before_popen_without_touching_live_job(
         "inode": 0,
         "argv": ["worker"],
         "env": {},
-        "projections": [],
+        "projections": [], "home_projection_profile": "none", "retirement": "process",
         "timeout_s": 1,
         "stdout_limit": 100,
         "stderr_limit": 100,
@@ -2227,7 +2278,7 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
             " assert os.read(r, 1) == b'R'\\n\")",
         ],
         "env": {"PATH": "/usr/bin:/bin"},
-        "projections": [],
+        "projections": [], "home_projection_profile": "none", "retirement": "process",
         "timeout_s": 5,
         "stdout_limit": 100,
         "stderr_limit": 100,
@@ -2314,7 +2365,7 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
         "inode": 0,
         "argv": ["worker"],
         "env": {},
-        "projections": [],
+        "projections": [], "home_projection_profile": "none", "retirement": "process",
         "timeout_s": 0.25,
         "stdout_limit": 100,
         "stderr_limit": 100,
@@ -2331,6 +2382,7 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
             "output_overflow": False,
             "stdout_bytes": 0,
             "stderr_bytes": 0,
+            "children_reaped": False,
         }
     finally:
         for fd in fds:
@@ -2504,7 +2556,7 @@ def factory_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
         "id": str(uuid.uuid4()), "issue": 41, "attempt": 2,
         "path": str(checkout), "run_uid": worker_uid,
-        "argv": ["factory-payload"], "env": {}, "projections": [],
+        "argv": ["factory-payload"], "env": {}, "projections": [], "home_projection_profile": "none", "retirement": "process",
         "timeout_s": 5, "stdout_limit": 4096, "stderr_limit": 4096,
     }
 
@@ -2532,6 +2584,7 @@ async def test_factory_compute_requires_executor_without_agent_fallback(
     spec = compute.WorkSpec(
         issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
         rules=None, test_command="", backend="feature_factory", timeout_s=10,
+        execution=OPENCODE_FACTORY,
         local_checkout=tmp_path, local_argv=("factory", "--dir", "factory-specific"),
     )
     with pytest.raises(compute.ComputeLaunchError, match="executor unavailable"):
@@ -3381,6 +3434,7 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
         return SimpleNamespace(pid=123, returncode=0)
 
     monkeypatch.setattr(worker_exec.subprocess, "Popen", popen)
+    monkeypatch.setattr(worker_exec, "process_start_ticks", lambda pid: 456)
     responses = []
     send_flags = []
 
@@ -3409,6 +3463,7 @@ def test_factory_drops_identity_before_payload_exec_or_spawn(
     assert events[-1] == "supervisor-exec"
     assert factory_request["argv"] == payload
     assert [response["status"] for response in responses] == ["started", "event", "terminal"]
+    assert responses[0]["process_start_ticks"] == 456
     assert send_flags == [0, socket.MSG_DONTWAIT, socket.MSG_DONTWAIT]
     assert responses[1] == {
         "kind": "event", "event": "worklink_factory_orphan_adopted", "pid": 456,
@@ -3933,6 +3988,7 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
             spec = WorkSpec(
                 issue_id=41, attempt=2, repo_url="", base_ref="", branch="",
                 prompt="", rules=None, test_command="", backend="feature_factory",
+                execution=OPENCODE_FACTORY,
                 timeout_s=10, local_checkout=checkout,
                 local_argv=[python, "-c", payload], env={"CANARY": str(canary)},
             )

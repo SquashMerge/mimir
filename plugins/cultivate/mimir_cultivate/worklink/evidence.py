@@ -706,8 +706,20 @@ async def _observe_evidence_from_ref(
     factory_run_id: str | None = None,
 ) -> EvidenceValidation:
     runner = runner or _run
-    worker_uid_drop = backend != "feature_factory" or compute is not None
-    if backend == "feature_factory" and factory_run_id is not None and test_command and not skip_test_reason:
+    if work_spec is not None:
+        execution = work_spec.execution
+    else:
+        # Historical read-only evidence calls have no launch spec. Resolve their
+        # registered tool's capabilities, never a compute-name containment gate.
+        from .backends.registry import BackendRegistry
+        from .execution_policy import ExecutionPolicy, execution_for_backend
+        try:
+            execution = execution_for_backend(BackendRegistry().get(backend))
+        except KeyError:
+            execution = ExecutionPolicy()
+    factory = execution.checkout_protocol == "factory_worker"
+    worker_uid_drop = not factory or compute is not None
+    if factory and factory_run_id is not None and test_command and not skip_test_reason:
         from .worker_client import factory_checkout_for_path
 
         binding = factory_checkout_for_path(checkout)
@@ -715,7 +727,6 @@ async def _observe_evidence_from_ref(
             binding is None
             or checkout != binding[0] / ".factory-sandboxes" / factory_run_id
             or binding[1:] != (issue, attempt)
-            or getattr(compute, "name", None) != "local_subprocess"
             or not callable(getattr(compute, "_launch_contained", None))
             or work_spec is None
             or work_spec.local_checkout != checkout
@@ -726,8 +737,9 @@ async def _observe_evidence_from_ref(
             or work_spec.test_command != test_command
         ):
             raise ComputeLaunchError("Cultivate factory evidence gate requires the recorded worker sandbox")
-    if backend != "feature_factory" and worker_uid_drop and test_command and not skip_test_reason:
-        if getattr(compute, "name", None) == "opencode_daemon":
+    if not factory and worker_uid_drop and test_command and not skip_test_reason:
+        if (work_spec is not None and work_spec.execution.substrate == "opencode_daemon"
+                and not callable(getattr(compute, "_launch_contained", None))):
             from .compute import LocalSubprocessComputeBackend
             from .identities import get_identities
             if work_spec is None or work_spec.session_request is None or work_spec.session_request.kind != "leaf":
@@ -735,8 +747,7 @@ async def _observe_evidence_from_ref(
             compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
         authorization = getattr(compute, "_authorized_checkout", None)
         worker_bound = (
-            getattr(compute, "name", None) != "local_subprocess"
-            or not callable(getattr(compute, "_launch_contained", None))
+            not callable(getattr(compute, "_launch_contained", None))
             or work_spec is None
             or work_spec.local_checkout != checkout
             or work_spec.issue_id != issue
@@ -1032,11 +1043,26 @@ async def _run_compute_gate(
     # the worker-side timeout must agree with that supervisor too.
     gate_spec = replace(
         work_spec,
+        execution=replace(work_spec.execution, substrate="contained_subprocess",
+                          retirement="contained_process_tree", home_projection_profile="none"),
+        backend_config={key: value for key, value in work_spec.backend_config.items()
+                        if key not in {"worker_identifier", "worker_projections"}},
         session_request=None,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
         timeout_s=min(work_spec.timeout_s, 60) if diagnostic else work_spec.timeout_s,
     )
+    if work_spec.execution.home_projection_profile == "claude_leaf":
+        # Deterministic gates need the test environment, not the model's OAuth
+        # credential. Their ordinary retained output must not acquire it.
+        from ..claude_code import OAUTH_ENV
+        gate_spec = replace(
+            gate_spec,
+            env={key: value for key, value in gate_spec.env.items() if key != OAUTH_ENV},
+            backend_config={**gate_spec.backend_config, "pass_env": tuple(
+                name for name in gate_spec.backend_config.get("pass_env", ()) if name != OAUTH_ENV
+            )},
+        )
     if work_spec.backend == "feature_factory":
         # Completion tests use the leaf's closed environment contract, not the
         # factory control/CLI environment. Report injections must be requested too.
@@ -1063,11 +1089,12 @@ async def _run_compute_gate(
             ),
         )
     gate_spec = replace(gate_spec, env=filter_otlp_env(gate_spec.env))
-    if getattr(compute, "name", None) == "opencode_daemon":
+    if (work_spec.execution.substrate == "opencode_daemon"
+            and not callable(getattr(compute, "_launch_contained", None))):
         from .compute import LocalSubprocessComputeBackend
         from .identities import get_identities
         compute = LocalSubprocessComputeBackend.for_path_checkout(get_identities().worklink_uid)
-    if work_spec.backend == "feature_factory":
+    if work_spec.backend == "feature_factory" or work_spec.execution.checkout_protocol == "factory_worker":
         from .compute import _enabled_child_env
         from .worker_client import run_factory_control
 
