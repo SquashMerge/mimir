@@ -10,7 +10,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import yaml
 
@@ -6292,10 +6292,21 @@ async def repo_test(
     pull_request: int,
     selectors: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
-    suite: str | None = None,
+    suite: Annotated[
+        str | None,
+        "For a repository declaring more than one test suite, pass exactly one "
+        "suite name from its test_suites in $MIMIR_HOME/repositories.yaml. "
+        "May be omitted for a single/default suite; legacy selector inference is unchanged.",
+    ] = None,
     include_output: bool = False,
 ) -> dict[str, Any]:
-    """Run configured tests in a contained repository snapshot under the live lease."""
+    """Run configured tests in a contained repository snapshot under the live lease.
+
+    For a repository declaring more than one test suite, pass exactly one
+    ``suite`` explicitly. Declared names come from that repository's
+    ``test_suites`` in ``$MIMIR_HOME/repositories.yaml``. A single/default suite
+    needs no ``suite``; legacy selector-based inference remains supported.
+    """
     retained = _retained_scope(runtime, repository, pull_request)
     if retained is not None:
         return await _repo_test_unlocked(
@@ -6315,6 +6326,8 @@ async def repo_test(
 
 def _remediation_test_guidance(code: str, *, scoped: bool) -> str:
     """Publication advice, not authorization or a replacement for CI checks."""
+    if code == "test_suite_selection_refused":
+        return "No tests ran. Retry with exactly one declared suite using suite=<name>."
     publish = (
         "After scoped tests pass, commit, push the fix to the PR branch, and "
         "re-request review. In the PR comment state that the in-runner full suite "
@@ -6692,6 +6705,32 @@ def _bind_injected_runtime(repo_tool: StructuredTool) -> StructuredTool:
     )
     repo_tool.__dict__.pop("_injected_args_keys", None)
     return repo_tool
+
+
+def build_repo_test_tool() -> StructuredTool:
+    """List current deployment declarations without mutating the shared tool."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return repo_test
+    try:
+        inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
+    except (OSError, RuntimeError, ValueError):
+        # Hints are not authority: invocation still validates configuration.
+        return repo_test
+    declarations = []
+    for record in inventory.repositories:
+        names = [suite.name for suite in record.test_suites]
+        if not names or (record.test_command is not None and not any(
+            suite.default for suite in record.test_suites
+        )):
+            names.insert(0, "default")
+        declarations.append(f"{record.slug}: {', '.join(names)}")
+    if not declarations:
+        return repo_test
+    return repo_test.model_copy(update={
+        "description": repo_test.description + "\nConfigured suites by repository: "
+        + "; ".join(declarations),
+    })
 
 
 REPO_TOOLS = tuple(_bind_injected_runtime(repo_tool) for repo_tool in (
