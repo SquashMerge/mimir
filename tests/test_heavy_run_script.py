@@ -246,6 +246,19 @@ def _frozen(tmp_path: Path, timestamp: float = 0) -> Path:
     return lease
 
 
+def _acquire_slot1(module, lease: Path, stale: float = 600, interval: float = 1) -> int:
+    """Take slot 1 (``<base>.lease``) alone through the real acquisition loop.
+
+    A medium acquisition takes exactly slot 1 when nothing else holds the
+    lease, so the single-directory protocol tests keep exercising _acquire.
+    """
+    assert lease.name.endswith(".lease")
+    held = module.Heartbeat()
+    module._acquire(str(lease)[: -len(".lease")], "medium", stale, interval, held)
+    assert list(held.held) == [lease.absolute()]
+    return held.held.pop(lease.absolute())
+
+
 def _helper():
     spec = importlib.util.spec_from_file_location("heavy_run_under_test", SCRIPT.with_suffix(".py"))
     module = importlib.util.module_from_spec(spec)
@@ -323,7 +336,7 @@ def test_retired_cleanup_races_losing_waiter_without_failing_run(tmp_path: Path,
 def test_sweep_only_retired_directories_for_this_lease(tmp_path: Path, capsys, operation: str) -> None:
     module = _helper()
     lease = tmp_path / "heavy[1].lock.lease"
-    fd = module._acquire(lease, stale=600, interval=1) if operation == "release" else None
+    fd = _acquire_slot1(module, lease) if operation == "release" else None
     retired = lease.with_name(lease.name + ".retired-old")
     retired.mkdir()
     (retired / "breaking").mkdir()
@@ -337,7 +350,7 @@ def test_sweep_only_retired_directories_for_this_lease(tmp_path: Path, capsys, o
     ordinary_file.touch()
     try:
         if operation == "acquire":
-            fd = module._acquire(lease, stale=600, interval=1)
+            fd = _acquire_slot1(module, lease)
             assert lease.is_dir()
         else:
             module._release(lease, fd)
@@ -358,7 +371,7 @@ def test_retired_sweep_errors_are_nonfatal_and_sanitized(tmp_path: Path, monkeyp
     parent = tmp_path / "parent\n\x1b[31m"
     parent.mkdir()
     lease = parent / "heavy\n\x1b[31m.lock.lease"
-    fd = module._acquire(lease, stale=600, interval=1)
+    fd = _acquire_slot1(module, lease)
     retired = lease.with_name(lease.name + ".retired-old")
     retired.mkdir()
 
@@ -373,14 +386,18 @@ def test_retired_sweep_errors_are_nonfatal_and_sanitized(tmp_path: Path, monkeyp
             # Keep the live generation as a replacement, but make a fresh
             # acquisition possible without invoking release's sweep.
             lease.rename(tmp_path / "displaced")
-            acquired = module._acquire(lease, stale=600, interval=1)
+            acquired = _acquire_slot1(module, lease)
             os.close(acquired)
         else:
             module._release(lease, fd)
     finally:
         os.close(fd)
     lines = capsys.readouterr().err.splitlines()
-    assert len(lines) == (0 if fault == "already-removed" else 1 if operation == "acquire" else 2)
+    # Acquisition sweeps each lease name (slot 1, slot 2, intent); only slot 1
+    # has a retired directory, but a failing scan fails once per name.
+    expected = {"already-removed": 0, "delete": 1, "scan": 3} if operation == "acquire" else \
+        {"already-removed": 0, "delete": 2, "scan": 2}
+    assert len(lines) == expected[fault]
     for line in lines:
         assert "cleanup deferred" in line and "errno=13" in line
         assert "\x1b" not in line and "unsafe" not in line
@@ -444,9 +461,18 @@ def test_abandoned_empty_lease_gets_full_monotonic_grace(tmp_path: Path, monkeyp
         now[0] += 100
 
     monkeypatch.setattr(module.time, "sleep", advance)
-    fd = module._acquire(lease, stale=600, interval=1)
+    real_break, breaks = module._break_stale, []
+
+    def observed_break(*args):
+        breaks.append(now[0])
+        return real_break(*args)
+
+    monkeypatch.setattr(module, "_break_stale", observed_break)
+    fd = _acquire_slot1(module, lease)
     try:
-        assert len(sleeps) == 6
+        # Broken once, and only after the full 600 s of unchanged observation.
+        assert len(breaks) == 1 and breaks[0] - 100.0 >= 600
+        assert len(sleeps) <= 7
     finally:
         module._release(lease, fd)
         os.close(fd)
@@ -560,7 +586,7 @@ def test_changing_counter_with_old_or_future_timestamp_is_never_broken(tmp_path:
         updater.join(timeout=10)
 
 
-@pytest.mark.parametrize("fault", ["missing-parent", "not-directory", "symlink", "unwritable", "timeout", "no-timeout", "python", "invalid-stale", "invalid-interval"])
+@pytest.mark.parametrize("fault", ["missing-parent", "not-directory", "symlink", "unwritable", "timeout", "no-timeout", "python", "invalid-stale", "invalid-interval", "invalid-tier"])
 def test_unusable_configuration_fails_closed(tmp_path: Path, fault: str) -> None:
     extra = {}
     if fault == "missing-parent":
@@ -589,6 +615,8 @@ def test_unusable_configuration_fails_closed(tmp_path: Path, fault: str) -> None
         extra["MIMIR_HEAVY_TIMEOUT_TOOL"] = ""
     elif fault == "python":
         extra["MIMIR_HEAVY_PYTHON"] = str(tmp_path / "absent-python")
+    elif fault == "invalid-tier":
+        extra["MIMIR_HEAVY_TIER"] = "huge"
     elif fault == "invalid-interval":
         extra["MIMIR_HEAVY_HEARTBEAT_SECONDS"] = "600"
     else:
@@ -692,7 +720,7 @@ def test_generation_is_published_open_and_the_umask_is_restored(tmp_path: Path, 
     monkeypatch.setattr(module.os, "mkdir", observed)
     previous = os.umask(0o077)
     try:
-        fd = module._acquire(_lease(tmp_path), 600, 1)
+        fd = _acquire_slot1(module, _lease(tmp_path))
         after = os.umask(0o077)
     finally:
         os.umask(previous)
@@ -839,3 +867,104 @@ os.close(fd)
         assert done.exists()
     finally:
         shutil.rmtree(shared, ignore_errors=True)
+
+
+def _marking_payload(entered: Path, release: Path) -> str:
+    return (f"from pathlib import Path; Path({str(entered)!r}).touch()\n"
+            + _blocking_payload(release))
+
+
+def _slot(tmp_path: Path, name: str) -> Path:
+    return tmp_path / f"heavy.lock.{name}"
+
+
+def test_two_medium_jobs_share_the_lease_and_a_third_waits(tmp_path: Path, start) -> None:
+    entered = {name: tmp_path / f"{name}-in" for name in ("m1", "m2", "m3")}
+    release = {name: tmp_path / f"{name}-release" for name in ("m1", "m2")}
+    m1 = start(sys.executable, "-c", _marking_payload(entered["m1"], release["m1"]), MIMIR_HEAVY_TIER="medium")
+    _wait(entered["m1"].exists)
+    m2 = start(sys.executable, "-c", _marking_payload(entered["m2"], release["m2"]), MIMIR_HEAVY_TIER="medium")
+    _wait(entered["m2"].exists)  # Both medium commands run at once.
+    assert json.loads((_slot(tmp_path, "lease2") / "owner").read_text())["tier"] == "medium"
+    m3 = start("touch", str(entered["m3"]), MIMIR_HEAVY_TIER="medium")
+    heartbeat = _slot(tmp_path, "lease") / "heartbeat"
+    seen = int(heartbeat.read_text())
+    _wait(lambda: int(heartbeat.read_text()) >= seen + 8)
+    assert m3.poll() is None and not entered["m3"].exists()
+    release["m1"].touch()
+    _wait(entered["m3"].exists)
+    release["m2"].touch()
+    for child in (m1, m2, m3):
+        assert child.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+
+
+def test_waiting_large_job_runs_alone_before_later_medium_jobs(tmp_path: Path, start) -> None:
+    entered = {name: tmp_path / f"{name}-in" for name in ("m1", "large", "m2")}
+    release = {name: tmp_path / f"{name}-release" for name in ("m1", "large", "m2")}
+    m1 = start(sys.executable, "-c", _marking_payload(entered["m1"], release["m1"]), MIMIR_HEAVY_TIER="medium")
+    _wait(entered["m1"].exists)
+    # No tier means large: v1 callers keep running alone.
+    large = start(sys.executable, "-c", _marking_payload(entered["large"], release["large"]))
+    _wait(_slot(tmp_path, "intent").exists)
+    m2 = start(sys.executable, "-c", _marking_payload(entered["m2"], release["m2"]), MIMIR_HEAVY_TIER="medium")
+    heartbeat = _slot(tmp_path, "lease") / "heartbeat"
+    seen = int(heartbeat.read_text())
+    _wait(lambda: int(heartbeat.read_text()) >= seen + 8)
+    assert not entered["large"].exists() and not entered["m2"].exists()
+    release["m1"].touch()
+    _wait(entered["large"].exists)
+    assert _slot(tmp_path, "lease").is_dir() and _slot(tmp_path, "lease2").is_dir()
+    assert not entered["m2"].exists()
+    release["large"].touch()
+    _wait(entered["m2"].exists)
+    release["m2"].touch()
+    for child in (m1, large, m2):
+        assert child.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0
+
+
+def _medium_acquire_blocked_until(module, tmp_path: Path, monkeypatch, blocker: Path,
+                                  rounds: int = 50) -> tuple[int, list[Path]]:
+    """Run a medium _acquire whose sleep removes ``blocker`` after ``rounds`` waits."""
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == rounds:
+            assert not _slot(tmp_path, "lease2").exists()
+            shutil.rmtree(blocker)
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    held = module.Heartbeat()
+    module._acquire(str(tmp_path / "heavy.lock"), "medium", 600, 1, held)
+    taken = list(held.held)
+    for path, fd in held.held.items():
+        module._release(path, fd)
+        os.close(fd)
+    return len(sleeps), taken
+
+
+@pytest.mark.parametrize("tier", [None, "large", "unknown", "medium"])
+def test_medium_takes_slot_two_only_beside_a_medium_slot_one(tmp_path: Path, monkeypatch, tier) -> None:
+    module = _helper()
+    holder = _frozen(tmp_path)  # A v1 holder writes no tier.
+    if tier is not None:
+        owner = json.loads((holder / "owner").read_text())
+        (holder / "owner").write_text(json.dumps({**owner, "tier": tier}))
+    rounds, taken = _medium_acquire_blocked_until(module, tmp_path, monkeypatch, holder)
+    if tier == "medium":
+        assert (rounds, taken) == (0, [_slot(tmp_path, "lease2").absolute()])
+    else:  # Missing, large or unreadable tiers all count as large.
+        assert (rounds, taken) == (50, [_slot(tmp_path, "lease").absolute()])
+
+
+@pytest.mark.parametrize("waiting_large", [False, True])
+def test_waiting_large_intent_blocks_new_medium_jobs(tmp_path: Path, monkeypatch, waiting_large) -> None:
+    module = _helper()
+    intent = _slot(tmp_path, "intent")
+    if waiting_large:
+        intent.mkdir()
+        (intent / "owner").write_text(json.dumps({"tier": "large", "role": "intent"}))
+        (intent / "heartbeat").write_text("1\n")
+    rounds, taken = _medium_acquire_blocked_until(module, tmp_path, monkeypatch, intent)
+    assert taken == [_slot(tmp_path, "lease").absolute()]
+    assert rounds == (50 if waiting_large else 0)

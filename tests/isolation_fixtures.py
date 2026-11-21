@@ -387,6 +387,7 @@ _HOST_ONLY_ENV = frozenset(
         "MIMIR_HEAVY_LOCK_FILE",
         "MIMIR_HEAVY_LOCK_TIMEOUT",
         "MIMIR_HEAVY_LOCK_HELD",
+        "MIMIR_HEAVY_TIER",
         "MIMIR_TRACING_ENABLED",
         "MIMIR_OTLP_ENDPOINT",
         "MIMIR_OTEL_SERVICE_NAME",
@@ -528,8 +529,8 @@ def _clear_host_mimir_environment():
     ``MIMIR_MALLOC_TRIM_CRON`` must not let a deployment override change the
     suite's default-registration assertions.
 
-    ``MIMIR_HEAVY_LOCK_FILE``/``MIMIR_HEAVY_LOCK_TIMEOUT``/``MIMIR_HEAVY_LOCK_HELD``
-    are set when the suite itself runs under scripts/heavy_run.sh (Worklink gates,
+    ``MIMIR_HEAVY_LOCK_FILE``/``MIMIR_HEAVY_LOCK_TIMEOUT``/``MIMIR_HEAVY_LOCK_HELD``/
+    ``MIMIR_HEAVY_TIER`` are set when the suite itself runs under scripts/heavy_run.sh (Worklink gates,
     factory verify). Left
     set, every Worklink worker environment gains the lease path and exact-env
     assertions fail only on a deployment. Tests that exercise them set them.
