@@ -9219,6 +9219,9 @@ class ToolAuthorization:
     # ``service_sink_destination_denied`` alone renders as "requires an admin
     # identity" and misdescribes a command-shape problem as a privilege problem.
     refusal_detail: str | None = None
+    # Always-on shell-profile refusal, evaluated before shadow allowances. Carry
+    # the original diagnostic to middleware without re-probing mutable state.
+    service_shell_binding_rule: str | None = None
     # ``None`` means provenance is unknown; ``()`` authoritatively classifies
     # the call as not reading a protected MCP source.
     protected_source_resources: tuple[str, ...] | None = None
@@ -10598,6 +10601,41 @@ class ToolRegistry:
                 sink_category=sink_category,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
+            shell_policy = (
+                preliminary_service.sink_policy_for(tool_name)
+                if preliminary_service is not None and tool_name in {"shell_exec", "bash_async"}
+                else None
+            )
+            if (shell_policy is not None and shell_policy.adapter == "shell_profile"
+                    and isinstance(target_channel, str)
+                    and (sink_check.allowed or sink_check.reason == "service_sink_destination_denied")):
+                # Preserve enforced IFC refusals above profile policy. But the
+                # binder's admission rules are always-on, not shadow policy:
+                # execution can never fall back to a shell when they refuse.
+                # Check before shadow allowances to distinguish ordinary policy
+                # outcomes from authorizer/binder disagreements. Revalidation in
+                # the binder still detects changed state, failed probes and races.
+                argv, refusal, rule = parse_service_shell_argv_with_diagnostics(
+                    target_channel, shell_policy.destination,
+                    review_state=repo_review_state,
+                    declared=getattr(preliminary_service, "declared_shell_commands", ()) or (),
+                )
+                if shell_policy.destination == "repo_review" and repo_review_state_refusal is not None:
+                    argv, refusal, rule = (
+                        None, repo_review_state_refusal,
+                        ServiceShellBindingRule.REPOSITORY_REVIEW_STATE,
+                    )
+                if argv is None:
+                    binding_rule = rule.value if rule is not None else "unknown"
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="service_sink_destination_denied",
+                        service_principal=preliminary_service,
+                        required_tier=AccessTier.ADMIN, enforcement_enabled=True,
+                        would_block=True,
+                        refusal_detail=f"{refusal} binding_rule={binding_rule}",
+                        service_shell_binding_rule=binding_rule,
+                    ))
             if (not enforce and sink_category is SinkCategory.SHELL_PROCESS
                     and sink_check.reason == "ifc_declassification_approved"
                     and not preliminary_admin_denied):
