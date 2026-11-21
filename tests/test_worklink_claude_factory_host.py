@@ -88,7 +88,7 @@ def test_claude_factory_spec_and_lockstep(real_package, tmp_path):
     assert backend.host == "claude_code"
     assert backend.capabilities().quota_pool == "claude_code"
     assert BackendRegistry().get("feature_factory").host == "opencode"
-    assert FACTORY_VERSION == host.FACTORY_VERSION == "0.14.1"
+    assert FACTORY_VERSION == host.FACTORY_VERSION == "0.14.2"
     assert resolve_factory_entrypoint(entrypoint(real_package), host="claude_code") == entrypoint(real_package)
     for settings in ({"host": "unknown"}, {"host": "claude_code", "model": 1}, {"host": "opencode", "model": "sonnet"}):
         with pytest.raises(ValueError):
@@ -103,7 +103,7 @@ def test_claude_factory_rejects_version_drift(real_package, tmp_path, manifest):
     data = json.loads(path.read_text())
     data["version"] = "0.14.0"
     path.write_text(json.dumps(data))
-    with pytest.raises(FactoryContractError, match="0.14.1"):
+    with pytest.raises(FactoryContractError, match="0.14.2"):
         resolve_factory_entrypoint(entrypoint(package), host="claude_code")
 
 

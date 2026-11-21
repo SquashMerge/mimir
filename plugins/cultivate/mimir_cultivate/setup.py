@@ -480,7 +480,7 @@ def _claude_token(args: argparse.Namespace, *, previous: str | None = None) -> s
 def _worklink_toolchain() -> dict:
     return {"host": "claude_code", "packages": {
         "@anthropic-ai/claude-code": "2.1.326",
-        "claude-code-feature-factory": "0.14.1", "feature-factory": "0.14.1",
+        "claude-code-feature-factory": "0.14.2", "feature-factory": "0.14.2",
     }}
 
 

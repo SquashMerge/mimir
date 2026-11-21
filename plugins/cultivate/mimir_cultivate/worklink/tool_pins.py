@@ -128,7 +128,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="claude-code-feature-factory",
         category="coding-plugin",
-        pin="0.14.1",
+        pin="0.14.2",
         smoke="test -r /opt/mimir-claude/lib/node_modules/claude-code-feature-factory/vendor/feature-factory/bin/factory.js",
         source="npm",
         package="claude-code-feature-factory",
