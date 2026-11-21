@@ -2061,6 +2061,318 @@ async def test_repo_test_legs_share_timeout_budget(
     assert state.full_tested_head is None
 
 
+def _repo_test_lease_fixture(tmp_path, monkeypatch, *, command="/usr/bin/true", wrapper=True):
+    _, _, _, state = _repo_scope_and_state(tmp_path)
+    root = state.checkout_lease.path
+    (root / "tests").mkdir()
+    (root / "tests/test_changed.py").write_text("def test_changed(): pass\n")
+    (root / "plugins/cultivate/tests").mkdir(parents=True)
+    if wrapper:
+        (root / "scripts").mkdir()
+        source = Path(__file__).resolve().parents[3] / "scripts"
+        for name in ("heavy_run.sh", "heavy_run.py"):
+            (root / "scripts" / name).write_bytes((source / name).read_bytes())
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, test_suites=_two_leg_suites(command))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", str(tmp_path / "heavy.lock"))
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_TIMEOUT", raising=False)
+    monkeypatch.delenv("MIMIR_HEAVY_TIER", raising=False)
+    monkeypatch.delenv("MIMIR_HEAVY_TIMEOUT_TOOL", raising=False)
+    monkeypatch.delenv("MIMIR_HEAVY_GTIMEOUT", raising=False)
+    return state
+
+
+def _lease_start(identifier, started, stderr=b""):
+    return f"\x1erepo-test-{identifier}:{started}\n".encode() + stderr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["medium", "large", "no_lease", "missing_wrapper"])
+@pytest.mark.parametrize("selectors", [(), ("tests/test_changed.py",)])
+async def test_repo_test_lease_wraps_every_leg(tmp_path, monkeypatch, mode, selectors):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch, wrapper=mode != "missing_wrapper")
+    if mode == "large":
+        monkeypatch.setenv("MIMIR_HEAVY_TIER", "large")
+        monkeypatch.setenv("MIMIR_HEAVY_LOCK_TIMEOUT", "20000")
+    if mode == "no_lease":
+        monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE")
+    calls, events, closed = [], [], []
+
+    async def log_event(name, **fields):
+        events.append((name, fields))
+
+    monkeypatch.setattr(repository, "safe_log_event", log_event)
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        calls.append((argv, env, kwargs))
+        stderr = (
+            _lease_start(kwargs["identifier"], repository.time.monotonic(), b"leg stderr")
+            if argv[0] == "sh" else b"leg stderr"
+        )
+        return CollectedExecutionResult(0, b"ok", stderr, False, False, 0, 0)
+
+    def checkout(source, **kwargs):
+        return SimpleNamespace(path=source, capability=SimpleNamespace(path=source),
+                               close=lambda: closed.append(True))
+
+    result = await repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=checkout,
+    ).execute(selectors)
+    assert result.ok and len(calls) == 2 and closed == [True]
+    for index, (argv, env, kwargs) in enumerate(calls):
+        paths = selectors or (() if index == 0 else ("tests", "plugins/cultivate/tests"))
+        if mode in {"medium", "large"}:
+            assert argv[:5] == ("sh", "./scripts/heavy_run.sh", "timeout", "-k", "10s")
+            assert 0 < float(argv[5][:-1]) <= repository._TIMEOUT_SECONDS
+            assert argv[6:9] == ("python3", "-c", repository._LEASE_RUN_START)
+            assert argv[10:] == ("/usr/bin/true", *paths)
+            assert env["MIMIR_HEAVY_TIER"] == mode
+            lease_timeout = 20000 if mode == "large" else 14400
+            assert env["MIMIR_HEAVY_LOCK_TIMEOUT"] == str(lease_timeout)
+            assert kwargs["timeout_s"] == float(argv[5][:-1]) + lease_timeout + 20
+        else:
+            assert argv == ("/usr/bin/true", *paths)
+            assert kwargs["timeout_s"] <= repository._TIMEOUT_SECONDS
+        assert env.get("MIMIR_PLUGINS") == (None if index == 0 else "cultivate")
+    assert result.stderr == "leg stderr"
+    assert all(leg["stderr"] == "leg stderr" for leg in result.legs)
+    assert bool(events) is (mode == "missing_wrapper")
+    if events:
+        assert events[0][0] == "repo_test_lease_warning"
+        assert events[0][1]["reason_code"] == "wrapper_missing"
+        assert events[0][1]["level"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_repo_test_wrapped_uv_keeps_config_and_cache_protections(tmp_path, monkeypatch):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    root = state.checkout_lease.path
+    (root / "tools").mkdir()
+    uv = root / "tools/uv"
+    uv.write_text("#!/bin/sh\nexit 0\n")
+    uv.chmod(0o755)
+    _configure_test_suites(
+        tmp_path / "home", state, test_suites=_two_leg_suites("env -u MIMIR_PLUGINS ./tools/uv run pytest -q"),
+    )
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        assert argv[0:2] == ("sh", "./scripts/heavy_run.sh")
+        assert argv[10:14] == ("./tools/uv", "run", "pytest", "-q")
+        assert env["UV_NO_CONFIG"] == "1"
+        assert env["UV_CACHE_DIR"] == env["XDG_CACHE_HOME"] + "/uv"
+        assert "HOME" not in env
+        return CollectedExecutionResult(
+            0, b"", _lease_start(kwargs["identifier"], repository.time.monotonic()), False, False, 0, 0,
+        )
+
+    assert (await repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute()).ok
+
+
+@pytest.mark.asyncio
+async def test_repo_test_lease_queue_does_not_spend_multileg_run_budget(tmp_path, monkeypatch):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    now, budgets = [100.0], []
+    monkeypatch.setattr(repository, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        budgets.append(float(argv[5][:-1]))
+        # Queue for longer than the entire repo_test run budget, on BOTH legs.
+        now[0] += 5000
+        started = now[0]
+        now[0] += 6 if len(budgets) == 1 else 4
+        return CollectedExecutionResult(
+            0 if len(budgets) == 1 else 124, b"",
+            _lease_start(kwargs["identifier"], started), False, False, 0, 0,
+        )
+
+    result = await repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory, timeout=10,
+    ).execute()
+    assert budgets == [10, 4]
+    assert result.code == "test_timeout" and result.failed_leg == "cultivate"
+    assert result.legs[-1]["timed_out"]
+    assert state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started", [False, True])
+@pytest.mark.parametrize("outcome", ["exit124", "exit137", "controller_timeout"])
+async def test_repo_test_lease_wait_timeout_is_not_test_failure(tmp_path, monkeypatch, started, outcome):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    closed = []
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        return CollectedExecutionResult(
+            {"exit124": 124, "exit137": 137, "controller_timeout": None}[outcome], b"",
+            _lease_start(kwargs["identifier"], repository.time.monotonic()) if started else b"",
+            outcome == "controller_timeout", False, 0, 0,
+        )
+
+    def checkout(source, **kwargs):
+        return SimpleNamespace(path=source, capability=SimpleNamespace(path=source),
+                               close=lambda: closed.append(True))
+
+    executor = repository.RepoProjectTests(state, runner=runner, checkout_factory=checkout)
+    if started:
+        assert (await executor.execute()).code == "test_timeout"
+    else:
+        with pytest.raises(repository.ProjectTestRefusal) as error:
+            await executor.execute()
+        assert error.value.code == "repo_test_lease_wait_timeout"
+        assert error.value.execution_started is False
+    assert closed == [True] and state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+async def test_repo_test_lease_wait_refusal_reaches_tool_without_failure_guidance(tmp_path, monkeypatch):
+    from mimir.tools.refusals import ToolPolicyRefusal
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+    real_runner = repository.RepoProjectTests
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(124, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real_runner(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    scope = state.action_scope
+    with pytest.raises(ToolPolicyRefusal, match="repo_test_lease_wait_timeout") as error:
+        await repository.repo_test.coroutine(
+            scope.canonical_repo, scope.pr_number, ("tests/test_changed.py",),
+        )
+    assert not error.value.__cause__.execution_started
+    assert "No tests ran" in str(error.value)
+    assert "Hold publication" not in str(error.value)
+    assert state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+async def test_repo_test_lease_timeout_override_cannot_forward_controller_path(tmp_path, monkeypatch):
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_HEAVY_TIMEOUT_TOOL", str(tmp_path / "home" / "timeout"))
+    closed = []
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("controller path must not reach the worker")
+
+    def checkout(source, **kwargs):
+        return SimpleNamespace(path=source, capability=SimpleNamespace(path=source),
+                               close=lambda: closed.append(True))
+
+    with pytest.raises(repository.ProjectTestRefusal) as error:
+        await repository.RepoProjectTests(state, runner=forbidden, checkout_factory=checkout).execute()
+    assert error.value.code == "test_config_invalid"
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("telemetry", ["missing", "nan", "before_launch", "future", "no_newline"])
+async def test_repo_test_lease_invalid_start_fails_closed(tmp_path, monkeypatch, telemetry):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(repository, "time", SimpleNamespace(monotonic=lambda: 100.0))
+    closed = []
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        stderr = b"" if telemetry == "missing" else _lease_start(
+            kwargs["identifier"], {"nan": "nan", "before_launch": 99, "future": 101, "no_newline": 100}[telemetry],
+        )
+        if telemetry == "no_newline":
+            stderr = stderr.rstrip(b"\n")
+        return CollectedExecutionResult(0, b"", stderr, False, False, 0, 0)
+
+    def checkout(source, **kwargs):
+        return SimpleNamespace(path=source, capability=SimpleNamespace(path=source),
+                               close=lambda: closed.append(True))
+
+    with pytest.raises(repository.ProjectTestRefusal) as error:
+        await repository.RepoProjectTests(state, runner=runner, checkout_factory=checkout).execute()
+    assert error.value.code == "test_containment_unavailable"
+    assert closed == [True] and state.full_tested_head is None
+
+
+@pytest.mark.parametrize("platform,available,override,expected", [
+    ("linux", {"timeout", "gtimeout"}, None, "timeout"),
+    ("darwin", {"timeout", "gtimeout"}, None, "gtimeout"),
+    ("linux", {"gtimeout"}, None, "gtimeout"),
+    ("darwin", {"timeout"}, None, "timeout"),
+    ("linux", set(), "/custom/timeout", "/custom/timeout"),
+])
+def test_repo_test_lease_timeout_tool_selection(monkeypatch, platform, available, override, expected):
+    monkeypatch.setattr(repository, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(repository.shutil, "which", lambda name, **kwargs: name if name in available else None)
+    env = {"PATH": "/fixed/path"}
+    if override:
+        env["MIMIR_HEAVY_TIMEOUT_TOOL"] = override
+    assert repository._lease_test_command(("test",), env, "id", 12)[2:6] == (expected, "-k", "10s", "12s")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["pass", "run_timeout", "queue_timeout"])
+async def test_repo_test_real_lease_and_run_timeout(tmp_path, monkeypatch, outcome):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    root = state.checkout_lease.path
+    command = "/usr/bin/true" if outcome != "run_timeout" else "/bin/sleep 5"
+    _configure_test_suites(tmp_path / "home", state, test_suites=[{
+        "name": "unit", "default": True, "command": command,
+    }])
+    if outcome == "queue_timeout":
+        # Scale only the fixture copy's outer timeout to keep the test fast.
+        wrapper = root / "scripts/heavy_run.sh"
+        wrapper.write_text(wrapper.read_text().replace(
+            '${MIMIR_HEAVY_LOCK_TIMEOUT:-7200}', "0.3",
+        ))
+        intent = tmp_path / "heavy.lock.intent"
+        intent.mkdir()
+        (intent / "owner").write_text('{"tier":"large"}')
+        (intent / "heartbeat").write_text("1\n")
+    calls = []
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        calls.append(argv)
+        process = await asyncio.to_thread(
+            subprocess.run, argv, cwd=capability.path, env=env, capture_output=True, check=False,
+            timeout=5,
+        )
+        return CollectedExecutionResult(
+            process.returncode, process.stdout, process.stderr, False, False, 0, 0,
+        )
+
+    executor = repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+        timeout=0.3 if outcome == "run_timeout" else 10,
+    )
+    if outcome == "queue_timeout":
+        with pytest.raises(repository.ProjectTestRefusal) as error:
+            await executor.execute()
+        assert error.value.code == "repo_test_lease_wait_timeout"
+        assert not error.value.execution_started
+    else:
+        result = await executor.execute()
+        assert result.code == ("tests_passed" if outcome == "pass" else "test_timeout")
+        assert "\x1erepo-test-" not in result.stderr
+    assert calls[0][:2] == ("sh", "./scripts/heavy_run.sh")
+    assert not (tmp_path / "heavy.lock.lease").exists()
+    assert not (tmp_path / "heavy.lock.lease2").exists()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("leg_count", [4, 5])
 async def test_repo_test_legs_count_bound(

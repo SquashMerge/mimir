@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-FACTORY_VERSION = "0.14.1"
+FACTORY_VERSION = "0.14.2"
 OPENCODE_VERSION = "2.3.0"
 from mimir.plugin_dockerfile import main as assemble_main, verify_pins
 
@@ -1051,7 +1051,7 @@ def _run_toolchain_script(tmp_path, host, opencode, claude):
                             env={**os.environ, "PATH": str(bin_dir) + ":" + os.environ["PATH"],
                                  "COMMAND_LOG": str(log), "MIMIR_WORKLINK_HOST": host,
                                  "MIMIR_ENABLE_OPENCODE": opencode, "MIMIR_ENABLE_CLAUDE_CODE": claude,
-                                 "FACTORY_VERSION": "0.14.1", "NODE_VERSION": "22"})
+                                 "FACTORY_VERSION": FACTORY_VERSION, "NODE_VERSION": "22"})
     commands = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     return result, commands
 
@@ -1061,7 +1061,7 @@ def test_claude_route_does_not_install_opencode(tmp_path):
     assert result.returncode == 0, result.stderr
     installs = [argv for argv in commands if argv[0] == "npm"]
     assert installs == [["npm", "install", "--global", "--prefix", str(tmp_path / "opt/mimir-claude"),
-                         "@anthropic-ai/claude-code@2.1.326", "claude-code-feature-factory@0.14.1"]]
+                         "@anthropic-ai/claude-code@2.1.326", f"claude-code-feature-factory@{FACTORY_VERSION}"]]
     assert any(argv[0] == "node" and "vendor/feature-factory" in argv[-1] for argv in commands)
     assert not any("opencode" in " ".join(argv) for argv in commands)
 
@@ -1075,8 +1075,8 @@ def test_legacy_routes_do_not_install_claude(tmp_path, enabled):
     assert not any("claude" in " ".join(argv) for argv in commands)
     if enabled == "1":
         assert installs[0][4:] == [str(tmp_path / "opt/mimir-opencode"), f"@opencode/cli@{OPENCODE_VERSION}",
-                                  "@openai/codex@0.139.0", "feature-factory@0.14.1",
-                                  "opencode2-feature-factory@0.14.1", "@devtheops/opencode-plugin-otel@2.1.0"]
+                                  "@openai/codex@0.139.0", f"feature-factory@{FACTORY_VERSION}",
+                                  f"opencode2-feature-factory@{FACTORY_VERSION}", "@devtheops/opencode-plugin-otel@2.1.0"]
 
 
 @pytest.mark.parametrize("host,opencode,claude", [
@@ -1108,6 +1108,42 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     assert 'if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then' in text
     assert "mimir opencode-bootstrap --home /home/mimir" not in text
     assert "/opt/cultivate-docker/opencode-enabled" in text
+
+
+def test_root_factory_install_resolves_both_packages_to_pinned_version(tmp_path: Path) -> None:
+    """Execute the root RUN and its real fragment, recording npm without Docker."""
+    root = DOCKERFILE.read_text()
+    match = re.search(r"(?m)^ARG FACTORY_VERSION=(\S+)$", root)
+    assert match is not None
+    program, = (p for p in _run_instructions(root) if "sh /opt/cultivate-docker/base.sh" in p)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for command in ("apt-get", "curl", "bash", "rm"):
+        stub = bin_dir / command
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+    npm = bin_dir / "npm"
+    npm.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$NPM_LOG"\n')
+    npm.chmod(0o755)
+    source = ROOT / "plugins/cultivate/mimir_cultivate/docker/base.sh"
+    local = tmp_path / "base.sh"
+    local.write_text(source.read_text().replace("/opt/cultivate-docker", str(tmp_path / "scripts"))
+                     .replace("-o root -g root ", ""))
+    log = tmp_path / "npm.log"
+    result = subprocess.run(
+        ["/bin/sh", "-eu", "-c", program.replace("/opt/cultivate-docker/base.sh", str(local))],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "NPM_LOG": str(log),
+             "NODE_VERSION": "22", "MIMIR_ENABLE_OPENCODE": "1", "FACTORY_VERSION": match[1],
+             "MIMIR_WORKLINK_HOST": "opencode", "MIMIR_ENABLE_CLAUDE_CODE": "0"},
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert log.read_text().splitlines() == [
+        "install", "--global", "--prefix", "/opt/mimir-opencode",
+        f"@opencode/cli@{OPENCODE_VERSION}", "@openai/codex@0.139.0",
+        "feature-factory@0.14.2", "opencode2-feature-factory@0.14.2",
+        "@devtheops/opencode-plugin-otel@2.1.0",
+    ]
 
 
 def test_worklink_service_run_script_is_made_executable() -> None:
