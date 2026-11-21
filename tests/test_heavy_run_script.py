@@ -1122,3 +1122,36 @@ def test_fifo_large_gives_back_a_reserved_slot_when_a_legacy_intent_appears(tmp_
         for path, fd in held.held.items():
             module._release(path, fd)
             os.close(fd)
+
+
+def test_a_large_waiter_gives_back_its_reservation_when_a_ticket_lands_ahead(tmp_path: Path, monkeypatch) -> None:
+    # Ticket numbers come from a directory snapshot, so a delayed enqueuer can
+    # publish a number below a waiting job. The waiter that loses the head must
+    # not keep a reserved slot, or two large waiters could hold one slot each.
+    module = _helper()
+    slot1, slot2, queue = (_slot(tmp_path, name) for name in ("lease", "lease2", "queue"))
+    _legacy_lease(slot1, "medium", "slot1")  # Busy, so the large job reserves slot 2.
+    inserted = queue / "000000000000"
+    rounds = []
+
+    def fake_sleep(seconds):
+        rounds.append(seconds)
+        if len(rounds) == 5:
+            assert slot2.is_dir()
+            _legacy_lease(inserted, "large", "ticket")  # Published late, below ours.
+        if len(rounds) == 10:
+            assert not slot2.exists(), "a non-head waiter kept its reserved slot"
+        if len(rounds) == 15:
+            shutil.rmtree(inserted)
+            shutil.rmtree(slot1)
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    held = module.Heartbeat()
+    module._acquire(str(tmp_path / "heavy.lock"), "large", 600, 1, held)
+    try:
+        assert len(rounds) == 15
+        assert set(held.held) == {slot1.absolute(), slot2.absolute()}
+    finally:
+        for path, fd in held.held.items():
+            module._release(path, fd)
+            os.close(fd)

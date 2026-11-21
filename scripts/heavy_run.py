@@ -282,6 +282,12 @@ class Queue:
     one free slot and holds it while it waits for the other, and nobody behind
     it can overtake. A ticket whose heartbeat stops goes stale and is broken
     exactly like a lease, so a crashed waiter cannot block the queue.
+
+    Numbering comes from a directory snapshot, so it is best-effort order, not
+    a reservation: an enqueuer delayed between the snapshot and its mkdir can
+    publish a number below a job that is already waiting. Safety does not rest
+    on the order. A job that is not the head never keeps a reserved slot, so
+    two waiting large jobs can never hold one slot each.
     """
 
     def __init__(self, base: str, stale: float):
@@ -365,44 +371,53 @@ def _acquire(base: str, tier: str, stale: float, interval: float, hb: Heartbeat)
         finally:
             os.close(fd)
 
+    def give_back() -> None:
+        # Only a large job keeps a slot before its command starts, and only as
+        # the head of the queue. Its command has not started, so this is safe.
+        for path in (slot2.path, slot1.path):
+            fd = hb.held.pop(path, None)
+            if fd is not None:
+                try:
+                    _release(path, fd)
+                finally:
+                    os.close(fd)
+
     while True:
         _check_signal()
         if time.monotonic() >= next_beat:
             hb.beat()  # Keep our ticket and any slot we already hold alive.
             next_beat = time.monotonic() + interval
-        if queue.at_head(ticket):
-            if legacy_intent.path.exists():
-                # A pre-queue large helper is waiting: it holds the intent and
-                # takes slot 1 then slot 2. Holding either slot here could form
-                # a cycle with it that heartbeats keep alive, so stand aside
-                # until it runs, and give back any slot this job reserved
-                # (its command has not started). A dead waiter's intent expires.
-                for path in (slot2.path, slot1.path):
-                    fd = hb.held.pop(path, None)
-                    if fd is not None:
-                        try:
-                            _release(path, fd)
-                        finally:
-                            os.close(fd)
-                _probe_stale(legacy_intent)
-            elif tier == "large":
-                if slot1.path not in hb.held:
-                    take(slot1, "slot1")
-                if slot2.path not in hb.held:
-                    take(slot2, "slot2")
-                if slot1.path in hb.held and slot2.path in hb.held:
-                    done()
-                    return
-            else:
-                if take(slot1, "slot1"):
-                    done()
-                    return
-                # Slot 2 only beside a medium: a v1 or unknown slot-1 holder
-                # counts as large and must keep the machine to itself.
-                if slot1.holder_tier() == "medium" and take(slot2, "slot2"):
-                    done()
-                    return
-                _probe_stale(slot2)
+        if not queue.at_head(ticket):
+            # Ticket numbers come from a directory snapshot, so a delayed
+            # enqueuer can publish a lower number ahead of this job. Holding a
+            # slot while another job is head could form a cycle with it that
+            # heartbeats keep alive, so give the reservation back.
+            give_back()
+        elif legacy_intent.path.exists():
+            # A pre-queue large helper is waiting: it holds the intent and
+            # takes slot 1 then slot 2. Holding either slot here could form a
+            # cycle with it, so stand aside until it runs. A dead waiter's
+            # intent expires through the stale probe.
+            give_back()
+            _probe_stale(legacy_intent)
+        elif tier == "large":
+            if slot1.path not in hb.held:
+                take(slot1, "slot1")
+            if slot2.path not in hb.held:
+                take(slot2, "slot2")
+            if slot1.path in hb.held and slot2.path in hb.held:
+                done()
+                return
+        else:
+            if take(slot1, "slot1"):
+                done()
+                return
+            # Slot 2 only beside a medium: a v1 or unknown slot-1 holder
+            # counts as large and must keep the machine to itself.
+            if slot1.holder_tier() == "medium" and take(slot2, "slot2"):
+                done()
+                return
+            _probe_stale(slot2)
         time.sleep(min(interval, 0.1))
 
 
