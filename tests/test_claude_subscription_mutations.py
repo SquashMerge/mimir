@@ -166,12 +166,38 @@ assert Path(candidates[0].entry_point.dist.locate_file("")).is_relative_to(repos
 assert metadata.version("mimir-cultivate") == candidates[0].version
 sys.argv[0] = "pytest"
 runpy.run_module("pytest", run_name="__main__")
-""", str(repository), "-q", "--tb=short", "-o", "addopts=", mutation.test],
+""", str(repository), "-q", "--tb=short", "-o", "addopts=",
+         # Own the child temp root as well as its source tree. Worklink's
+         # inherited TMPDIR may sit behind execute-only home ancestors; the
+         # fail-closed resource lock must be able to open every ancestor.
+         "--basetemp", str(repository.parent / f"pytest-{stage}"),
+         mutation.test],
         cwd=repository, env=env, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=180,
     )
     (repository.parent / f"{mutation.name}-{stage}.log").write_text(result.stdout)
     return result
+
+
+def test_subscription_mutation_child_owns_temporary_root(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "unrelated-runtime-home"))
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="1 passed\n")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    mutation = MUTATIONS[0]
+    for stage in ("baseline", "mutant", "restored"):
+        run_control(repository, mutation, stage)
+        argv, kwargs = calls[-1]
+        base = Path(argv[argv.index("--basetemp") + 1])
+        assert base == tmp_path / f"pytest-{stage}"
+        assert kwargs["cwd"] == repository
+    assert len({argv[argv.index("--basetemp") + 1] for argv, _ in calls}) == 3
 
 
 @pytest.mark.parametrize("mutation", MUTATIONS, ids=lambda mutation: mutation.name)
