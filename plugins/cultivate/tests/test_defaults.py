@@ -26,7 +26,7 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2150-own-unpublished-commits"
+GITHUB_POLLER_RELEASE = "2189-npm-package-provenance"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.
 IDENTITY_EXCEPTIONS: dict[str, set[str]] = {}
@@ -55,7 +55,7 @@ def test_current_repository_skill_release_hash(name):
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     version = {
         "github-poller": GITHUB_POLLER_RELEASE,
-        "review": "2126-claude-subscription-main-integration",
+        "review": "2189-npm-package-provenance",
         "tracker-poller": "2066-pr-publication",
     }.get(name, "0.9.10-2025")
     expected = releases[version][name]["SKILL.md"]
@@ -108,7 +108,7 @@ def test_history_file_defaults_are_released_for_both_pollers():
         # independently after the shared history-file release.
         release = {
             "github-poller": GITHUB_POLLER_RELEASE,
-            "github-ci-watch": "2072-history-files",
+            "github-ci-watch": "2189-npm-package-provenance",
         }[skill.name]
         assert skill_inventory(skill) == releases[release][skill.name]
         capabilities = json.loads((SKILLS / skill.name / "pollers.json").read_text())["pollers"][0]["authority"]["capabilities"]

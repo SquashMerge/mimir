@@ -14765,7 +14765,7 @@ def _claude_selection_case(tmp_path, monkeypatch, *, dry_run):
     monkeypatch.setattr(orch, "_create_backend_checkout", issue_checkout)
     result = asyncio.run(WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
         441, backend_name=backend.name, test_command="uv run pytest -q", dry_run=dry_run))
-    assert requested_uids == [4242]
+    assert requested_uids == [4242], result
     assert not any(isinstance(call, list) and call[:2] == ["claude", "-p"] for call in calls)
     return result, checkout_requests
 

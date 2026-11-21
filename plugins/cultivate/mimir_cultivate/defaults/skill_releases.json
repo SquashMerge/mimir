@@ -835,5 +835,42 @@
   },
   "2126-claude-subscription-main-integration": {
     "review": {"SKILL.md": "df96be0c131e321fb236ac511b8363f7ab52f3b805e606fd4b5e0922bd98ad16"}
+  },
+  "2189-npm-package-provenance": {
+    "github-poller": {
+      "SKILL.md": "447fe0837379d781f1d3050bb157990846d42dfbff8a2a96928a986e2c36b6d9",
+      "pollers.json": "e36a57af356f7130f5d2f57906a46f507e3ffd044cf83bd63b97bffcfdacdf42",
+      "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
+      "scripts/poller.py": "401c6d906152a8d9986f0da00233f4e494951d1d2901c94bef26bb8f9b0d6793",
+      "tests/conftest.py": "06c6fdd21e3fe55ee2e29085aefb21740cf9941ad0bba4a5499056d662816de1",
+      "tests/github_poller_test_support.py": "43bba3c7a2dc4f741aa090dd4c23bb01a2457413ff7a3e4bd6d552aa57756fab",
+      "tests/test_github_poller_auto_review.py": "fe468ac55b21f14bee08a5ee3cc765f9a466d10a8b4e678d6a8f852990e752ba",
+      "tests/test_github_poller_changes_requested.py": "14eada4ed0f1eb0ae1b9b6e2288e77f9bd2cc8a64b87e97891d5a0eaff1a00d3",
+      "tests/test_github_poller_ci_failures.py": "70388f99cd78e18cfbcdaf5a6ce15e349f726aee1c6b64b9fe0548bffab44557",
+      "tests/test_github_poller_ci_logs.py": "fdeefc12d4483cbcd658f6a460fcc5c6f4c5d41f26f56cfd16a5b6c3014d1ce9",
+      "tests/test_github_poller_event_coalescing.py": "d19afeeeaca68e5fdd458b1f6f9e257cc0e45ec732ca571e83694f557bd7c75a",
+      "tests/test_github_poller_issue_notices.py": "8bf270a5fc30e418c425d46ad1d9dd54b96f4e2f26681a3e8c7230152f97e61f",
+      "tests/test_github_poller_mergeability.py": "88a30924512f8df77b9ad0dd0afd5ab5d8343190d44d85b8daa533fb7031d1d1",
+      "tests/test_github_poller_own_feedback.py": "fdc813cf84fad3be8560e18d1e9ce82072478b9df40772530919d2f714b95c75",
+      "tests/test_github_poller_pr_pushes.py": "87b943017ceaa621c60747944c3a48383f4aa0d8559dd6aa47b1ca36aca5d6eb",
+      "tests/test_github_poller_pr_scope_snapshot.py": "005137dbb24dff5cfe3892ff83d09efbb710ac2b02d8aacdacc7b444902b0094",
+      "tests/test_github_poller_pr_trust.py": "58fade4ccb673e234cc75e514afc7712cc9b8c0ca9dba919d44d1e80153a7af4",
+      "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
+      "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
+      "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
+    },
+    "github-ci-watch": {
+      "SKILL.md": "ff502554b1aaa77f6ba62859850429b5acd2400a9733fea1e8214a029f51830d",
+      "pollers.json": "cf12bace495179efb472e5d1d8d65a7dd3a2a4dccd17c5f312dfdbc6a639bcd2",
+      "scripts/ci_logs.py": "897902c578741b17b8987da7bd4126a9f918198df05148f4f981c6b012f68c87",
+      "scripts/poller.py": "8f600defe469eea2d0445136a5da31ae430b9a65cab054b9a1bcbd9b5eec8c14",
+      "tests/conftest.py": "0ad004f92857df903eb394bdd197d1d7a946cd1a40a82e2e3c07510e911437da",
+      "tests/github_ci_test_support.py": "02b3334cfeb6a73641cdeeb8ad413fdbc5716fda63b94122cff2b0d6b356cf87",
+      "tests/test_ci_logs.py": "ea1b6bd17544651441d4b1aff24716d479aed0e1057298a8bf4832fe39320a77",
+      "tests/test_ci_state.py": "19967b370dacfe8a65829637e3c9d6ba0b4991cd6b538aec5a6d6f17b85b3964",
+      "tests/test_ci_watch_attention.py": "941aada8f3b8f02187dd54ef3369b32f89be260f8734e9dc926263fee03b7a1d",
+      "tests/test_github_ci_watch.py": "aa1d9cba4f82e4c72c84a511c94bb51d031a348b77057624f7390856f366e43d"
+    },
+    "review": {"SKILL.md": "7de6d1fb2d5cd7419106236f94530488e94340d05083d998ad7134e800923942"}
   }
 }

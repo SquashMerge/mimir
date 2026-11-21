@@ -16,7 +16,7 @@ described below.
 ## Contract
 
 For coding-enabled server-bound poller and heartbeat turns, use the typed
-`repo_checkout`, `pr_metadata`, `pr_files`, `pr_diff`, `pr_file_content`, `pr_checks`, `pr_reviews`, `pr_comments`,
+`repo_checkout`, `pr_metadata`, `pr_files`, `pr_diff`, `pr_file_content`, `pr_checks`, `pr_reviews`, `pr_comments`, `package_compare`,
 and `pr_review_requests` tools instead of `gh`. Submit through
 `pr_submit_review` or `pr_inline_review_comment`. These tools intentionally have
 no repository or PR selector: the immutable event authority supplies the only
@@ -26,6 +26,18 @@ without a bound repo/PR tool surface.
 issue context use `chainlink_issue_show(issue_id)`; for local changes use
 `repo_diff` rather than passing arbitrary revision ranges to `git diff` on a
 `repo_review` service turn.
+
+For published npm package provenance, use `package_compare`, **not `fetch_url`**
+or `npm pack`. Pass up to four exact `name@version` specs (scoped names and exact
+prerelease versions are supported; ranges and tags are refused). Optional `pairs`
+select ascending zero-based index pairs; otherwise all packages are compared.
+The result contains integrity-verified tarball hashes, file counts and per-path
+SHA-256 equality, never package text. Nonconforming paths are counted, not shown.
+This content-free evidence does not taint a later remediation or PR comment;
+do not fetch README, manifests or CDN source to obtain the same evidence.
+Only the operator may set `MIMIR_NPM_REGISTRY` (default
+`https://registry.npmjs.org`); tarball requests must stay on that HTTPS origin,
+without redirects or proxy environment settings.
 
 Use the repository named in the PR URL or triggering event; for configured
 watches, use the matching entry in `GITHUB_REPOS`. Replace `<owner>/<repo>`

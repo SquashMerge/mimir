@@ -259,6 +259,7 @@ def test_selected_provider_registers_its_coding_resources() -> None:
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import core_policy_registry, core_runtime_names
     from mimir_cultivate.forge import FORGE_TOOLS
+    from mimir_cultivate.package_compare import PACKAGE_TOOLS
     from mimir_cultivate.policy import TRACKER_TOOL_NAMES
     from mimir_cultivate.repository import REPO_TOOLS
 
@@ -266,13 +267,15 @@ def test_selected_provider_registers_its_coding_resources() -> None:
     assert [plugin.candidate.name for plugin in manager.plugins] == ["cultivate"]
     repository = {tool.name for tool in REPO_TOOLS}
     forge = {tool.name for tool in FORGE_TOOLS}
+    packages = {tool.name for tool in PACKAGE_TOOLS}
     assert len(repository) == 18
     assert len(forge) == 21
+    assert packages == {"package_compare"}
     assert repository.isdisjoint(forge)
     with pytest.raises(KeyError):
         core_runtime_names("coding")
-    coding = {"spawn_open_code", "worklink_run", "worklink_resume"} | repository | forge
-    assert len(coding) == 42
+    coding = {"spawn_open_code", "worklink_run", "worklink_resume"} | repository | forge | packages
+    assert len(coding) == 43
     owned = coding | TRACKER_TOOL_NAMES
     assert len(TRACKER_TOOL_NAMES) == 3
     assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == owned
