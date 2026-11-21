@@ -68,6 +68,12 @@ def test_legacy_setup_renderer_bytes_and_modes(setup_environment, monkeypatch, p
     assert expected["manifest.json"]["text"].count(anchor) == 1
     expected["manifest.json"]["text"] = expected["manifest.json"]["text"].replace(
         anchor, anchor + '  "heavy_lock_timeout": null,\n')
+    # #2181 moves the factory pin; authorize exactly that one rendered line.
+    from mimir_cultivate.worklink.backends.feature_factory import FACTORY_VERSION
+    pinned = "\nARG FACTORY_VERSION=0.14.1\n"
+    assert expected["scaffold-workspace"]["text"].count(pinned) == 1
+    expected["scaffold-workspace"]["text"] = expected["scaffold-workspace"]["text"].replace(
+        pinned, f"\nARG FACTORY_VERSION={FACTORY_VERSION}\n")
     import difflib
     differences = []
     for name in sorted(actual.keys() | expected.keys()):

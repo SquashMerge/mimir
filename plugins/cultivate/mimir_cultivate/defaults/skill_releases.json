@@ -872,5 +872,8 @@
       "tests/test_github_ci_watch.py": "aa1d9cba4f82e4c72c84a511c94bb51d031a348b77057624f7390856f366e43d"
     },
     "review": {"SKILL.md": "7de6d1fb2d5cd7419106236f94530488e94340d05083d998ad7134e800923942"}
+  },
+  "2189-caller-selected-paths": {
+    "review": {"SKILL.md": "4091e3570aa012af80af2cda95258820075c05a5401864617e7908cf78feee27"}
   }
 }

@@ -31,3 +31,34 @@ SHA-256: `5632d857ee856542777756f4471b3b3ea00ebf236b5a3268d6df7aeb3d54235c`.
 
 These are local CLI contract captures, not evidence of a subscription or
 publishing identity being authenticated.
+
+## #2181: claude-code-feature-factory 0.14.2 (no re-capture needed)
+
+The Claude Code host now pins `claude-code-feature-factory@0.14.2` and its
+vendored `feature-factory` 0.14.2. These 0.14.1 captures remain the contract
+fixtures because the commands they exercise are unchanged:
+- The vendored `feature-factory` in `claude-code-feature-factory@0.14.2` is
+  byte-identical to the published `feature-factory@0.14.2` (recursive diff of
+  the extracted tarballs). The Claude plugin's `launcher/` is byte-identical
+  between 0.14.1 and 0.14.2.
+- `vendor/feature-factory/bin/factory.js` changes only in the evidence path:
+  `writeObservedEvidence` gains `testIsVerify`, a `PLAIN_COMMAND` pattern, and
+  slice evidence may share one execution between the ratified test and the
+  repository verify. `core/executable.js` adds `shellRunsSameExecutable` and
+  an argv timeout for that shared run. `observe/index.js` threads the flag.
+  `init`, `lock claim`, `status --json` and the lock-refusal path are untouched,
+  so `status.json` and `lock-refusal.stderr.txt` are what 0.14.2 emits too.
+- The other changes are agent prompts, `WORKFLOW.md`, and the manifests.
+
+Reproduce with `npm pack claude-code-feature-factory@0.14.1
+claude-code-feature-factory@0.14.2 feature-factory@0.14.2`, extracting each
+into separate scratch roots.
+
+| Package | Version | Tarball SHA-256 |
+| --- | --- | --- |
+| claude-code-feature-factory | 0.14.1 | `1a40d0c49971c38c9a988ad079070c0aedc3e782dd5b5c2ea479bc4d8ae108cd` |
+| claude-code-feature-factory | 0.14.2 | `3838ee94fbf74af6527837e5e12887f1ac8139f183e410879cde3a75a8a25d56` |
+
+Vendored entrypoint SHA-256: 0.14.1
+`bc5bded59ec5d335cc702eddf83218e7042d22ffcfa52a93650a845c24288340` (as above);
+0.14.2 `2f043b2d9300fca5a67ef41a7122ae1b0e2916ff0e2ff4e7876662a82dfdd681`.

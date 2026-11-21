@@ -12586,7 +12586,7 @@ def _bound_package_compare_result(
             result = json.loads(result.content)
         except ValueError:
             return False
-    return content_free_result(result, arguments.get("specs"), arguments.get("pairs"))
+    return content_free_result(result, arguments.get("specs"), arguments.get("pairs"), arguments.get("paths"))
 
 
 def _bound_unsupported_operation_result(

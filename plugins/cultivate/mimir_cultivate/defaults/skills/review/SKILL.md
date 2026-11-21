@@ -31,8 +31,14 @@ For published npm package provenance, use `package_compare`, **not `fetch_url`**
 or `npm pack`. Pass up to four exact `name@version` specs (scoped names and exact
 prerelease versions are supported; ranges and tags are refused). Optional `pairs`
 select ascending zero-based index pairs; otherwise all packages are compared.
-The result contains integrity-verified tarball hashes, file counts and per-path
-SHA-256 equality, never package text. Nonconforming paths are counted, not shown.
+The result contains integrity-verified tarball hashes, deterministic inventory
+SHA-256s and counts (`identical`, `changed`, `only_left`, `only_right`, `omitted`).
+No package-chosen path is listed. Optional `paths` (at most 64 validated relative
+paths) are echoed in caller order with status and hashes; `absent` means neither
+package contains the requested path. All other paths stay counts, never text.
+Inventory hashes cover compact ASCII JSON of the sorted `(path, sha256)` list.
+Byte identity requires zero `changed`, `only_left`, `only_right` AND `omitted`;
+nonzero omissions mean the comparison is incomplete. SHA-1-only SRI is refused.
 This content-free evidence does not taint a later remediation or PR comment;
 do not fetch README, manifests or CDN source to obtain the same evidence.
 Only the operator may set `MIMIR_NPM_REGISTRY` (default

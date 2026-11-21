@@ -146,6 +146,8 @@ def run_control(repository: Path, mutation: Mutation, stage: str) -> subprocess.
     env.pop("MIMIR_ACCESS_CONTROL_ENFORCED", None)
     env.pop("PYTHONPATH", None)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Use a fixture-owned, non-symlinked base: inherited TMPDIR may have a
+    # symlinked session home, which the real issue-resource lock rightly refuses.
     result = subprocess.run(
         [sys.executable, "-S", "-c", """
 from pathlib import Path
@@ -167,7 +169,7 @@ assert metadata.version("mimir-cultivate") == candidates[0].version
 sys.argv[0] = "pytest"
 runpy.run_module("pytest", run_name="__main__")
 """, str(repository), "-q", "--tb=short", "-o", "addopts=",
-         "--basetemp", str(repository.parent / f"pytest-{stage}"), mutation.test],
+         "--basetemp", str(repository.parent / f"{stage}-tmp"), mutation.test],
         cwd=repository, env=env, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=180,
     )

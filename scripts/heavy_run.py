@@ -16,16 +16,18 @@ file. A slot-1 holder whose tier is missing or unreadable counts as large, and a
 medium job may take slot 2 only while slot 1 is held by a medium job, so a v2
 medium never starts beside a v1 holder. The reverse is NOT guaranteed: when the
 slot-1 medium of a medium pair exits first, a waiting v1 helper (which never
-looks at slot 2 or the intent) can take slot 1 and run beside the slot-2
+looks at slot 2 or the queue) can take slot 1 and run beside the slot-2
 medium. v2 large jobs are not affected; they wait for both slots. Use the
 medium tier only once every participant on the lease runs this helper.
 
-Large jobs are not starved. A waiting large job first takes the intent lease
-``<file>.intent``. While it exists, no medium job starts. The large job then
-takes slot 1, then slot 2 (fixed order, so large jobs cannot deadlock each
-other), and releases the intent once it holds both. At most one medium job that
-was already starting can slip in ahead of it; the large job waits for that job
-to finish before its command starts.
+Jobs start in ticket order (owner design, 2026-11-21). Each waiter takes a
+FIFO ticket in ``<file>.queue/``; only the lowest live ticket may take slots. A
+large job at the head takes whichever slot is free and holds it while waiting for
+the other, so later medium jobs cannot starve it. The cost is that a slot can sit
+idle while a large job waits for the second one. Ticket order is best-effort
+arrival order (see ``Queue``): a delayed enqueuer can land ahead of an earlier
+waiter, and a waiter that loses the head gives back any reserved slot, so the
+lease can be reordered but never wedged.
 """
 from __future__ import annotations
 
@@ -273,12 +275,88 @@ class Heartbeat:
             _write(fd, "heartbeat", f"{self.counter}\n")
 
 
+class Queue:
+    """FIFO tickets (owner design, 2026-11-21).
+
+    Each waiter creates a ticket directory ``<file>.queue/<n>`` (atomic mkdir,
+    n = highest waiting ticket + 1) and heartbeats it like a lease. Only the
+    lowest live ticket may take slots; once a job holds what it needs it drops
+    its ticket. So jobs start in ticket order: a large job at the head takes
+    one free slot and holds it while it waits for the other, and nobody behind
+    it can overtake. A ticket whose heartbeat stops goes stale and is broken
+    exactly like a lease, so a crashed waiter cannot block the queue.
+
+    Numbering comes from a directory snapshot, so it is best-effort order, not
+    a reservation: an enqueuer delayed between the snapshot and its mkdir can
+    publish a number below a job that is already waiting. Safety does not rest
+    on the order. A job that is not the head never keeps a reserved slot, so
+    two waiting large jobs can never hold one slot each.
+    """
+
+    def __init__(self, base: str, stale: float):
+        self.dir = Path(base + ".queue").absolute()
+        self.stale = stale
+        self.leases: dict[str, Lease] = {}
+
+    def _ensure_dir(self) -> None:
+        try:
+            _publish_generation(self.dir)
+        except FileExistsError:
+            pass
+
+    def _waiting(self) -> list[str]:
+        try:
+            return sorted(n for n in os.listdir(self.dir) if n.isdigit())
+        except FileNotFoundError:
+            return []
+
+    def enqueue(self) -> tuple[Path, int]:
+        self._ensure_dir()
+        try:  # Housekeeping: remove broken (retired) tickets.
+            for name in os.listdir(self.dir):
+                if ".retired-" in name:
+                    _remove_retired(self.dir / name)
+        except OSError as exc:
+            _cleanup_warning(self.dir, exc)
+        while True:
+            _check_signal()
+            waiting = self._waiting()
+            n = (int(waiting[-1]) + 1) if waiting else 1
+            path = self.dir / f"{n:012d}"
+            try:
+                _publish_generation(path)
+            except FileExistsError:
+                continue  # Lost the race for that number: take the next one.
+            except FileNotFoundError:
+                self._ensure_dir()
+                continue
+            return path, os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+    def at_head(self, mine: Path) -> bool:
+        """True when no live ticket is ahead of ours. Breaks stale ones."""
+        for name in self._waiting():
+            if name >= mine.name:
+                return True
+            lease = self.leases.setdefault(name, Lease(self.dir / name, self.stale))
+            _probe_stale(lease)
+            if lease.path.exists():
+                return False
+            self.leases.pop(name, None)
+        return True
+
+
 def _acquire(base: str, tier: str, stale: float, interval: float, hb: Heartbeat) -> None:
     slot1 = Lease(Path(base + ".lease").absolute(), stale)
     slot2 = Lease(Path(base + ".lease2").absolute(), stale)
-    intent = Lease(Path(base + ".intent").absolute(), stale)
-    for lease in (slot1, slot2, intent):
+    for lease in (slot1, slot2):
         _sweep_retired(lease.path)
+    # Transition: helpers started before the FIFO queue (2026-11-21) mark a
+    # waiting large job with ``<file>.intent``. Honour it so they are not skipped.
+    legacy_intent = Lease(Path(base + ".intent").absolute(), stale)
+    queue = Queue(base, stale)
+    ticket, tfd = queue.enqueue()
+    hb.held[ticket] = tfd
+    _hold(tfd, tier, "ticket")
     next_beat = time.monotonic() + interval
 
     def take(lease: Lease, role: str) -> bool:
@@ -289,38 +367,60 @@ def _acquire(base: str, tier: str, stale: float, interval: float, hb: Heartbeat)
         _hold(fd, tier, role)
         return True
 
+    def done() -> None:
+        fd = hb.held.pop(ticket)
+        try:
+            _release(ticket, fd)
+        finally:
+            os.close(fd)
+
+    def give_back() -> None:
+        # Only a large job keeps a slot before its command starts, and only as
+        # the head of the queue. Its command has not started, so this is safe.
+        for path in (slot2.path, slot1.path):
+            fd = hb.held.pop(path, None)
+            if fd is not None:
+                try:
+                    _release(path, fd)
+                finally:
+                    os.close(fd)
+
     while True:
         _check_signal()
         if time.monotonic() >= next_beat:
-            hb.beat()  # Keep any lease we already hold (intent, slot 1) alive.
+            hb.beat()  # Keep our ticket and any slot we already hold alive.
             next_beat = time.monotonic() + interval
-        if tier == "large":
-            if intent.path not in hb.held:
-                take(intent, "intent")
-            if intent.path in hb.held:
-                if slot1.path not in hb.held:
-                    take(slot1, "slot1")
-                if slot1.path in hb.held and take(slot2, "slot2"):
-                    fd = hb.held.pop(intent.path)
-                    try:
-                        _release(intent.path, fd)
-                    finally:
-                        os.close(fd)
-                    return
+        if not queue.at_head(ticket):
+            # Ticket numbers come from a directory snapshot, so a delayed
+            # enqueuer can publish a lower number ahead of this job. Holding a
+            # slot while another job is head could form a cycle with it that
+            # heartbeats keep alive, so give the reservation back.
+            give_back()
+        elif legacy_intent.path.exists():
+            # A pre-queue large helper is waiting: it holds the intent and
+            # takes slot 1 then slot 2. Holding either slot here could form a
+            # cycle with it, so stand aside until it runs. A dead waiter's
+            # intent expires through the stale probe.
+            give_back()
+            _probe_stale(legacy_intent)
+        elif tier == "large":
+            if slot1.path not in hb.held:
+                take(slot1, "slot1")
+            if slot2.path not in hb.held:
+                take(slot2, "slot2")
+            if slot1.path in hb.held and slot2.path in hb.held:
+                done()
+                return
         else:
-            # Writer preference: a waiting large job blocks new medium jobs.
-            # try_take on the intent only for stale tracking; never keep it.
-            if intent.holder_tier() is not None:
-                fd = intent.try_take()  # Breaks a stale intent; else None.
-                if fd is not None:
-                    _release(intent.path, fd)
-                    os.close(fd)
-            elif take(slot1, "slot1"):
+            if take(slot1, "slot1"):
+                done()
                 return
-            elif slot1.holder_tier() == "medium" and take(slot2, "slot2"):
+            # Slot 2 only beside a medium: a v1 or unknown slot-1 holder
+            # counts as large and must keep the machine to itself.
+            if slot1.holder_tier() == "medium" and take(slot2, "slot2"):
+                done()
                 return
-            else:
-                _probe_stale(slot2)
+            _probe_stale(slot2)
         time.sleep(min(interval, 0.1))
 
 
@@ -393,7 +493,7 @@ def run(command: list[str]) -> int:
             except ProcessLookupError:
                 pass
             child.wait()
-        # Release in reverse acquisition order: slot 2, slot 1, intent.
+        # Release in reverse acquisition order: slot 2, then slot 1.
         for path in sorted(hb.held, key=lambda p: p.name, reverse=True):
             fd = hb.held[path]
             try:

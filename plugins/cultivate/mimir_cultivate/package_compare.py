@@ -20,7 +20,7 @@ from langchain.tools import ToolRuntime, tool
 
 from mimir.models import AuthContext
 from mimir.package_evidence import (
-    MAX_FILES, integrity_tokens, parse_specs, requested_pairs, safe_path,
+    MAX_FILES, integrity_tokens, parse_specs, requested_pairs, requested_paths, safe_path,
 )
 
 MAX_DOWNLOAD = 64 * 1024 * 1024
@@ -114,11 +114,14 @@ def _extract(data: bytes, root: Path) -> tuple[dict[str, str], int, int]:
     return inventory, count, omitted
 
 
-def compare(specs: list[str], pairs: list[list[int]] | None = None) -> dict[str, Any]:
+def compare(
+    specs: list[str], pairs: list[list[int]] | None = None, paths: list[str] | None = None,
+) -> dict[str, Any]:
     """Fetch only the configured registry and return a closed structural projection."""
     try:
         parsed = parse_specs(specs)
         indexes = requested_pairs(specs, pairs)
+        path_names = requested_paths(paths)
     except ValueError:
         return {"status": "refused", "reason": "invalid_request"}
     try:
@@ -144,21 +147,29 @@ def compare(specs: list[str], pairs: list[list[int]] | None = None) -> dict[str,
                 packages.append({
                     "name": name, "version": version,
                     "tarball_sha256": hashlib.sha256(data).hexdigest(),
+                    "inventory_sha256": hashlib.sha256(json.dumps(
+                        sorted(inventory.items()), ensure_ascii=True, separators=(",", ":"),
+                    ).encode("ascii")).hexdigest(),
                     "registry_integrity": integrity, "file_count": count,
                     "omitted_path_count": omitted,
                 })
         comparisons = []
         for left, right in indexes:
             a, b = inventories[left], inventories[right]
+            shared = a.keys() & b.keys()
+            identical = sum(a[path] == b[path] for path in shared)
             comparisons.append({
                 "left": left, "right": right,
-                "omitted_path_count": packages[left]["omitted_path_count"] + packages[right]["omitted_path_count"],
+                "identical": identical, "changed": len(shared) - identical,
+                "only_left": len(a.keys() - b.keys()), "only_right": len(b.keys() - a.keys()),
+                "omitted": packages[left]["omitted_path_count"] + packages[right]["omitted_path_count"],
                 "files": [{
                     "path": path,
-                    "status": ("only_right" if path not in a else "only_left" if path not in b
+                    "status": ("absent" if path not in a and path not in b else
+                               "only_right" if path not in a else "only_left" if path not in b
                                else "identical" if a[path] == b[path] else "changed"),
                     "left_sha256": a.get(path), "right_sha256": b.get(path),
-                } for path in sorted(a.keys() | b.keys())],
+                } for path in path_names],
             })
         return {"status": "compared", "packages": packages, "pairs": comparisons}
     except PackageRefusal as exc:
@@ -176,17 +187,20 @@ def package_compare(
     pull_request: int,
     specs: list[str],
     pairs: list[list[int]] | None = None,
+    paths: list[str] | None = None,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Compare 1–4 exact npm name@version specs without ingesting contents.
 
     Optional pairs are ascending zero-based index pairs; default compares all.
-    Returns hashes and safe relative paths only. Requires the bound PR inspect grant.
+    Returns inventory hashes and pair counts; paths (up to 64) are caller-selected
+    relative paths echoed with status/hashes. No discovered paths or package text.
+    Requires the bound PR inspect grant.
     """
     from .forge import _scope
 
     _scope(runtime, repository, pull_request)
-    return compare(specs, pairs)
+    return compare(specs, pairs, paths)
 
 
 from .forge import _bind_injected_runtime  # noqa: E402

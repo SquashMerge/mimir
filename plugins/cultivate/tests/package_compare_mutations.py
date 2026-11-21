@@ -62,6 +62,8 @@ add(module, "enable redirects", "follow_redirects=False", "follow_redirects=True
 add(module, "return hostile paths instead of omitting",
     'if not member.name.startswith("package/") or not safe_path(path):', "if False:",
     "changed_and_only_in_one_and_hostile_paths")
+add(module, "re-add package-chosen path listing", 'for path in path_names],',
+    'for path in sorted(a.keys() | b.keys())],', "test_no_unrequested_paths_and_requested_echo")
 add(module, "return file bytes instead of hashes", "inventory[path] = digest.hexdigest()",
     'inventory[path] = (root / str(index)).read_bytes().decode("utf-8", errors="replace")',
     "test_no_package_or_manifest_text")
@@ -106,7 +108,7 @@ for node in ast.walk(function):
         replace_node(module, f"bound result deny line {node.lineno}", node, "return True",
                      "package_result_binding_fails_closed")
 add(module, "remove content validator",
-    'return content_free_result(result, arguments.get("specs"), arguments.get("pairs"))',
+    'return content_free_result(result, arguments.get("specs"), arguments.get("pairs"), arguments.get("paths"))',
     "return True", "package_result_binding_fails_closed")
 
 CHILD = r'''

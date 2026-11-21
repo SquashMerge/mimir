@@ -62,6 +62,14 @@ def test_current_factory_admission_claims_match_runtime_version() -> None:
     assert f"package/adapter {factory_version} verification" in worklink
 
 
+@pytest.mark.parametrize("relative_path", ["docs/internal/WORKLINK.md", "docs/code-building-pipeline.md"])
+def test_factory_docs_describe_targeted_tests_and_shared_verification(relative_path: str) -> None:
+    text = " ".join((ROOT / relative_path).read_text().split())
+    assert "slice builders run targeted slice tests" in text
+    assert "verification runs once per attempt in the factory's `observe` step" in text
+    assert "Worklink's independent final repository gate" in text
+
+
 def test_factory_launch_contract_is_identical_in_bounded_documentation() -> None:
     assert FACTORY_DOCS == (
         "docs/code-building-pipeline.md",

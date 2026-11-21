@@ -54,6 +54,16 @@ def safe_path(path: object) -> bool:
     )
 
 
+def requested_paths(paths: object) -> list[str]:
+    if paths is None:
+        return []
+    if (type(paths) is not list or len(paths) > 64
+            or any(not safe_path(path) for path in paths)
+            or len(set(paths)) != len(paths)):
+        raise ValueError("invalid_request")
+    return paths
+
+
 def integrity_tokens(value: object) -> list[tuple[str, bytes]]:
     """Only canonical SRI digests; never reflect arbitrary registry strings."""
     if type(value) is not str or not 1 <= len(value) <= 1024:
@@ -73,6 +83,8 @@ def integrity_tokens(value: object) -> list[tuple[str, bytes]]:
         if base64.b64encode(raw).decode("ascii") != digest:
             raise ValueError("integrity_failed")
         tokens.append((algorithm, raw))
+    if all(algorithm == "sha1" for algorithm, _ in tokens):
+        raise ValueError("integrity_failed")
     return tokens
 
 
@@ -84,6 +96,7 @@ class PackageEvidence(_Closed):
     name: str
     version: str
     tarball_sha256: HASH
+    inventory_sha256: HASH
     registry_integrity: str
     file_count: COUNT
     omitted_path_count: COUNT
@@ -91,16 +104,17 @@ class PackageEvidence(_Closed):
 
 class FileEvidence(_Closed):
     path: str
-    status: Literal["identical", "changed", "only_left", "only_right"]
+    status: Literal["identical", "changed", "only_left", "only_right", "absent"]
     left_sha256: HASH | None
     right_sha256: HASH | None
 
     @model_validator(mode="after")
     def structural_only(self) -> FileEvidence:
         left, right = self.left_sha256, self.right_sha256
-        expected = ("only_right" if left is None else "only_left" if right is None
+        expected = ("absent" if left is right is None else
+                    "only_right" if left is None else "only_left" if right is None
                     else "identical" if left == right else "changed")
-        if not safe_path(self.path) or left is right is None or self.status != expected:
+        if not safe_path(self.path) or self.status != expected:
             raise ValueError("invalid file evidence")
         return self
 
@@ -108,8 +122,12 @@ class FileEvidence(_Closed):
 class PairEvidence(_Closed):
     left: int
     right: int
-    files: Annotated[list[FileEvidence], Field(max_length=2 * MAX_FILES)]
-    omitted_path_count: Annotated[int, Field(ge=0, le=2 * MAX_FILES)]
+    identical: COUNT
+    changed: COUNT
+    only_left: COUNT
+    only_right: COUNT
+    omitted: Annotated[int, Field(ge=0, le=2 * MAX_FILES)]
+    files: Annotated[list[FileEvidence], Field(max_length=64)]
 
 
 class ComparisonEvidence(_Closed):
@@ -118,13 +136,14 @@ class ComparisonEvidence(_Closed):
     pairs: Annotated[list[PairEvidence], Field(max_length=6)]
 
 
-def content_free_result(result: object, specs: object, pairs: object) -> bool:
+def content_free_result(result: object, specs: object, pairs: object, paths: object = None) -> bool:
     """Validate every returned field, not just a NON_INGESTING declaration."""
     if type(result) is dict and set(result) == {"status", "reason"}:
         return result["status"] == "refused" and type(result["reason"]) is str and result["reason"] in REASONS
     try:
         expected = parse_specs(specs)
         pair_indexes = requested_pairs(specs, pairs)
+        path_names = requested_paths(paths)
         evidence = ComparisonEvidence.model_validate(result)
         if [(p.name, p.version) for p in evidence.packages] != expected:
             return False
@@ -135,9 +154,16 @@ def content_free_result(result: object, specs: object, pairs: object) -> bool:
             if package.omitted_path_count > package.file_count:
                 return False
         for pair in evidence.pairs:
-            paths = [file.path for file in pair.files]
-            if paths != sorted(set(paths)):
+            if [file.path for file in pair.files] != path_names:
                 return False
+            left, right = evidence.packages[pair.left], evidence.packages[pair.right]
+            if (pair.identical + pair.changed + pair.only_left != left.file_count - left.omitted_path_count
+                    or pair.identical + pair.changed + pair.only_right != right.file_count - right.omitted_path_count
+                    or pair.omitted != left.omitted_path_count + right.omitted_path_count):
+                return False
+            for status in ("identical", "changed", "only_left", "only_right"):
+                if sum(file.status == status for file in pair.files) > getattr(pair, status):
+                    return False
         return True
     except (ValueError, TypeError, ValidationError):
         return False

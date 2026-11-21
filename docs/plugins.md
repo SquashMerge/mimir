@@ -95,8 +95,8 @@ value in argv. Setup stores only `CLAUDE_CODE_OAUTH_TOKEN` in mode-0600
 model is `claude-code:sonnet:low`; local embeddings need no API key.
 
 This route installs the official Claude CLI **2.1.326** and
-`claude-code-feature-factory` **0.14.1** under `/opt/mimir-claude`, using that
-plugin's vendored factory **0.14.1** for every epic control. Worklink YAML selects
+`claude-code-feature-factory` **0.14.2** under `/opt/mimir-claude`, using that
+plugin's vendored factory **0.14.2** for every epic control. Worklink YAML selects
 `claude_code` and `feature_factory.host: claude_code`. Leaves use restricted,
 contained subprocesses; factory drivers use the plugin's upstream tool policy
 in a contained foreground subprocess. There is no OpenCode daemon, telemetry
@@ -268,7 +268,7 @@ preserves them. Without a shared directory, no timeout is written. Outside setup
 an unset timeout is not forwarded, so `heavy_run`'s own default applies.
 The lease has two slots. A command run with `MIMIR_HEAVY_TIER=medium` holds one,
 so two medium commands can share the host; `large` (the default) holds both and
-runs alone, and a waiting large command blocks new medium ones. Worklink forwards
+runs alone. Waiting commands take FIFO tickets and start in best-effort arrival order, so later medium commands cannot starve a large one. A waiter that loses its place gives back any slot it reserved, so a reordering can never wedge the lease. Worklink forwards
 a `medium` or `large` tier set in the agent's environment the same way as the
 timeout (anything else fails closed); setup does not write one. Keep anything
 whose timing or footprint is measured on `large`. Set `medium` only once every
@@ -394,6 +394,27 @@ delivery failure reports that the incident was cleared and exits nonzero.
 Labels, claims, worktrees and `refs/worklink/<id>/<n>` are untouched. If the issue
 is still `worklink:ready`, the next autonomous scan can dispatch it under normal
 admission rules, with its previous attempt available to the retry.
+
+For a retained local leaf, use:
+
+```sh
+mimir worklink clear-leaf-state <issue-id> --worker-id <exact-recorded-worker-UUID> --home <agent-home>
+```
+
+This read-only retirement check never signals a live worker. It requires the
+recorded executor instance, supervisor PID and process birth identity, refuses
+live or unverifiable trees, and durably logs `worklink_leaf_state_cleared` before
+removing state. Claims, labels, publication intents and checkouts are unchanged.
+After an executor restart, startup reconciliation and `worklink stop` can also
+recover dead leaves automatically. A changed kernel boot/PID-namespace-init birth
+proves the previous namespace's tree exited, without confusing the newly started
+daemon with stale descendants. For executor-only restarts in the same namespace,
+the privileged proof conservatively refuses while **any** live Worklink-UID process
+remains (including unrelated workers); stop those processes or retry after they
+finish. Legacy records without an instance
+identity still fail closed unless executor cancellation or an existing durable
+retirement proof establishes cleanup. This protocol update requires an executor
+image rebuild/redeploy.
 
 For retained factory records, `mimir worklink archive-factory-run <issue-id>
 --home <agent-home>` archives factory control-plane state. For a quiescent legacy
