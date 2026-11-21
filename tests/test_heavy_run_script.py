@@ -1059,3 +1059,66 @@ def test_a_dead_waiters_ticket_goes_stale_and_does_not_block(tmp_path: Path, sta
     child = start("touch", str(done), MIMIR_HEAVY_TIER="medium", MIMIR_HEAVY_STALE_SECONDS="1")
     assert child.wait(timeout=SUBPROCESS_HANG_GUARD_SECONDS) == 0, child.stderr.read()
     assert done.exists() and not ticket.exists()
+
+
+def _legacy_lease(path: Path, tier: str, role: str) -> None:
+    path.mkdir()
+    (path / "owner").write_text(json.dumps({"tier": tier, "role": role}))
+    (path / "heartbeat").write_text("1\n")
+
+
+def test_fifo_large_takes_no_slot_while_a_legacy_large_holds_the_intent(tmp_path: Path, monkeypatch) -> None:
+    # A pre-queue large helper holds the intent and slot 1 and waits for slot 2.
+    # Reserving the free slot 2 would form a cycle both sides keep alive.
+    module = _helper()
+    intent, slot1, slot2 = (_slot(tmp_path, name) for name in ("intent", "lease", "lease2"))
+    _legacy_lease(intent, "large", "intent")
+    _legacy_lease(slot1, "large", "slot1")
+    rounds = []
+
+    def fake_sleep(seconds):
+        rounds.append(seconds)
+        assert not slot2.exists(), "FIFO large reserved slot 2 beside a legacy large"
+        if len(rounds) == 50:  # The legacy job ran and released everything.
+            shutil.rmtree(intent)
+            shutil.rmtree(slot1)
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    held = module.Heartbeat()
+    module._acquire(str(tmp_path / "heavy.lock"), "large", 600, 1, held)
+    try:
+        assert len(rounds) == 50
+        assert set(held.held) == {slot1.absolute(), slot2.absolute()}
+    finally:
+        for path, fd in held.held.items():
+            module._release(path, fd)
+            os.close(fd)
+
+
+def test_fifo_large_gives_back_a_reserved_slot_when_a_legacy_intent_appears(tmp_path: Path, monkeypatch) -> None:
+    module = _helper()
+    intent, slot1, slot2 = (_slot(tmp_path, name) for name in ("intent", "lease", "lease2"))
+    _legacy_lease(slot1, "medium", "slot1")  # Slot 1 busy; the FIFO large reserves slot 2.
+    rounds = []
+
+    def fake_sleep(seconds):
+        rounds.append(seconds)
+        if len(rounds) == 5:
+            assert slot2.is_dir()  # Reserved while waiting for slot 1.
+            _legacy_lease(intent, "large", "intent")  # A pre-queue large starts waiting.
+        if len(rounds) == 10:
+            assert not slot2.exists(), "reserved slot was not given back"
+        if len(rounds) == 20:  # The medium and the legacy large are done.
+            shutil.rmtree(intent)
+            shutil.rmtree(slot1)
+
+    monkeypatch.setattr(module.time, "sleep", fake_sleep)
+    held = module.Heartbeat()
+    module._acquire(str(tmp_path / "heavy.lock"), "large", 600, 1, held)
+    try:
+        assert len(rounds) == 20
+        assert set(held.held) == {slot1.absolute(), slot2.absolute()}
+    finally:
+        for path, fd in held.held.items():
+            module._release(path, fd)
+            os.close(fd)
