@@ -1077,6 +1077,12 @@ def _repo_pr_scope_resolution(
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    from .github_identity import own_conflict_pr_author
+
+    own_conflict = (
+        event_type == "pr_mergeability_conflicting"
+        and own_conflict_pr_author(principal, self_login)
+    )
     is_fresh_changes_requested_remediation = (
         event_type == "pr_review"
         and review_state == "CHANGES_REQUESTED"
@@ -1138,7 +1144,7 @@ def _repo_pr_scope_resolution(
             )
         )
     root, origin = binding_resolution.binding
-    if principal != self_login and pr_author_is_trusted is not True:
+    if principal != self_login and not own_conflict and pr_author_is_trusted is not True:
         from .event_logger import log_event_sync
 
         reason = (
@@ -1170,7 +1176,7 @@ def _repo_pr_scope_resolution(
             "pull request withheld: its author is not a repository collaborator; "
             "the item was withheld and logged"
         ))
-    if is_remediation and principal != self_login:
+    if is_remediation and principal != self_login and not own_conflict:
         return RepoPRScopeResolution(
             refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
         )
@@ -9537,10 +9543,6 @@ def _recovery_tool_refusal(review_state: Any, tool_name: str | None) -> str | No
     if interrupted is None or tool_name is None or not tool_name.startswith("repo_"):
         return None
     if tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"}:
-        return None
-    scope = getattr(review_state, "action_scope", None)
-    if (tool_name == "repo_rebase" and interrupted.kind == "rebase"
-            and getattr(scope, "event_type", None) == "pr_mergeability_conflicting"):
         return None
     return f"Interrupted {interrupted.kind} on {interrupted.branch}; call {interrupted.abort_tool} first."
 

@@ -327,6 +327,9 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
     if conflicting:
         from tests.test_repo_tools import _two_sided_conflict_tools
         origin, scope, state, _ = _two_sided_conflict_tools(tmp_path)
+        # Generic interrupted-operation tests exercise both merge and rebase.
+        # Conflict-resolution authority itself is now exclusively merge-based.
+        event_type = event_type or "pr_mergeability_rebase"
     else:
         origin, source, scope, state = _repo_scope_and_state(tmp_path)
         if behind_base:
@@ -724,31 +727,83 @@ def test_conflicted_merge_resolve_stage_commit_push_same_trusted_turn(tmp_path, 
     assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
 
 
-def test_conflicted_rebase_continue_failures_stay_trusted_then_complete(tmp_path, monkeypatch):
+def test_conflicting_scope_merge_resolve_test_push_comment_and_rerequest(tmp_path, monkeypatch):
+    from mimir_cultivate import forge, repository
+    from tests.test_repo_tools import (
+        _configure_conflict_suites, _conflict_commit_evidence,
+        _local_contained_runner, _test_checkout_factory,
+    )
+
+    origin, scope, state, auth, invoke = _remediation_turn(
+        tmp_path, monkeypatch, conflicting=True, file_tools=True,
+        event_type="pr_mergeability_conflicting", pull_request_author="mimir-bot",
+    )
+    home = tmp_path / "home"
+    _configure_conflict_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE", raising=False)
+    assert invoke("repo_rebase").status == "error"
+    assert invoke("repo_merge").status == "error"
+    assert invoke("repo_unmerged").status == "success"
+    path = state.checkout_lease.path / "tracked.txt"
+    assert invoke("read_file", file_path=str(path)).status == "success"
+    edited = invoke("edit_file", file_path=str(path), old_string=path.read_text(),
+                    new_string="base property\nhead property\n")
+    assert edited.status == "success", edited.content
+    assert invoke("repo_stage", paths=("tracked.txt",)).status == "success"
+    committed = invoke(
+        "repo_commit", paths=("tracked.txt", "base-test", "head-test", "suite"),
+        message="resolve base merge", conflict_evidence=_conflict_commit_evidence(),
+    )
+    assert committed.status == "success", committed.content
+    assert state.interrupted_operation is None
+    assert state.conflict_evidence_head == state.git_expected_head
+    assert invoke("repo_push").status == "error"  # full suites are still required
+    runner = repository.RepoProjectTests
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: runner(
+        state, runner=_local_contained_runner, checkout_factory=_test_checkout_factory,
+    ))
+    tested = invoke("repo_test")
+    assert tested.status == "success", tested.content
+    assert state.full_tested_head == state.git_expected_head
+    pushed = invoke("repo_push")
+    assert pushed.status == "success", pushed.content
+    assert _git(origin, "rev-parse", scope.destination_ref) == state.git_expected_head
+    reports = []
+    from mimir_cultivate.forge import CommentProjection
+
+    class Client:
+        def add_pull_request_comment(self, scope, body):
+            reports.append(("comment", scope.observed_head_sha, body))
+            return CommentProjection("1", "mimir-bot", body, "", "")
+
+        def rerequest_review(self, scope, reviewer):
+            reports.append(("review", scope.observed_head_sha, reviewer))
+
+    monkeypatch.setattr(forge, "_client", lambda _: Client())
+    comment = invoke("pr_comment", body=(
+        "Resolved tracked.txt: preserved base property and head property; "
+        "verified with base-test, head-test and both full suites."
+    ))
+    assert comment.status == "success", comment.content
+    review = invoke("pr_rerequest_review", reviewer="reviewer")
+    assert review.status == "success", review.content
+    assert [report[0] for report in reports] == ["comment", "review"]
+    assert all(report[1] == state.git_expected_head for report in reports)
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+
+
+def test_conflicted_rebase_cannot_continue_and_can_abort(tmp_path, monkeypatch):
     _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
     assert invoke("repo_rebase").status == "error"
-    # Missing resolution evidence is a local refusal, not untrusted ingest.
-    missing = invoke("repo_rebase")
-    assert missing.status == "error" and "conflict_evidence_required" in missing.content
+    refused = invoke("repo_rebase")
+    assert refused.status == "error"
+    assert not _decision(auth, scope, "repo_rebase").allowed
     assert not auth.ifc_state.has_untrusted_active_ingest()
-    evidence = dict(base_property="base property", base_verification="base-test",
-                    head_property="head property", head_verification="head-test")
-    # Git itself refuses --continue while the index is still unmerged.
-    failed = invoke("repo_rebase", **evidence)
-    assert failed.status == "error", failed.content
-    assert not auth.ifc_state.has_untrusted_active_ingest()
-    lease = state.checkout_lease
-    # Operator-provided resolution: this issue deliberately does not grant file
-    # edits or staging while interrupted.
-    (lease.path / "tracked.txt").write_text("base property\nhead property\n")
-    _git(lease.path, "add", "tracked.txt")
-    continued = invoke("repo_rebase", **evidence)
-    assert continued.status == "success", continued.content
+    aborted = invoke("repo_rebase_abort")
+    assert aborted.status == "success", aborted.content
     assert state.interrupted_operation is None
-    assert _git(lease.path, "symbolic-ref", "--short", "HEAD") == scope.head_ref
-    # Success no longer uses interrupted-operation authority. In particular it
-    # does not exempt changed foreign-authored patches from normal IFC labels.
-    assert auth.ifc_state.has_untrusted_active_ingest()
+    assert not auth.ifc_state.has_untrusted_active_ingest()
 
 
 @pytest.mark.parametrize("kind", ["rebase", "merge"])
@@ -939,10 +994,10 @@ def test_interrupted_inspection_classifier_rechecks_live_grant(tmp_path, monkeyp
     assert labels is not None and labels.has_untrusted_active_ingest
 
 
-def test_interrupted_rebase_continue_only_for_conflicting_event(tmp_path, monkeypatch):
+def test_interrupted_rebase_never_continues_on_conflicting_event(tmp_path, monkeypatch):
     _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
     assert invoke("repo_rebase").status == "error"
-    object.__setattr__(scope, "event_type", "pr_mergeability_rebase")
+    object.__setattr__(scope, "event_type", "pr_mergeability_conflicting")
     assert not _decision(auth, scope, "repo_rebase").allowed
     assert _decision(auth, scope, "repo_rebase_abort").allowed
 

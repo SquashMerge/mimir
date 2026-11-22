@@ -159,6 +159,7 @@ from mimir.pollers import (
     bounded_github_author_cause, _github_author_diagnostic_sink,
 )
 from mimir.prompt_safety import sanitize_prompt_field
+from mimir.github_identity import own_conflict_pr_author
 from mimir_cultivate.ci import capture_job_log, clean_log_tail, classify_cancelled_run
 from mimir_cultivate.github_trust import partition, sanitize_login, sanitize_url
 from mimir_cultivate.review_checks import approval_blocker
@@ -787,7 +788,9 @@ class _GhApiBudgetRefused:
 _GH_API_BUDGET_REFUSED = _GhApiBudgetRefused()
 
 
-def _gh_api(endpoint: str, token: str) -> list | dict | None | _GhApiBudgetRefused:
+def _gh_api(
+    endpoint: str, token: str, *, graphql_query: str | None = None,
+) -> list | dict | None | _GhApiBudgetRefused:
     """Call ``gh api <endpoint> --paginate`` and return parsed JSON.
 
     Returns ``None`` on an ordinary API error and a private marker when the tick
@@ -819,8 +822,11 @@ def _gh_api(endpoint: str, token: str) -> list | dict | None | _GhApiBudgetRefus
                 )
                 return _GH_API_BUDGET_REFUSED
             timeout = allowed
+        argv = ["gh", "api", endpoint, "--paginate"]
+        if graphql_query is not None:
+            argv.extend(["-f", f"query={graphql_query}"])
         result = subprocess.run(
-            ["gh", "api", endpoint, "--paginate"],
+            argv,
             capture_output=True, text=True, timeout=timeout, env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -3650,6 +3656,30 @@ def _deliver_pr_ci(
     }
 
 
+def _conflict_pr_queued(repo: str, number: int, head: str, token: str) -> bool | None:
+    """REST mergeability does not expose queue membership; unknown fails closed."""
+    owner, name = repo.split("/", 1)
+    result = _gh_api("graphql", token, graphql_query=(
+        "query { repository(owner: " + json.dumps(owner) + ", name: " + json.dumps(name)
+        + ") { pullRequest(number: " + str(number)
+        + ") { headRefOid mergeQueueEntry { id } } } }"
+    ))
+    if not isinstance(result, dict) or result.get("errors"):
+        return None
+    try:
+        pr = result["data"]["repository"]["pullRequest"]
+        if pr["headRefOid"] != head or "mergeQueueEntry" not in pr:
+            return None
+        entry = pr["mergeQueueEntry"]
+        if entry is None:
+            return False
+        if isinstance(entry, dict) and entry.get("id"):
+            return True
+    except (KeyError, TypeError):
+        pass
+    return None
+
+
 def _check_own_mergeability(
     repo: str,
     token: str,
@@ -3688,7 +3718,7 @@ def _check_own_mergeability(
     reconciled = 0
     prs = _rotate(list(prs), rotate_offset)
     for listed_pr in prs:
-        if (listed_pr.get("user") or {}).get("login") != me:
+        if not own_conflict_pr_author((listed_pr.get("user") or {}).get("login"), me):
             continue
         number = listed_pr.get("number")
         if not isinstance(number, int) or isinstance(number, bool):
@@ -3716,6 +3746,9 @@ def _check_own_mergeability(
         if not head_sha or not base_sha or not isinstance(mergeable, bool):
             if key in prior:
                 new[key] = prior[key]
+            continue
+        author = (pr.get("user") or {}).get("login")
+        if not own_conflict_pr_author(author, me) or (mergeable and author != me):
             continue
         compare = _compare_data(repo, base_sha, head_sha, token)
         if compare is None:
@@ -3747,6 +3780,11 @@ def _check_own_mergeability(
         if blocking:
             # Moving the head could make an unaddressed blocking review appear
             # stale. The changes-requested reconciler owns this PR until cleared.
+            continue
+        if not mergeable and _conflict_pr_queued(repo, number, head_sha, token) is not False:
+            # A queued or unverified PR remains escalation-only.
+            if key in prior:
+                new[key] = prior[key]
             continue
 
         reason = "conflicting" if not mergeable else "behind_base"
@@ -3842,17 +3880,26 @@ def _check_own_mergeability(
             prompt = (
                 f"Your PR #{number} on {repo} conflicts with its declared base "
                 f"{base.get('ref')} at {base_sha}: {title}\n"
-                "Use the scoped PR checkout and repo_rebase to reproduce the conflict, "
+                "Use the scoped PR checkout and repo_merge to merge the declared base into "
+                "the PR branch, "
                 "then collect every path with repo_unmerged. Resolve only when you can "
                 "identify the intended property from both the base and head; prefer "
-                "repo_rebase_abort and escalation over guessing. Stage only the conflict "
-                "paths and call repo_rebase again with the base property, head property, "
-                "and how you verified each so that evidence is recorded in the rebased "
-                "commit. Run repo_test with no selectors for the repository's configured "
-                "full suite; never push if it fails. Then repo_push with the existing lease "
+                "repo_merge_abort and escalation over guessing. Stage the resolved conflict "
+                "paths, then repo_commit listing every staged path, including auto-merged "
+                "files. Supply conflict_evidence for every conflicted path: base property, head property, "
+                "and a verification of each, recorded in the merge commit. Preserve base "
+                "changes: the resulting tree may differ from the merged base only on paths "
+                "already changed by the PR before merging. An outside-path refusal requires "
+                "escalation. Run repo_test with no selectors for the configured default suite "
+                "with both full legs: core and MIMIR_PLUGINS=cultivate, at the merge commit; "
+                "both must pass. Then repo_push with the lease against the observed head "
+                f"{head_sha}. After a successful push, post a PR comment listing every "
+                "conflicted path and how its two-sided intent was resolved and verified, "
                 f"and re-request review from {reviewer_text}. This path only resolves and "
                 "re-requests review: do not merge the PR.\n"
-                f"There is no blocking CHANGES_REQUESTED review. Base: {base_sha}.\n{url}"
+                "Use merge commits, never rebase or history rewriting. Eligibility was "
+                "verified: deployment-owned author, no blocking CHANGES_REQUESTED review, "
+                f"and not in a merge queue. Base: {base_sha}.\n{url}"
             )
             event_type = "pr_mergeability_conflicting"
         _emit(

@@ -2145,9 +2145,7 @@ def test_interrupted_pr_lease_scoped_grants_and_continue(tmp_path, monkeypatch, 
     assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
     for tool_name in ("repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort", "repo_diff", "repo_push", "repo_test", "repo_cleanup", "repo_stage", "repo_rebase"):
         action = RepoPRAction.INSPECT if tool_name != "repo_rebase" else RepoPRAction.WRITE
-        expected = tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"} or (
-            tool_name == "repo_rebase" and event == "pr_mergeability_conflicting"
-        )
+        expected = tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"}
         assert _valid_scoped_pr_grant(auth, "cultivate", action, protocol, scope, state, tool_name=tool_name) is expected
         for enforce in (False, True):
             decision = authorize_repo_pr_tool(
@@ -2159,17 +2157,11 @@ def test_interrupted_pr_lease_scoped_grants_and_continue(tmp_path, monkeypatch, 
             if not expected:
                 assert "repo_rebase_abort" in decision.refusal_detail
     lease = state.checkout_lease
-    if event == "pr_mergeability_conflicting":
-        # Resolution is external; recovery itself only permits continue, not staging.
-        (lease.path / "tracked.txt").write_text("conflicting base\npull request\n")
-        _git(lease.path, "add", "tracked.txt")
-        assert RepoGitTools(state, auth_context=auth).execute(GitRebase(
-            "base", "base check", "head", "head check",
-        )).ok
-        assert lease.interrupted_operation is None
-    else:
-        assert RepoGitTools(state).execute(GitRebaseAbort()).ok
-        assert _valid_scoped_pr_grant(auth, "cultivate", RepoPRAction.INSPECT, protocol, scope, state, tool_name="repo_diff")
+    with pytest.raises(GitRefusal, match="repo_rebase_abort"):
+        RepoGitTools(state, auth_context=auth).execute(GitRebase())
+    assert RepoGitTools(state).execute(GitRebaseAbort()).ok
+    assert lease.interrupted_operation is None
+    assert _valid_scoped_pr_grant(auth, "cultivate", RepoPRAction.INSPECT, protocol, scope, state, tool_name="repo_diff")
     assert RepoGitTools(state).execute(GitDiff()).ok
 
 
@@ -2209,6 +2201,25 @@ def _two_sided_conflict_tools(
     return origin, conflict_scope, state, RepoGitTools(state)
 
 
+def _conflict_commit_evidence():
+    from mimir_cultivate.repository import ConflictResolutionEvidence
+
+    return (ConflictResolutionEvidence(
+        "tracked.txt", "base property", "base-test checks the merged file",
+        "head property", "head-test checks the merged file",
+    ),)
+
+
+def _configure_conflict_suites(home, state):
+    _configure_test_suites(home, state, test_suites=[{
+        "name": "python", "default": True,
+        "legs": [
+            {"name": "core", "command": "./suite"},
+            {"name": "cultivate", "command": "./suite", "env": {"MIMIR_PLUGINS": "cultivate"}},
+        ],
+    }])
+
+
 @pytest.mark.parametrize("dropped_side", ["base", "head"])
 def test_conflict_resolution_dropping_either_test_pinned_side_is_not_pushed(
     tmp_path: Path,
@@ -2218,17 +2229,17 @@ def test_conflict_resolution_dropping_either_test_pinned_side_is_not_pushed(
     origin, scope, state, tools = _two_sided_conflict_tools(tmp_path)
     lease = state.checkout_lease
     with pytest.raises(GitRefusal):
-        tools.execute(GitRebase())
+        tools.execute(GitMerge())
     chosen = "head property\n" if dropped_side == "base" else "base property\n"
     (lease.path / "tracked.txt").write_text(chosen, encoding="utf-8")
     tools.execute(GitStage(("tracked.txt",)))
-    assert tools.execute(GitRebase(
-        "base property", "base-test",
-        "head property", "head-test",
+    assert tools.execute(GitCommit(
+        ("tracked.txt", "base-test", "head-test", "suite"), "resolve merge",
+        _conflict_commit_evidence(),
     )).ok
 
     home = tmp_path / "home"
-    _configure_worklink_test(home, str(lease.path / "suite"))
+    _configure_conflict_suites(home, state)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     result = _execute_project_tests(state)
     assert result.ok is False
@@ -2246,26 +2257,26 @@ def test_conflict_resolution_preserves_both_sides_records_evidence_and_pushes(
     origin, scope, state, tools = _two_sided_conflict_tools(tmp_path)
     lease = state.checkout_lease
     with pytest.raises(GitRefusal):
-        tools.execute(GitRebase())
+        tools.execute(GitMerge())
     (lease.path / "tracked.txt").write_text(
         "base property\nhead property\n", encoding="utf-8",
     )
     tools.execute(GitStage(("tracked.txt",)))
-    assert tools.execute(GitRebase(
-        "base property", "base-test checks the rebased file",
-        "head property", "head-test checks the rebased file",
+    assert tools.execute(GitCommit(
+        ("tracked.txt", "base-test", "head-test", "suite"), "resolve merge",
+        _conflict_commit_evidence(),
     )).ok
     message = _git(lease.path, "log", "-1", "--format=%B")
     assert "Base property: base property" in message
-    assert "Base verification: base-test checks the rebased file" in message
+    assert "Base verification: base-test checks the merged file" in message
     assert "Head property: head property" in message
-    assert "Head verification: head-test checks the rebased file" in message
+    assert "Head verification: head-test checks the merged file" in message
 
     with pytest.raises(GitRefusal) as untested:
         tools.execute(GitPush())
     assert untested.value.code == "full_test_required"
     home = tmp_path / "home"
-    _configure_worklink_test(home, str(lease.path / "suite"))
+    _configure_conflict_suites(home, state)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     assert _execute_project_tests(state).ok
     assert tools.execute(GitPush()).ok

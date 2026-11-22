@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
 
 import pytest
 
@@ -31,9 +33,12 @@ def _pr(*, mergeable: bool | None, number: int = 42) -> dict:
     }
 
 
-def _patch_api(monkeypatch, *, mergeable, behind, reviews=None):
+def _patch_api(monkeypatch, *, mergeable, behind, reviews=None,
+               listed_author="mimir-bot", detail_author="mimir-bot"):
     listed = _pr(mergeable=None)
     detail = _pr(mergeable=mergeable)
+    listed["user"]["login"] = listed_author
+    detail["user"]["login"] = detail_author
 
     def fake_api(endpoint: str, token: str):
         if endpoint.endswith("/pulls/42/reviews"):
@@ -52,6 +57,7 @@ def _patch_api(monkeypatch, *, mergeable, behind, reviews=None):
 @pytest.fixture
 def events(monkeypatch):
     captured = []
+    monkeypatch.setattr(poller, "_conflict_pr_queued", lambda *args: False)
     monkeypatch.setattr(
         poller, "_emit", lambda prompt, **extra: captured.append({"prompt": prompt, **extra}),
     )
@@ -101,6 +107,12 @@ def test_conflict_authorizes_resolution_suite_push_and_review_rerequest(monkeypa
     assert "base property, head property" in event["prompt"]
     assert "repo_test with no selectors" in event["prompt"]
     assert "repo_push" in event["prompt"]
+    assert "repo_merge" in event["prompt"]
+    assert "repo_commit" in event["prompt"]
+    assert "MIMIR_PLUGINS=cultivate" in event["prompt"]
+    assert "post a PR comment listing every" in event["prompt"]
+    assert "conflict_evidence" in event["prompt"]
+    assert "repo_rebase" not in event["prompt"]
     assert "re-request review" in event["prompt"]
     assert "do not merge" in event["prompt"]
 
@@ -213,6 +225,76 @@ def test_conflict_attempts_share_backoff_and_named_exhaustion(monkeypatch, event
         "reason": "conflicting",
         "attempts": cap,
     }]
+
+
+@pytest.mark.parametrize("queued", [True, None])
+def test_conflict_queued_or_unknown_pr_has_no_resolution_authority(monkeypatch, events, queued):
+    _patch_api(monkeypatch, mergeable=False, behind=2)
+    monkeypatch.setattr(poller, "_conflict_pr_queued", lambda *args: queued)
+    count, _ = poller._check_own_mergeability("o/r", "tok", "mimir-bot", {}, now=NOW)
+    assert count == 0 and events == []
+
+
+@pytest.mark.parametrize("where", ["listing", "detail"])
+def test_conflict_ineligible_author_has_no_resolution_authority(monkeypatch, events, where):
+    _patch_api(
+        monkeypatch, mergeable=False, behind=2,
+        listed_author="outsider" if where == "listing" else "mimir-bot",
+        detail_author="outsider" if where == "detail" else "mimir-bot",
+    )
+    count, _ = poller._check_own_mergeability("o/r", "tok", "mimir-bot", {}, now=NOW)
+    assert count == 0 and events == []
+
+
+def test_conflict_worklink_publication_identity_is_eligible(monkeypatch, events):
+    monkeypatch.setenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", "worklink-bot")
+    _patch_api(monkeypatch, mergeable=False, behind=2,
+               listed_author="worklink-bot", detail_author="worklink-bot")
+    count, _ = poller._check_own_mergeability("o/r", "tok", "mimir-bot", {}, now=NOW)
+    assert count == 1 and events[0]["author"] == "worklink-bot"
+
+
+def test_conflict_poller_receives_worklink_publication_identity():
+    manifest = Path(poller.__file__).resolve().parents[1] / "pollers.json"
+    entry = json.loads(manifest.read_text())["pollers"][0]
+    assert "MIMIR_FACTORY_PUBLISHING_IDENTITY" in entry["pass_env"]
+
+
+def test_conflict_backoff_and_gave_up_do_not_restart_same_head(monkeypatch, events):
+    _patch_api(monkeypatch, mergeable=False, behind=2)
+    count, cursor = poller._check_own_mergeability("o/r", "tok", "mimir-bot", {}, now=NOW)
+    assert count == 1
+    events.clear()
+    count, same = poller._check_own_mergeability("o/r", "tok", "mimir-bot", cursor, now=NOW)
+    assert count == 0 and same == cursor and events == []
+    exhausted = {"42": {**cursor["42"], "attempts": poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1}}
+    count, same = poller._check_own_mergeability(
+        "o/r", "tok", "mimir-bot", exhausted, now=NOW + timedelta(hours=2),
+    )
+    assert count == 0 and same == exhausted and events == []
+
+
+@pytest.mark.parametrize("response,expected", [
+    ({"data": {"repository": {"pullRequest": {"headRefOid": HEAD, "mergeQueueEntry": None}}}}, False),
+    ({"data": {"repository": {"pullRequest": {"headRefOid": HEAD, "mergeQueueEntry": {"id": "Q"}}}}}, True),
+    ({"data": {"repository": {"pullRequest": {"headRefOid": BASE, "mergeQueueEntry": None}}}}, None),
+    ({"data": {"repository": {"pullRequest": {"headRefOid": HEAD}}}}, None),
+    ({"errors": [{"message": "denied"}], "data": None}, None),
+    (None, None),
+    ({"data": {"repository": None}}, None),
+    ({"data": {"repository": {"pullRequest": {"headRefOid": HEAD, "mergeQueueEntry": {}}}}}, None),
+])
+def test_conflict_queue_lookup_fails_closed(monkeypatch, response, expected):
+    calls = []
+
+    def api(endpoint, token, **kwargs):
+        calls.append((endpoint, kwargs))
+        return response
+
+    monkeypatch.setattr(poller, "_gh_api", api)
+    assert poller._conflict_pr_queued("o/r", 42, HEAD, "tok") is expected
+    assert calls[0][0] == "graphql"
+    assert "mergeQueueEntry" in calls[0][1]["graphql_query"]
 
 
 def test_attempt_budget_backs_off_then_reports_named_exhaustion(monkeypatch, events):
