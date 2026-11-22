@@ -160,6 +160,7 @@ from mimir.pollers import (
 )
 from mimir.prompt_safety import sanitize_prompt_field
 from mimir_cultivate.ci import capture_job_log, clean_log_tail, classify_cancelled_run
+from mimir_cultivate.forge import ForgeError, GitHubForgeClient
 from mimir_cultivate.github_trust import partition, sanitize_login, sanitize_url
 from mimir_cultivate.review_checks import approval_blocker
 from mimir_cultivate.repository import RepositoryInventory
@@ -3660,6 +3661,20 @@ def _deliver_pr_ci(
     }
 
 
+def _pr_merge_queue_status(repo: str, number: int, token: str) -> bool | None:
+    """Bound the typed queue read by the same hard deadline as REST reads."""
+    budget = _ACTIVE_TICK_BUDGET
+    timeout = budget.call_timeout() if budget is not None else float(GH_API_TIMEOUT_SECONDS)
+    if timeout is None:
+        budget.note_truncation("merge_queue_read_refused", 1)
+        return None
+    try:
+        with _wall_clock_deadline(timeout):
+            return GitHubForgeClient(token=token, timeout=timeout).is_pull_request_queued(repo, number)
+    except (ForgeError, _DeadlineExceeded):
+        return None
+
+
 def _check_own_mergeability(
     repo: str,
     token: str,
@@ -3717,6 +3732,16 @@ def _check_own_mergeability(
         # Listing and detail retrieval are not atomic. Only the live detail
         # response may authorize work if the PR merges between those requests.
         if pr.get("state") != "open" or pr.get("merged") is True or pr.get("merged_at"):
+            continue
+        # The merge queue already rebuilds/tests against the current base and
+        # rejects branch pushes. Do not authorize even a checkout/test turn.
+        # Review requests and operator asks use separate, unaffected paths.
+        queued = _pr_merge_queue_status(repo, number, token)
+        if queued is not False:
+            reason = "in merge queue" if queued is True else "merge queue status unavailable"
+            _eprint(f"Skipping non-review remediation for PR #{number}: {reason}")
+            if key in prior:
+                new[key] = prior[key]
             continue
         head = pr.get("head") or {}
         base = pr.get("base") or {}

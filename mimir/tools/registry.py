@@ -82,6 +82,7 @@ SEND_MESSAGE_SKIPLIST_TRIGGERS: frozenset[str] = frozenset(
         "scheduled_tick",
         # Shell wake-ups use interactive send defaults, but often correctly end silent.
         "shell_job_complete",
+        "repo_test_complete",
         # Session synthesis is internal housekeeping, not a direct user reply.
         "saga_session_end",
         # Upgrade maintenance is framework-originated with no awaiting user.

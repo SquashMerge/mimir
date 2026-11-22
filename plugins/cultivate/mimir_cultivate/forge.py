@@ -131,6 +131,8 @@ class ForgeClient(Protocol):
 
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection: ...
 
+    def is_pull_request_queued(self, repository: str, number: int) -> bool: ...
+
     def list_pull_requests(
         self, repository: str, *, state: str, base: str | None,
         head: str | None, limit: int,
@@ -352,7 +354,7 @@ def confirm_github_identity(principal: str, token: str | None = None) -> str:
 
 
 class GitHubForgeClient:
-    """Construct and execute bounded GitHub REST requests inside the adapter."""
+    """Construct and execute bounded GitHub requests inside the adapter."""
 
     def __init__(
         self,
@@ -646,6 +648,43 @@ class GitHubForgeClient:
     ) -> NormalizedPullRequestSnapshot:
         """Read the PR's identity/ref snapshot without projecting PR text."""
         return self.get_pull_request_snapshot(repository, number)
+
+    def is_pull_request_queued(self, repository: str, number: int) -> bool:
+        """Read queue membership; only an explicit null entry means unqueued."""
+        if (
+            _REPOSITORY.fullmatch(repository) is None
+            or type(number) is not int
+            or number < 1
+        ):
+            raise ForgeError("invalid pull-request selector")
+        owner, name = repository.split("/")
+        response = self._request("POST", "/graphql", body={
+            "query": (
+                "query($owner: String!, $name: String!, $number: Int!) {"
+                " repository(owner: $owner, name: $name) {"
+                " pullRequest(number: $number) { number mergeQueueEntry { id } } } }"
+            ),
+            "variables": {"owner": owner, "name": name, "number": number},
+        })
+        diagnostic = "forge returned unavailable merge-queue metadata"
+        if not isinstance(response, Mapping) or response.get("errors"):
+            raise ForgeError(diagnostic)
+        data = response.get("data")
+        repo = data.get("repository") if isinstance(data, Mapping) else None
+        pr = repo.get("pullRequest") if isinstance(repo, Mapping) else None
+        if (
+            not isinstance(pr, Mapping)
+            or type(pr.get("number")) is not int
+            or pr["number"] != number
+            or "mergeQueueEntry" not in pr
+        ):
+            raise ForgeError(diagnostic)
+        entry = pr["mergeQueueEntry"]
+        if entry is None:
+            return False
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("id"), str) or not entry["id"]:
+            raise ForgeError(diagnostic)
+        return True
 
     def author_is_trusted(self, repository: str, author: str) -> bool | None:
         """Share poller collaborator/org attestation, not payload trust claims."""

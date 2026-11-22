@@ -383,7 +383,10 @@ outcome, and taint source domains without logging option values.
 | `MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD` | int | `5` | Confirmations required before acting on a 7d quota anomaly. |
 | `MIMIR_WATCHDOG_WEBHOOK_URL` | str | unset | Out-of-band webhook the watchdog POSTs `{"text": ...}` to on liveness down/recovered. |
 | `NTFY_TOPIC` | str | unset | ntfy.sh topic for watchdog alerts (alternative sink). |
-| `MIMIR_POLLER_ENV_ALLOWLIST` | csv-list | `""` | Extra env-var names (beyond the builtin allowlist) forwarded into poller subprocess environments. |
+| `MIMIR_POLLER_ENV_ALLOWLIST` | csv-list | `""` | Extra env-var names (beyond the builtin allowlist) forwarded into poller subprocess environments; does not bypass secret-name or `MIMIR_` denies. |
+| `MIMIR_HEAVY_LOCK_FILE` | path | unset (no lease) | Shared heavy-run lease path, implicitly forwarded to pollers so detached Worklink runs retain it. Worklink requires a normalized absolute path outside `/home/mimir`; malformed settings fail closed before worker/gate/session environment construction. Empty disables the lease. |
+| `MIMIR_HEAVY_LOCK_TIMEOUT` | int | unset (`heavy_run.sh` uses `7200`) | Total lease queue-and-run budget in seconds. Implicitly forwarded to pollers; Worklink validates ASCII digits in `60..86400` and carries it to workers only with a configured lease path. |
+| `MIMIR_HEAVY_TIER` | enum | unset (`large`) | Lease tier, `medium` or `large`. Implicitly forwarded to pollers; Worklink validates and carries it to workers only with a configured lease path. These three exact non-credential names are the only implicit exception to the poller `MIMIR_` deny; explicit manifest forwarding and framework-injected names are unchanged. |
 
 ### Codex quota-pause recovery
 

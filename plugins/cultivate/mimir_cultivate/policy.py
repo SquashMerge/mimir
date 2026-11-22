@@ -706,6 +706,7 @@ def _valid_interrupted_operation(scope, state, tool_name, turn_nonce, *, interru
     allowed = {
         "repo_status", "repo_unmerged", "unsupported_operation",
         "pr_metadata", "pr_comments", "pr_reviews", "pr_comment",
+        "ls", "read_file", "glob", "grep",
     }
     if evidence.kind == "rebase":
         allowed.add("repo_rebase_abort")

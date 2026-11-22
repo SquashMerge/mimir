@@ -26,7 +26,7 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2193-private-draft-archival"
+GITHUB_POLLER_RELEASE = "2193-private-draft-archival-main-merged"
 CI_WATCH_RELEASE = "2193-private-draft-archival"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.

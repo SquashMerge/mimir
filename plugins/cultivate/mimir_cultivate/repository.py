@@ -5500,6 +5500,8 @@ class RepoProjectTests:
 
     async def execute(
         self, selectors: tuple[str, ...] = (), *, suite: str | None = None,
+        record_evidence: bool = True,
+        job_checkpoint: Callable[..., None] | None = None,
     ) -> ProjectTestResult:
         scope = (
             self._state.action_scope
@@ -5694,6 +5696,13 @@ class RepoProjectTests:
         leg_summaries: list[dict[str, object]] = []
         deadline: float | None = None
         try:
+            if job_checkpoint is not None:
+                metadata = checkout.path.stat()
+                job_checkpoint(snapshot={
+                    "path": str(checkout.path), "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "head_sha": self._state.git_expected_head if self._state is not None else None,
+                })
             for leg, paths, prepared_leg in zip(legs, paths_by_leg, prepared):
                 (command, environment, identifier, stdout_path, stderr_path,
                  stdout_relative, stderr_relative) = prepared_leg
@@ -5721,6 +5730,8 @@ class RepoProjectTests:
                                     + 2 * _LEASE_KILL_GRACE_SECONDS
                                 )
                             launched = time.monotonic()
+                            if job_checkpoint is not None:
+                                job_checkpoint(worker=identifier)
                             result = await self._runner(
                                 argv, checkout.capability, environment, (),
                                 identifier=identifier, timeout_s=wait_timeout,
@@ -5774,6 +5785,9 @@ class RepoProjectTests:
                         "name": leg.name, "returncode": result.exit_code,
                         "timed_out": result.timed_out, "output_limited": result.output_overflow,
                         "pytest_summary": _pytest_terminal_summary(result.stdout),
+                        "failing_node_ids": (
+                            pytest_failure_summary(result.stdout, node_inventory) or {}
+                        ).get("failing", [])[:_RETURN_FAILING_NODES],
                         "stdout": _safe_output(result.stdout, scrubber, _RETURN_STDOUT_CHARS)[0],
                         "stderr": _safe_stderr_output(result.stderr, scrubber, _RETURN_STDERR_CHARS)[0],
                     })
@@ -5847,7 +5861,7 @@ class RepoProjectTests:
                 failure_summary=(failure_summary if code == "tests_failed" else None),
             )
         # A non-default suite must not satisfy the existing default-test push gate.
-        if not retained and not selectors and is_default:
+        if record_evidence and not retained and not selectors and is_default:
             assert self._state is not None
             head = self._state.git_expected_head
             if head is None:
@@ -6630,6 +6644,148 @@ async def _repo_test_unlocked(
         ) from exc
 
 
+async def recover_repo_test_job(record: dict[str, Any]) -> None:
+    """Retire every recorded executor identity before reporting interruption."""
+    from .worklink.worker_client import WorkerClient
+
+    client = WorkerClient(None)
+    for identifier in record["workers"]:
+        try:
+            await client.cancel(identifier)
+        except RuntimeError as exc:
+            # Executor restarts/eviction forget retired identities. This exact
+            # response confirms there is no live worker with that identity;
+            # transport/protocol/cleanup failures must remain retryable.
+            if str(exc) != "unknown worker id":
+                raise
+
+
+def _repo_test_head_matches(
+    state: RepoReviewState, head: str, live_head: str | None, snapshot_head: str | None,
+) -> bool:
+    """No live observation, changed scope, local head, or superseded event is evidence."""
+    scope = state.action_scope
+    return (
+        live_head == head
+        and scope.observed_head_sha == head
+        and state.git_expected_head == head
+        and snapshot_head == head
+        and not was_superseded_by_own_push(scope.canonical_repo, scope.pr_number, head)
+    )
+
+
+async def _queue_repo_test(
+    registry: Any, runtime: Any, state: RepoReviewState | RetainedFactoryScope,
+    selectors: tuple[str, ...], suite: str | None,
+) -> dict[str, Any]:
+    from mimir._context import get_current_turn, is_same_turn_auth_carrier
+    from .forge import _client, _live_pr_head
+
+    retained = isinstance(state, RetainedFactoryScope)
+    scope = state if retained else state.action_scope
+    git_tools = (RepoGitTools(retained_scope=scope, runner=retained_factory_git_runner)
+                 if retained else RepoGitTools(state))
+    root = git_tools.validated_checkout_root()
+    repository = scope.repository if retained else scope.canonical_repo
+    pull_request = scope.issue_id if retained else scope.pr_number
+    _, _, _, suite_name, is_default = _configured_command(
+        repository, selectors, suite, root,
+    )
+    selected = _validated_selectors(root, selectors, suite=suite_name)
+    auth = runtime.context
+    ctx = get_current_turn()
+    if is_same_turn_auth_carrier(ctx, auth):
+        auth = ctx.auth_with_plugin_state()
+    head = (git_tools._command(("rev-parse", "--verify", "HEAD")).stdout.strip()
+            if retained else scope.observed_head_sha)
+    # Publish the same attested repository provenance as the synchronous tool.
+    # Inherited labels are monotonic; the result source is joined below rather
+    # than attempting to reuse the spawning tool call's output collector.
+    from mimir.access_control import pr_checkout_lease_attestation
+
+    labels = auth.ifc_state.current(auth.ifc_labels)
+    attestation = (None if retained else
+                   pr_checkout_lease_attestation(auth, scope, state.checkout_lease))
+    principal = auth.canonical_principal
+    if auth.is_service and principal:
+        principal = f"service:{principal}"
+    source = SourceLabel(
+        principal=principal, domain="repository",
+        resource_id=(f"{repository}#issue/{pull_request}@retained/{scope.scope_id}" if retained else
+                     f"{repository}#pull/{pull_request}@{head}"),
+        bridge_instance="worklink" if retained else "forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}) if principal else frozenset(),
+        source_kind="protected_tool",
+        integrity="trusted" if retained or attestation.ok else "untrusted",
+        integrity_effect="active_ingest",
+    )
+    labels = labels.with_source(source)
+
+    async def run(job: Any) -> dict[str, Any]:
+        stack = ExitStack()
+
+        def checkpoint(**updates: Any) -> None:
+            worker = updates.pop("worker", None)
+            if worker is not None:
+                updates["workers"] = [*job.record["workers"], worker]
+            registry.save(job, **updates)
+            if "snapshot" in updates:
+                # The disposable snapshot is now independent of the mutable
+                # checkout. Never hold its root flock across the heavy queue:
+                # another turn's synchronous lease acquisition could deadlock
+                # the event loop.
+                stack.close()
+
+        # Use the frozen scoped carrier, not whatever channel is currently active.
+        # The contained runner owns cancellation/reaping and snapshot disposal.
+        with stack:
+            if retained:
+                from .worklink.retained_scope import retained_factory_effect_lease
+
+                lease = stack.enter_context(retained_factory_effect_lease(
+                    Path(os.environ["MIMIR_HOME"]), scope,
+                ))
+                if lease.scope is None:
+                    raise ToolPolicyRefusal("retained repository test scope expired")
+                executor = RepoProjectTests(retained_scope=scope)
+            else:
+                stack.enter_context(hold_pr_checkout_lease(state.checkout_lease))
+                executor = RepoProjectTests(state)
+            result = asdict(await executor.execute(
+                selected, suite=suite_name, record_evidence=False,
+                job_checkpoint=checkpoint,
+            ))
+        result.pop("failure_summary", None)
+        if retained:
+            result["evidence"] = False
+            return result
+        try:
+            live_head = await asyncio.to_thread(_live_pr_head, _client(scope), scope)
+        except Exception:
+            live_head = None
+        snapshot_head = (job.record.get("snapshot") or {}).get("head_sha")
+        if not _repo_test_head_matches(state, head, live_head, snapshot_head):
+            result.update(stale=True, evidence=False, message="stale: head moved")
+        else:
+            result["evidence"] = True
+            if result["ok"] and not selected and is_default:
+                try:
+                    state.record_full_test(scope.scope_id, head)
+                except ValueError:
+                    # Test completion is still useful after a checkout grant
+                    # expires, but cannot renew that grant or satisfy its gate.
+                    result.update(evidence=False, message="informational: starting checkout lease expired")
+        return result
+
+    return registry.enqueue(
+        repository=repository, pull_request=pull_request,
+        head_sha=head, suite=suite_name, selectors=selected,
+        channel_id=auth.channel_id,
+        starting_turn_id=getattr(ctx, "turn_id", None),
+        auth=auth, labels=labels, run=run,
+    )
+
+
 @tool
 async def repo_test(
     repository: str,
@@ -6650,13 +6806,31 @@ async def repo_test(
     ``suite`` explicitly. Declared names come from that repository's
     ``test_suites`` in ``$MIMIR_HOME/repositories.yaml``. A single/default suite
     needs no ``suite``; legacy selector-based inference remains supported.
+    With a heavy-run lease and an agent channel, tests run in the background.
+    A ``repo_test_complete`` turn delivers the bounded result (or folds it into
+    this turn if still running). Comment that tests are queued, if appropriate,
+    then end the turn; do not poll or queue another run.
     """
     retained = _retained_scope(runtime, repository, pull_request)
+    from mimir.repo_test_jobs import get_registry
+
+    auth = getattr(runtime, "context", None)
+    asynchronous = isinstance(auth, AuthContext) and auth.channel_id and heavy_lock_environment()
     if retained is not None:
+        if asynchronous:
+            registry = get_registry()
+            if registry is None:
+                raise ToolPolicyRefusal("project test rejected: background job registry unavailable")
+            return await _queue_repo_test(registry, runtime, retained, selectors, suite)
         return await _repo_test_unlocked(
             repository, pull_request, selectors, runtime, suite, include_output,
         )
     state = _state(runtime, repository, pull_request)
+    if asynchronous:
+        registry = get_registry()
+        if registry is None:
+            raise ToolPolicyRefusal("project test rejected: background job registry unavailable")
+        return await _queue_repo_test(registry, runtime, state, selectors, suite)
     lease = getattr(state, "checkout_lease", None)
     if not isinstance(lease, PRCheckoutLease) or not lease.is_active:
         return await _repo_test_unlocked(

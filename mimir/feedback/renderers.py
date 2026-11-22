@@ -476,7 +476,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"expected {expected}; action={action}. Check /mimir-home branch "
             f"and upstream before trusting tracked-state sync."
         )
-    if rule_kind == "shell_job_complete_enqueue_failed":
+    if rule_kind in {"shell_job_complete_enqueue_failed", "repo_test_complete_enqueue_failed"}:
         job_id = ev.get("job_id") or "?"
         err = _sanitize_field(ev.get("error") or "(no detail)")
         return (
@@ -501,7 +501,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return "git pull --ff-only succeeded"
     if rule_kind == "git_fetch_ok":
         return "git fetch succeeded"
-    if rule_kind == "shell_job_complete_enqueue_ok":
+    if rule_kind in {"shell_job_complete_enqueue_ok", "repo_test_complete_enqueue_ok"}:
         job_id = ev.get("job_id") or "?"
         return f"shell job {job_id} wake-up enqueued"
     if rule_kind == "discord_bridge_retry":
