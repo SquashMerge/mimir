@@ -266,3 +266,46 @@ async def test_repo_test_completion_routes_or_folds_with_scope_and_labels(monkey
         assert _shell_continuation_auth_context(replace(event, channel_id="other")) is None
     finally:
         mti.deactivate(auth.channel_id)
+
+
+@pytest.mark.parametrize("case", ["trusted", "tainted_start", "no_continuation", "shell", "http"])
+def test_repo_test_completion_inherits_queueing_turn_integrity(case):
+    """A completion turn is as trusted as the turn that queued its tests.
+
+    Without this, the completion's channel source was always untrusted active
+    ingest, so the repo_test_complete turn could never check out, comment or
+    push, however clean the queueing turn and the attested lease were.
+    """
+    from mimir.access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
+    from mimir.agent import _initialize_ifc_labels
+
+    auth = auth_context()
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="alice", domain="repository", resource_id="o/r#pull/9@" + "a" * 40,
+        bridge_instance="forge", sensitivity="internal", integrity="trusted",
+        integrity_effect="active_ingest",
+    ))
+    if case == "tainted_start":
+        labels = labels.with_source(SourceLabel(
+            principal="outside", domain="web", resource_id="untrusted-instruction",
+            bridge_instance="web", sensitivity="public", integrity="untrusted",
+            integrity_effect="active_ingest",
+        ))
+    extra = {"job_id": "rt_one", "starting_turn_id": "turn-1", "status": "completed"}
+    if case == "http":
+        extra[HTTP_EVENT_INGRESS_EXTRA_KEY] = {"route": "/events"}
+    event = AgentEvent(
+        trigger="shell_job_complete" if case == "shell" else "repo_test_complete",
+        channel_id=auth.channel_id, source="system", content='{"ok": true}', extra=extra,
+        continuation_auth_context=None if case == "no_continuation" else auth,
+        ifc_labels=labels,
+    )
+    result = _initialize_ifc_labels(event)
+    tainted = any(source.has_untrusted_active_ingest for source in result.sources)
+    assert tainted is (case != "trusted"), [
+        (s.domain, s.resource_id, s.integrity, s.integrity_effect) for s in result.sources
+    ]
+    # The completion's own ingress source, separate from the inherited labels:
+    # it is vouched for only when nothing the queueing turn carried was tainted.
+    [ingress] = [source for source in result.sources if source not in labels.sources]
+    assert ingress.integrity == ("trusted" if case == "trusted" else "untrusted")
