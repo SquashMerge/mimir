@@ -824,6 +824,47 @@ class InterruptedCheckoutRefusal(RuntimeError):
     """A retained checkout needs recovery but cannot be safely admitted."""
 
 
+class DirtyPRCheckoutLeaseRefusal(RuntimeError):
+    """Prior-turn drafts remain intact and require operator disposition."""
+
+    def __init__(self, lease: PRCheckoutLease) -> None:
+        prior = lease.last_turn_id or "unknown (legacy lease)"
+        self.signal = {
+            "status": "attestation_refused",
+            "reason": "dirty_lease_from_prior_turn",
+            "prior_turn_id": lease.last_turn_id,
+            "path": str(lease.path),
+            "mutation_allowed": False,
+            "disposition": "operator_required",
+            "message": (
+                f"dirty lease from prior turn {prior}; edits are preserved in place. "
+                "An operator must preserve or discard the draft and clean the lease "
+                "before checkout can be admitted. Report this refusal; leave the PR unchanged."
+            ),
+        }
+        super().__init__(self.signal["message"])
+
+
+def _lease_turn_id() -> str | None:
+    from mimir._context import get_current_turn
+
+    turn = get_current_turn()
+    return turn.turn_id if turn is not None else None
+
+
+def _refuse_prior_turn_draft(lease: PRCheckoutLease, runner: Runner) -> None:
+    current = _lease_turn_id()
+    if current is not None and lease.last_turn_id == current:
+        return
+    status = _run(
+        runner,
+        ["git", "-C", str(lease.path), "status", "--porcelain=v1", "--untracked-files=all"],
+        "prior-turn PR checkout status inspection failed",
+    )
+    if status:
+        raise DirtyPRCheckoutLeaseRefusal(lease)
+
+
 def _retained_branch(path: Path, runner: Runner) -> str:
     try:
         return _run(runner, ["git", "-C", str(path), "symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -856,6 +897,7 @@ class PRCheckoutLease:
     verified_base_sha: str | None = None
     # Turn-local recovery authority, never reconstructed from lease metadata.
     interrupted_operation: InterruptedGitOperation | None = None
+    last_turn_id: str | None = None
 
     def recovery_checkout_state(self, scope: RepoPRActionScope) -> tuple[str, str] | None:
         return recovery_checkout_state(self, scope)
@@ -1051,6 +1093,7 @@ def _metadata(lease: PRCheckoutLease) -> dict[str, object]:
         "pr_number": lease.pr_number,
         "lineage": lease.lineage,
         "verified_base_sha": lease.verified_base_sha,
+        "last_turn_id": lease.last_turn_id,
     }
 
 
@@ -1220,6 +1263,7 @@ def create_pr_checkout_lease(
             )
         lease = PRCheckoutLease(
             canonical_repo=scope.canonical_repo,
+            last_turn_id=_lease_turn_id(),
             canonical_origin=scope.canonical_origin,
             source_root=source,
             scope_base_sha=scoped_base,
@@ -1361,12 +1405,14 @@ def _recover_pr_checkout_lease_unlocked(
             pr_number=scope.pr_number,
             lineage=_recorded_lineage(raw),
             verified_base_sha=_recorded_verified_base(raw),
+            last_turn_id=raw.get("last_turn_id") if isinstance(raw.get("last_turn_id"), str) else None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("PR checkout lease recovery metadata is invalid") from exc
     expired = datetime.now(UTC) >= lease.expires_at
     if (lease.revoked or not path.is_dir() or expired) and not (expired and renew_expired):
         raise RuntimeError("PR checkout lease is expired")
+    _refuse_prior_turn_draft(lease, runner)
     head = _run(
         runner, ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
         "recovered PR checkout has no HEAD",
@@ -1416,6 +1462,7 @@ def _recover_pr_checkout_lease_unlocked(
         lease, expires_at=datetime.now(UTC) + ttl,
         recovery_id=uuid.uuid4().hex,
         interrupted_operation=interrupted,
+        last_turn_id=_lease_turn_id(),
     )
     _attest_resume_candidate(lease, scope, head, review_state, attest_resume, prior=prior)
     try:
@@ -1468,6 +1515,7 @@ def _lease_from_recorded_metadata(path: Path, root: Path) -> PRCheckoutLease:
             pr_number=int(raw.get("pr_number", 0)),
             lineage=_recorded_lineage(raw),
             verified_base_sha=_recorded_verified_base(raw),
+            last_turn_id=raw.get("last_turn_id") if isinstance(raw.get("last_turn_id"), str) else None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("PR checkout lease reclamation metadata is invalid") from exc
@@ -2183,6 +2231,7 @@ def _rebind_foreign_candidate(
     attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> PRCheckoutLease:
     """Move a proven same-PR lease onto the current immutable turn scope."""
+    _refuse_prior_turn_draft(lease, runner)
     interrupted = interrupted_pr_checkout(lease, scope, runner=runner)
     _run(
         runner,
@@ -2249,6 +2298,7 @@ def _rebind_foreign_candidate(
         lineage=lease.lineage,
         verified_base_sha=actual_base,
         interrupted_operation=interrupted,
+        last_turn_id=_lease_turn_id(),
     )
     _attest_resume_candidate(rebound, scope, head, review_state, attest_resume, prior=lease)
     metadata_path = lease.path / _METADATA
@@ -2521,6 +2571,8 @@ def acquire_pr_checkout_lease(
                     )
                 )
             )
+            # Inspect before any recovery, rebind, expiry renewal or divergent
+            # cleanup can turn another turn's draft into this turn's authority.
             if (path / _RECLAMATION_METADATA).exists():
                 if raw.get("scope_id") == scope.scope_id or same_pr:
                     _report_retained_candidates(
@@ -2535,6 +2587,7 @@ def acquire_pr_checkout_lease(
                         "pr_checkout_lease_retained", scope, [(path, "<unverifiable>")],
                     )
                     continue
+                _refuse_prior_turn_draft(_lease_from_recorded_metadata(path, root), runner)
             if raw.get("scope_id") == scope.scope_id:
                 paths.append(path)
                 continue
@@ -3120,6 +3173,8 @@ class GitStatus:
 class GitDiff:
     mode: Literal["working", "staged", "base"] = "working"
     paths: tuple[str, ...] = ()
+    failing_test: str | None = None
+    imported_modules: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4048,6 +4103,33 @@ class RepoGitTools:
             paths = _validated_paths(operation.paths, required=False)
             if operation.mode not in {"working", "staged", "base"}:
                 raise GitRefusal("invalid_shape", "unsupported diff mode")
+            if operation.failing_test is not None:
+                if operation.mode != "base" or self._retained:
+                    raise GitRefusal("invalid_shape", "CI failure classification requires a PR base diff")
+                evidence = _validated_paths(
+                    (operation.failing_test, *operation.imported_modules), required=True,
+                )
+                # Use the published immutable PR diff, not local drafts, an
+                # optional path filter, or commits produced during remediation.
+                changed = self._checked((
+                    "diff", "--name-only", "-z", "--no-renames",
+                    f"{self._scope.observed_base_sha}...{self._scope.observed_head_sha}", "--",
+                )).stdout.split("\0")
+                related = bool(set(evidence).intersection(changed))
+                decision = {
+                    "action": "remediate" if related else "report",
+                    "edit_allowed": related,
+                    "matched_paths": sorted(set(evidence).intersection(changed)),
+                    "guidance": (
+                        "Remediate the related failure, verify, and push with a lease."
+                        if related else
+                        "Report the unrelated failure with pr_comment or operator escalation; leave the PR unchanged."
+                    ),
+                }
+                return GitOperationResult(
+                    True, "ci_failure_related" if related else "ci_failure_unrelated",
+                    json.dumps(decision, sort_keys=True),
+                )
             revisions: tuple[str, ...] = ()
             if operation.mode == "staged":
                 revisions = ("--cached",)
@@ -6018,7 +6100,14 @@ def repo_checkout(
     pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Create the exact checkout lease bound to this turn's immutable PR scope."""
+    """Create the exact checkout lease bound to this turn's immutable PR scope.
+
+    A dirty_lease_from_prior_turn refusal preserves drafts and requires operator
+    disposition before mutation. After checkout, classify CI failures using
+    repo_diff(mode='base', failing_test=..., imported_modules=...). Remediate
+    failures related to the PR's changed paths; report unrelated failures with
+    pr_comment or operator escalation and leave the PR unchanged.
+    """
     if _retained_scope(runtime, repository, pull_request) is not None:
         raise _retained_refusal("repo_checkout")
     return checkout_scoped_pr(repository, pull_request, runtime)
@@ -6143,6 +6232,24 @@ def checkout_scoped_pr(
             # Tool and framework resumes share the no-renewal-on-refusal rule.
             attest_resume=attest_resume,
         )
+    except DirtyPRCheckoutLeaseRefusal as exc:
+        if context is not None and context.ifc_state is not None:
+            context.ifc_state.framework_pr_checkouts.pop(scope.scope_id, None)
+        if state.checkout_lease is not None:
+            attached = state.checkout_lease
+            attached.revoke()
+            state.revoke_checkout_lease(attached)
+        _report_retained_candidates(
+            "pr_checkout_dirty_lease_from_prior_turn", scope, [],
+            **exc.signal,
+        )
+        return {
+            **exc.signal,
+            # The host consumes the existing generic admission reason; opaque
+            # provider details carry the structured draft signal to the model.
+            "reason": "checkout_state_mismatch",
+            "details": exc.signal,
+        }
     except LeaseAttestationRefusal as exc:
         from mimir.access_control import log_pr_checkout_lease_attestation_refused
 
@@ -6459,14 +6566,27 @@ def repo_diff(
     mode: Literal["working", "staged", "base"] = "working",
     paths: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+    failing_test: str | None = None,
+    imported_modules: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Read a bounded working, staged, or base diff from the bound checkout.
 
     On a retained Worklink remediation turn, ``repository`` is the retained
     run's repository and ``pull_request`` is the incident's Chainlink issue id;
     retained scopes do not support ``mode='base'``.
+
+    Before CI remediation, classify with mode='base', failing_test=<test path>
+    and imported_modules=<repo-relative module paths imported by that test>.
+    Remediate when the failing test or an imported module is in the published
+    PR's changed paths. When both are outside those paths, report the unrelated
+    failure using pr_comment or operator escalation and leave the PR unchanged.
+    Unknown or insufficient evidence calls for reporting, not a speculative edit.
+    Classification returns action and edit_allowed in stdout JSON.
     """
-    return _execute(runtime, repository, pull_request, GitDiff(mode, paths))
+    return _execute(
+        runtime, repository, pull_request,
+        GitDiff(mode, paths, failing_test, imported_modules),
+    )
 
 
 @tool

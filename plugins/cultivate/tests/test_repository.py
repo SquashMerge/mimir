@@ -55,6 +55,136 @@ def test_git_fetch_transport_failures_are_typed(args, stderr, transport) -> None
     assert isinstance(raised.value, repository.GitTransportError) is transport
 
 
+@pytest.mark.parametrize("test_path,modules,action", [
+    ("tests/test_viability.py", ("mimir/viability.py",), "report"),
+    ("tracked.txt", ("mimir/viability.py",), "remediate"),
+    ("tests/test_viability.py", ("tracked.txt",), "remediate"),
+])
+def test_ci_failure_scope_reports_unrelated_and_remediates_related(
+    tmp_path, test_path, modules, action,
+):
+    _, _, scope, state = _repo_scope_and_state(tmp_path, event_type="pr_ci_failure")
+    lease = state.checkout_lease
+    # A local draft cannot manufacture relevance; nor can a path filter hide it.
+    (lease.path / "tests").mkdir()
+    (lease.path / "tests/test_viability.py").write_text("unrelated draft\n")
+    before = _git(lease.path, "status", "--porcelain=v1")
+    from mimir.plugins.core import policy_scope
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        result = repository.RepoGitTools(state).execute(
+            repository.GitDiff("base", ("not-in-pr.txt",), test_path, modules),
+        )
+    assert result.ok
+    decision = json.loads(result.stdout)
+    assert decision["action"] == action
+    assert decision["edit_allowed"] is (action == "remediate")
+    assert result.code == ("ci_failure_related" if action == "remediate" else "ci_failure_unrelated")
+    if action == "report":
+        assert "pr_comment or operator escalation" in decision["guidance"]
+        assert "leave the PR unchanged" in decision["guidance"]
+    assert _git(lease.path, "status", "--porcelain=v1") == before
+
+
+@pytest.mark.parametrize("dirty_kind", ["tracked", "staged", "untracked", "legacy", "no_context"])
+@pytest.mark.parametrize("entry", ["acquire", "recover"])
+def test_prior_turn_dirty_lease_refused_and_signalled(tmp_path, monkeypatch, dirty_kind, entry):
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "prior-turn-2193")
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    metadata = lease.path / repository._METADATA
+    if dirty_kind in {"legacy", "no_context"}:
+        raw = json.loads(metadata.read_text())
+        raw.pop("last_turn_id")
+        metadata.write_text(json.dumps(raw))
+    path = lease.path / ("draft.txt" if dirty_kind in {"untracked", "legacy"} else "tracked.txt")
+    path.write_text("abandoned draft\n")
+    if dirty_kind == "staged":
+        _git(lease.path, "add", "tracked.txt")
+    before = metadata.read_bytes()
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "next-turn-2193")
+    if dirty_kind == "no_context":
+        monkeypatch.setattr(repository, "_lease_turn_id", lambda: None)
+    run = lambda args: subprocess.run(
+        args, capture_output=True, text=True, env=_fixture_git_env(),
+    )
+    with pytest.raises(repository.DirtyPRCheckoutLeaseRefusal) as caught:
+        if entry == "acquire":
+            repository.acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=lease.lease_root, runner=run,
+            )
+        else:
+            repository.recover_pr_checkout_lease(
+                lease.path, scope, owner=scope.principal, lease_root=lease.lease_root, runner=run,
+            )
+    signal = caught.value.signal
+    assert signal["reason"] == "dirty_lease_from_prior_turn"
+    assert signal["prior_turn_id"] == (
+        None if dirty_kind in {"legacy", "no_context"} else "prior-turn-2193"
+    )
+    assert signal["mutation_allowed"] is False
+    assert signal["disposition"] == "operator_required"
+    assert signal["path"] == str(lease.path)
+    assert "dirty lease from prior turn" in signal["message"]
+    assert path.read_text() == "abandoned draft\n"
+    assert metadata.read_bytes() == before  # no renewal or authority attachment
+
+
+@pytest.mark.parametrize("same_turn", [False, True])
+def test_clean_prior_lease_and_same_turn_draft_unaffected(tmp_path, monkeypatch, same_turn):
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "first-turn")
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    if same_turn:
+        (lease.path / "tracked.txt").write_text("active draft\n")
+    else:
+        monkeypatch.setattr(repository, "_lease_turn_id", lambda: "second-turn")
+    resumed, _ = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        runner=lambda args: subprocess.run(args, capture_output=True, text=True, env=_fixture_git_env()),
+    )
+    assert resumed.path == lease.path
+    assert resumed.last_turn_id == ("first-turn" if same_turn else "second-turn")
+
+
+@pytest.mark.parametrize("pre_turn", [False, True])
+def test_dirty_lease_signal_reaches_checkout_and_model(tmp_path, monkeypatch, pre_turn):
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+    from mimir_cultivate import forge
+
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "abandoned-turn-2193")
+    _, _, scope, old_state = _repo_scope_and_state(tmp_path)
+    lease = old_state.checkout_lease
+    (lease.path / "draft.txt").write_text("retain this draft\n")
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "next-turn-2193")
+    state = RepoReviewState(scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    auth = replace(
+        _untainted_ifc_auth(), repo_review_state=state, repo_pr_action_scope=scope,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    result = repository.checkout_scoped_pr(
+        scope.canonical_repo, scope.pr_number,
+        SimpleNamespace(context=auth, pre_turn_checkout=pre_turn),
+    )
+    assert result["status"] == "attestation_refused"
+    assert result["reason"] == "checkout_state_mismatch"
+    assert result["details"]["prior_turn_id"] == "abandoned-turn-2193"
+    assert result["details"]["mutation_allowed"] is False
+    assert state.checkout_lease is None
+    prompt = build_turn_prompt(
+        AgentEvent(trigger="poller", channel_id="test", content="CI failed"),
+        prechecked_pr_refusals=[{
+            "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+            "reason": result["reason"], "details": result["details"],
+        }],
+    )
+    assert "dirty_lease_from_prior_turn" in prompt
+    assert "abandoned-turn-2193" in prompt
+    assert "operator_required" in prompt
+
+
 def test_repository_implementation_is_owned_by_provider() -> None:
     root = Path(__file__).resolve().parents[3] / "mimir"
     for retired in (
@@ -1054,6 +1184,7 @@ def test_repo_rebase_records_unpublished_replay_and_next_turn_discards_it(
 def test_dirty_equivalent_checkout_is_preserved_not_discarded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "active-recovery-turn")
     _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
     (lease.path / "draft.txt").write_text("working tree draft\n")
     events = []
@@ -1199,6 +1330,7 @@ def test_behind_head_with_untracked_file_recovers_empty_incremental_bundle(
     import shutil
     import tarfile
 
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "active-recovery-turn")
     source, original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
     replay = _git(lease.path, "rev-parse", "HEAD")
     reflog_commits = [replay]
@@ -1451,6 +1583,7 @@ def test_preserved_notice_reaches_real_checkout_result(tmp_path: Path, monkeypat
     from mimir.plugins.core import policy_scope
     from langgraph.prebuilt import ToolRuntime
 
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "active-recovery-turn")
     _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
     (lease.path / "draft.txt").write_text("recover me\n")
     state = RepoReviewState(scope)

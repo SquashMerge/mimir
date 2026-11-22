@@ -74,6 +74,17 @@ insufficient evidence if the relevant error is outside the excerpt.
 A failed download reports the job and HTTP status when available, otherwise an
 explicit timeout/transport/state-write limitation. Failures still emit normally.
 
+For PR CI remediation, classify before editing with
+`repo_diff(mode='base', failing_test=<test path>,
+imported_modules=<repo-relative module paths imported by that test>)`.
+Remediate when the failing test or an imported module is in the PR's changed
+paths. When both the failing test and its imported modules are outside those
+paths, report the unrelated failure using `pr_comment` or operator escalation
+and leave the PR unchanged. Report insufficient evidence rather than drafting
+a speculative fix. Main-branch failures belong in a separate issue, not an
+unrelated PR's branch. A `dirty_lease_from_prior_turn` refusal preserves drafts
+in place; report it and await operator disposition before mutation.
+
 Optional enrichment: call `ci_run(repository, run_id)` for run metadata,
 `ci_run_jobs(repository, run_id)` for jobs and failed steps, and
 `ci_recent_runs(repository, branch)` to compare recent runs on the branch.

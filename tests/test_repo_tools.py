@@ -1881,6 +1881,9 @@ def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) ->
 def _interrupted_lease(tmp_path, monkeypatch, *, kind="rebase", foreign=True):
     from mimir_cultivate import forge, repository
 
+    # Exercise same-turn abort-only recovery. Prior-turn dirty checkouts now
+    # require operator disposition before admission (#2193).
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "active-recovery-turn")
     _, source, scope, old_state = _repo_scope_and_state(tmp_path)
     lease = old_state.checkout_lease
     _git(source, "checkout", "-q", "main")

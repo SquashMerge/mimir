@@ -3627,8 +3627,16 @@ def _deliver_pr_ci(
             f"CI failed on your open PR #{number} on {repo} at immutable head "
             f"{head_sha}: {names}. Re-check the live PR, exact head, and current "
             "checks before changing anything. If it is still open at this head and "
-            "still red, inspect the linked check logs, fix the failure, run the "
-            f"repository's configured tests, and push with a lease.\n{pr.get('html_url', '')}"
+            "still red, inspect the linked check logs and classify the failure with "
+            "repo_diff(mode='base', failing_test=<test path>, "
+            "imported_modules=<repo-relative imported module paths>). Remediate when "
+            "the failing test or an imported module is in the PR's changed paths, "
+            "run the repository's configured tests, and push with a lease. When both "
+            "the failing test and its imported modules are outside the PR's changed "
+            "paths, report the unrelated failure with pr_comment or operator escalation "
+            "and leave the PR unchanged. Report insufficient evidence rather than "
+            "drafting a speculative fix. A dirty_lease_from_prior_turn refusal requires "
+            f"operator disposition before mutation.\n{pr.get('html_url', '')}"
         )
         prompt += _remediation_logs(repo, pr, token, failures)
         _emit(

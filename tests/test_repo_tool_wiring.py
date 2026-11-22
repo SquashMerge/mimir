@@ -954,7 +954,7 @@ async def test_poller_precheckout_handles_stopped_and_reminted_preflight(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", ["ancestry_failure", "no_author_trust", "checkout_state_mismatch", "git_timeout"])
+@pytest.mark.parametrize("reason", ["ancestry_failure", "no_author_trust", "checkout_state_mismatch", "git_timeout", "dirty_prior_turn"])
 @pytest.mark.parametrize("followup", ["none", "pr_comment", "unsupported_operation", "operator_alert", "repo_push", "model_error", "hard_refusal_model_error"])
 async def test_poller_precheckout_refused_resume_is_no_work_without_renewal(
     tmp_path, monkeypatch, selected_repo_policy, reason, followup,
@@ -970,6 +970,14 @@ async def test_poller_precheckout_refused_resume_is_no_work_without_renewal(
 
     _, _, scope, original = _repo_scope_and_state(tmp_path)
     lease = original.checkout_lease
+    dirty = reason == "dirty_prior_turn"
+    if dirty:
+        reason = "checkout_state_mismatch"
+        raw_path = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(raw_path.read_text())
+        raw["last_turn_id"] = "abandoned-turn-2193"
+        raw_path.write_text(json.dumps(raw))
+        (lease.path / "draft.txt").write_text("prior draft\n")
     state = RepoReviewState(scope)
     auth = replace(
         _auth(scope), repo_pr_scope_registry=RepoPRScopeRegistry((state,)), repo_review_state=state,
@@ -1036,7 +1044,20 @@ async def test_poller_precheckout_refused_resume_is_no_work_without_renewal(
     terminal = [event for event in events if event.get("type") in {"turn_failed", "turn_completed"}]
     assert observed_refusals == [({
         "repository": scope.canonical_repo, "pull_request": scope.pr_number, "reason": reason,
+        **({"details": {
+            "status": "attestation_refused", "reason": "dirty_lease_from_prior_turn",
+            "prior_turn_id": "abandoned-turn-2193", "path": str(lease.path),
+            "mutation_allowed": False, "disposition": "operator_required",
+            "message": (
+                "dirty lease from prior turn abandoned-turn-2193; edits are preserved in place. "
+                "An operator must preserve or discard the draft and clean the lease "
+                "before checkout can be admitted. Report this refusal; leave the PR unchanged."
+            ),
+        }} if dirty else {}),
     },)]
+    if dirty:
+        assert "abandoned-turn-2193" in seen[0]
+        assert "dirty_lease_from_prior_turn" in seen[0]
     assert len(terminal) == 1
     assert terminal[0]["type"] == ("turn_failed" if followup in {"model_error", "hard_refusal_model_error"} else "turn_completed")
     charged = followup in {"repo_push", "model_error", "hard_refusal_model_error"}
@@ -1061,7 +1082,7 @@ async def test_poller_precheckout_refused_resume_is_no_work_without_renewal(
     assert "adapter-secret" not in seen[0]
     assert "may comment on the PR or escalate" in seen[0]
     assert "cannot read or write PR content this turn" in seen[0]
-    assert str(lease.path) not in seen[0]
+    assert (str(lease.path) in seen[0]) is dirty
     assert not auth.ifc_state.framework_pr_checkouts
     assert state.checkout_lease is None
     assert json.loads(metadata.read_text())["expires_at"] == before["expires_at"]

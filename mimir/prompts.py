@@ -12,6 +12,7 @@ skills``) come in later phases when the registry is dynamic.
 from __future__ import annotations
 
 import os
+import json
 from datetime import datetime, timezone
 from typing import Iterable, Mapping
 
@@ -350,6 +351,11 @@ def build_turn_prompt(
             "No checkout lease was acquired. You may comment on the PR or escalate, "
             "but you cannot read or write PR content this turn.",
         )
+        if refusal.get("details"):
+            _add_labeled(
+                "Checkout refusal details",
+                json.dumps(refusal["details"], sort_keys=True)[:4096],
+            )
 
     # Materialize once if we need to scan it twice (identity + render).
     recent_list: list[Message] | None = None
