@@ -6302,6 +6302,74 @@ def test_repo_nonpublishing_tools_keep_original_decision(
             assert actual.allowed
 
 
+@pytest.mark.parametrize("invalid", [
+    None, "tool", "missing_tool", "owner", "receipt", "grant",
+])
+def test_scoped_abort_exemption_is_not_a_generic_write_bypass(monkeypatch, invalid):
+    """Isolate each host-side exemption guard from downstream grant denials."""
+    tool_name = "repo_commit" if invalid == "tool" else "repo_rebase_abort"
+    tool = SimpleNamespace(
+        owner="other_plugin" if invalid == "owner" else "cultivate", typed_action=object(),
+    )
+    policy = SimpleNamespace(
+        tools={} if invalid == "missing_tool" else {tool_name: tool},
+        scoped_actions={"cultivate": object()},
+    )
+    state = SimpleNamespace(interrupted_operation=None if invalid == "receipt" else object())
+    monkeypatch.setattr(access_control, "_valid_scoped_pr_grant", lambda *a, **kw: invalid != "grant")
+    assert access_control._scoped_pr_abort_allowed(
+        tool_name, object(), object(), state, policy,
+    ) is (invalid is None)
+
+
+@pytest.mark.parametrize("invalid", [
+    None, "author", "missing_author", "lease_path", "recovery_id",
+    "grant", "receipt", "recovered", "missing_lease", "missing_scope",
+])
+def test_interrupted_filesystem_provenance_requires_all_trust_bindings(tmp_path, monkeypatch, invalid):
+    """Test classifier guards independently of the real Git/grant integration."""
+    scope = SimpleNamespace(scope_id="scope", owner="cultivate")
+    attached = SimpleNamespace(path=tmp_path / "lease", recovery_id="recovery")
+    lease = SimpleNamespace(
+        path=tmp_path / ("other" if invalid == "lease_path" else "lease"),
+        recovery_id="other" if invalid == "recovery_id" else "recovery",
+        canonical_repo="owner/repo", pr_number=7, head_sha="a" * 40,
+    )
+    if invalid == "recovered":
+        attached.interrupted_operation = object()
+    state = SimpleNamespace(
+        action_scope=None if invalid == "missing_scope" else scope,
+        checkout_lease=attached,
+        interrupted_operation=None if invalid in {"receipt", "recovered"} else object(),
+    )
+    auth = SimpleNamespace(
+        canonical_principal="poller:github", is_service=False,
+        ifc_state=SimpleNamespace(pr_checkout_author_trust=(
+            {} if invalid == "missing_author" else {"scope": invalid != "author"}
+        )),
+        repo_pr_scope_registry=SimpleNamespace(resolve_checkout_path=lambda _: state),
+    )
+    policy = SimpleNamespace(
+        policy_consumer_hooks=SimpleNamespace(
+            active_checkout=lambda _: None if invalid == "missing_lease" else lease,
+        ),
+        scoped_actions={"cultivate": object()},
+    )
+    monkeypatch.setattr(access_control, "selected_policy_registry", lambda: policy)
+    monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                        lambda *a: access_control.LeaseAttestation(False, "checkout_state_mismatch"))
+    monkeypatch.setattr(access_control, "log_pr_checkout_lease_attestation_refused", lambda *a: None)
+    monkeypatch.setattr(access_control, "_registered_review_action", lambda *a: object())
+    monkeypatch.setattr(access_control, "_valid_scoped_pr_grant", lambda *a, **kw: invalid != "grant")
+    monkeypatch.setattr(access_control, "get_trusted_service_from_auth_context", lambda *a: None)
+    source = protected_result_source(
+        auth, principal="filesystem", domain="filesystem",
+        resource_id=str(attached.path / "tracked.txt"), bridge_instance="filesystem",
+    )
+    assert source.integrity == ("trusted" if invalid is None else "untrusted")
+    assert source.integrity_effect == ("informational" if invalid is None else "active_ingest")
+
+
 @pytest.mark.parametrize("tool_name", ["repo_commit", "repo_push"])
 @pytest.mark.parametrize("enforce", [False, True])
 @pytest.mark.usefixtures("selected_repository_policy")

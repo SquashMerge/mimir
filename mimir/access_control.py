@@ -7125,6 +7125,18 @@ class SinkGate:
 
         sink_category = sink_category or get_sink_category(tool_name)
         service = get_trusted_service_from_auth_context(auth_context)
+        if _scoped_pr_abort_allowed(
+            tool_name, auth_context, repo_pr_action_scope, repo_review_state,
+            selected_policy_registry(),
+        ):
+            # The forge sink descriptor is shared with publishing tools, but
+            # this exact, grant-validated operation only restores local state.
+            return ToolAuthorization(
+                tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True, reason="scoped_pr_local_recovery",
+                service_principal=service, enforcement_enabled=enforce,
+                repo_pr_action_scope=repo_pr_action_scope,
+            )
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return _scheduled_write_denial(tool_name)
         # Both service and operator routes need a veto before any shadow allow.
@@ -9533,6 +9545,22 @@ def _recovery_tool_refusal(review_state: Any, tool_name: str | None) -> str | No
     return f"Interrupted {interrupted.kind} on {interrupted.branch}; call {interrupted.abort_tool} first."
 
 
+def _scoped_pr_abort_allowed(
+    tool_name: str, auth_context: Any, scope: Any, state: Any, policy: Any,
+) -> bool:
+    """Exempt only an exact same-turn local rollback, never publication."""
+    tool = policy.tools.get(tool_name)
+    return (
+        tool_name in {"repo_rebase_abort", "repo_merge_abort"}
+        and tool is not None and tool.owner == "cultivate"
+        and getattr(state, "interrupted_operation", None) is not None
+        and _valid_scoped_pr_grant(
+            auth_context, tool.owner, tool.typed_action,
+            policy.scoped_actions.get(tool.owner), scope, state, tool_name=tool_name,
+        )
+    )
+
+
 def register_server_discovered_review_grant(auth_context: AuthContext, state: Any) -> None:
     """Bind a live, turn-registered review scope to an operator's grants."""
     grants = getattr(auth_context, "scoped_pr_grants", None)
@@ -10229,9 +10257,29 @@ class ToolRegistry:
         if (plugin_tool is not None and plugin_tool.writes_code_or_state
                 and "worklink_build_tools" not in plugin_tool.memberships
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            return finish(_tainted_write_denial(
-                tool_name, service, auth_context=auth_context, ifc_labels=ifc_labels,
-            ))
+            # Keep the veto before argument/sink handling (including shadow
+            # allowances). Only a fully bound local abort may proceed.
+            recovery_state = None
+            repository = (arguments or {}).get("repository")
+            pull_request = (arguments or {}).get("pull_request")
+            if (tool_name in {"repo_rebase_abort", "repo_merge_abort"}
+                    and isinstance(repository, str)
+                    and type(pull_request) is int and pull_request > 0):
+                for states in (
+                    getattr(auth_context, "server_discovered_pr_states", None),
+                    getattr(auth_context, "repo_pr_scope_registry", None),
+                ):
+                    if states is not None:
+                        recovery_state = states.resolve(repository, pull_request)
+                        if recovery_state is not None:
+                            break
+            if not _scoped_pr_abort_allowed(
+                tool_name, auth_context, getattr(recovery_state, "action_scope", None),
+                recovery_state, policy,
+            ):
+                return finish(_tainted_write_denial(
+                    tool_name, service, auth_context=auth_context, ifc_labels=ifc_labels,
+                ))
         if (plugin_tool is not None and plugin_tool.flow in {"sink", "both"}
                 and plugin_tool.resource_scope != "channel"
                 and tool_name != "issue_comment"):
@@ -10588,7 +10636,7 @@ class ToolRegistry:
                 ifc_labels,
                 auth_context,
                 enforce=enforce,
-                repo_review_state=repo_review_state,
+                repo_review_state=repo_review_state if repo_review_state is not None else state,
                 repo_review_state_refusal=repo_review_state_refusal,
                 repo_pr_action_scope=repo_pr_action_scope,
                 operator_shell_binding=operator_shell_binding,
@@ -11733,8 +11781,23 @@ def protected_result_source(
         if scope is not None or lease is not None:
             lease_attestation = pr_checkout_lease_attestation(auth_context, scope, lease)
             trusted_lease = lease_attestation.ok
-            # Recovery attests the pre-operation branch, never interrupted files.
-            if getattr(getattr(review_state, "checkout_lease", None), "interrupted_operation", None) is not None:
+            attached = getattr(review_state, "checkout_lease", None)
+            if getattr(review_state, "interrupted_operation", None) is not None:
+                # Normal HEAD attestation cannot observe a detached rebase.
+                # Preserve read provenance only for the exact, trusted lease
+                # whose operation this turn started, rechecking all Git markers.
+                trusted_lease = (
+                    lease is not None and scope is not None
+                    and getattr(auth_context.ifc_state, "pr_checkout_author_trust", {}).get(scope.scope_id) is True
+                    and _valid_scoped_pr_grant(
+                        auth_context, scope.owner, _registered_review_action("inspect", auth_context),
+                        selected_policy_registry().scoped_actions.get(scope.owner),
+                        scope, review_state, tool_name="read_file",
+                    )
+                    and (str(lease.path), lease.recovery_id) == (str(attached.path), attached.recovery_id)
+                )
+            # Earlier-turn recovery attests the pre-operation branch only.
+            elif getattr(attached, "interrupted_operation", None) is not None:
                 trusted_lease = False
             if not trusted_lease:
                 log_pr_checkout_lease_attestation_refused(
