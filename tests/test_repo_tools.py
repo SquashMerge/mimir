@@ -5618,6 +5618,74 @@ async def test_failed_repo_test_after_tainted_commit_stays_untrusted(tmp_path, m
     assert integ == "untrusted" and allowed is False
 
 
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_repo_inventory")
+@pytest.mark.parametrize("tainted", [False, True])
+async def test_queued_repo_test_publishes_lease_attested_provenance(tmp_path, monkeypatch, tainted):
+    """Queueing background tests must not taint the turn that queued them.
+
+    The queued result is a repository result. Without the provenance the
+    synchronous path publishes, it defaulted to untrusted active ingest
+    (``no_published_provenance``), so every remediation turn that queued
+    repo_test could no longer commit, push or comment.
+    """
+    from mimir import access_control, repo_test_jobs
+    from mimir.access_control import (
+        SinkGate, ToolAuthorization, begin_protected_result_capture,
+        classify_protected_result, end_protected_result_capture,
+    )
+    from mimir.models import InformationFlowLabels
+    from mimir_cultivate import repository as repo
+
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: "owner/repo")
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    object.__setattr__(scope, "pull_request_author", scope.principal)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path / "leases"))
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", str(tmp_path / "heavy.lock"))
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_TIMEOUT", raising=False)
+    monkeypatch.delenv("MIMIR_HEAVY_TIER", raising=False)
+    lease = state.checkout_lease
+    if tainted:
+        (lease.path / "tracked.txt").write_text("tainted\n")
+        RepoGitTools(
+            state, auth_context=_lineage_turn(scope, state, tainted=True), enforce=False,
+        ).execute(GitCommit(("tracked.txt",), "t"))
+    turn = _lineage_turn(scope, state)
+    if not tainted:
+        assert_lease_attested(turn, scope, lease)
+    monkeypatch.setattr(repo, "_state", lambda *_: state)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", object())
+    queued = {"status": "queued", "job_id": "rt_0", "head_sha": scope.observed_head_sha}
+
+    async def queue(registry, runtime, target, selectors, suite):
+        assert target is state
+        return dict(queued)
+
+    monkeypatch.setattr(repo, "_queue_repo_test", queue)
+    capture = begin_protected_result_capture()
+    try:
+        result = await repo.repo_test.coroutine(
+            "owner/repo", 7, runtime=SimpleNamespace(context=turn),
+        )
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert result == queued
+    labels = classify_protected_result(
+        "repo_test", {"repository": "owner/repo", "pull_request": 7}, turn,
+        ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope),
+        result=result, provenance=provenance,
+    )
+    assert labels.sources[0].integrity == ("untrusted" if tainted else "trusted")
+    turn.ifc_state.merge(labels)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        turn.ifc_state.current(InformationFlowLabels()), turn,
+        enforce=False, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is (not tainted)
+
 def test_recorded_inventory_unresolvable_key_fails_closed(tmp_path, monkeypatch):
     """An inventory key that cannot be resolved (e.g. a symlink loop on Python
     <= 3.12, where Path.resolve raises) must fail closed, never crash result

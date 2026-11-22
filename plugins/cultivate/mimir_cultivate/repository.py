@@ -6566,7 +6566,10 @@ async def repo_test(
             registry = get_registry()
             if registry is None:
                 raise ToolPolicyRefusal("project test rejected: background job registry unavailable")
-            return await _queue_repo_test(registry, runtime, retained, selectors, suite)
+            return _retained_result(
+                runtime, retained,
+                await _queue_repo_test(registry, runtime, retained, selectors, suite),
+            )
         return await _repo_test_unlocked(
             repository, pull_request, selectors, runtime, suite, include_output,
         )
@@ -6575,7 +6578,12 @@ async def repo_test(
         registry = get_registry()
         if registry is None:
             raise ToolPolicyRefusal("project test rejected: background job registry unavailable")
-        return await _queue_repo_test(registry, runtime, state, selectors, suite)
+        queued = await _queue_repo_test(registry, runtime, state, selectors, suite)
+        # The queued result is a repository result like the synchronous one. Without
+        # published provenance it defaults to untrusted active ingest, and the turn
+        # that queued its tests could no longer commit, push or comment.
+        _publish_attested_lease_result(runtime, state)
+        return queued
     lease = getattr(state, "checkout_lease", None)
     if not isinstance(lease, PRCheckoutLease) or not lease.is_active:
         return await _repo_test_unlocked(
