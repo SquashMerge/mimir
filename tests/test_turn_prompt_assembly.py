@@ -2942,6 +2942,10 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
          "_publish_retained_result", "SourceLabel"): 1,
         ("producer", "plugins/cultivate/mimir_cultivate/repository.py",
          "_publish_attested_scope_result", "SourceLabel"): 1,
+        # Async results retain the starting scope's repository provenance;
+        # unattested checkouts stay untrusted (covered by the async tests).
+        ("producer", "plugins/cultivate/mimir_cultivate/repository.py",
+         "_queue_repo_test", "SourceLabel"): 1,
     })
     forge = root.parent / "plugins/cultivate/mimir_cultivate/forge.py"
     Visitor("plugins/cultivate/mimir_cultivate/forge.py").visit(

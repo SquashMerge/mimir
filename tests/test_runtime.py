@@ -440,6 +440,10 @@ def _patch_factory(
         async def on_message_injected(self, event: Any) -> None:
             events.append(("injected", event))
 
+        async def _on_repo_test_complete(self, event: Any) -> bool:
+            events.append(("repo_test_complete", event))
+            return True
+
     monkeypatch.setattr(mimir.turn_logger, "TurnLogger", TurnLogger)
     monkeypatch.setattr(mimir.history, "MessageBuffer", MessageBuffer)
     monkeypatch.setattr(mimir.index, "IndexGenerator", IndexGenerator)

@@ -57,6 +57,7 @@ tr:hover td{background:var(--surface2);cursor:pointer}
 .badge-poller{background:#103838;color:#5eead4}
 .badge-claude_code_spawn{background:#3a230f;color:#fb923c}
 .badge-shell_job_complete{background:#1f2d1f;color:#86efac}
+.badge-repo_test_complete{background:#1f2d1f;color:#86efac}
 .badge-react_received{background:#3a1c2e;color:#f472b6}
 .badge-unknown{background:var(--surface2);color:var(--text2);border:1px dashed var(--border)}
 .badge-channel{background:var(--surface2);color:var(--text2);border:1px solid var(--border)}
@@ -137,6 +138,7 @@ tr:hover td{background:var(--surface2);cursor:pointer}
     <button class="tab" data-trigger="poller">Poller</button>
     <button class="tab" data-trigger="claude_code_spawn">Spawn</button>
     <button class="tab" data-trigger="shell_job_complete">Job</button>
+    <button class="tab" data-trigger="repo_test_complete">Tests</button>
   </div>
   <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer;margin-left:12px">
     <input type="checkbox" id="hidePollersToggle" style="cursor:pointer"> hide pollers
@@ -256,7 +258,7 @@ var hidePollers = lsGet('hidePollers', '0') === '1';
 // renders with badge-unknown so it's visually flagged for follow-up.
 var KNOWN_TRIGGERS = {
   user_message: 1, scheduled_tick: 1, saga_session_end: 1,
-  poller: 1, claude_code_spawn: 1, shell_job_complete: 1,
+  poller: 1, claude_code_spawn: 1, shell_job_complete: 1, repo_test_complete: 1,
   react_received: 1,
 };
 

@@ -47,6 +47,7 @@ export type TurnTrigger =
   | "poller"
   | "claude_code_spawn"
   | "shell_job_complete"
+  | "repo_test_complete"
   | "react_received"
   | string;
 

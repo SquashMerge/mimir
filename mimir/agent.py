@@ -696,7 +696,7 @@ def _shell_continuation_auth_context(event: AgentEvent) -> AuthContext | None:
     """Return a trusted shell continuation carrier only for its origin channel."""
     inherited = event.continuation_auth_context
     if (
-        event.trigger == "shell_job_complete"
+        event.trigger in {"shell_job_complete", "repo_test_complete"}
         and isinstance(inherited, AuthContext)
         and inherited.channel_id == event.channel_id
     ):
@@ -1762,7 +1762,7 @@ class Agent:
     # kind=system_note) so the agent's view of "what just happened on
     # this channel" stays accurate.
     _INBOUND_SKIP_TRIGGERS: frozenset[str] = frozenset(
-        {"saga_session_end", "shell_job_complete"}
+        {"saga_session_end", "shell_job_complete", "repo_test_complete"}
     )
 
     def add_hook(self, hook: TurnHook) -> None:
@@ -2656,7 +2656,7 @@ class Agent:
             )
             ctx.completion_chain_id = (
                 event.extra.get("completion_chain_id") or turn_id
-                if event.trigger == "shell_job_complete" else turn_id
+                if event.trigger in {"shell_job_complete", "repo_test_complete"} else turn_id
             )
             # Both ordinary and synthesis turns share this setup. Register the
             # intended workspace before validating/repairing it so the janitor
@@ -2898,9 +2898,9 @@ class Agent:
                     event.channel_id
                 )
                 if leftover_injections and self._dispatcher is not None:
-                    user_leftovers = [e for e in leftover_injections if e.trigger != "shell_job_complete"]
+                    user_leftovers = [e for e in leftover_injections if e.trigger not in {"shell_job_complete", "repo_test_complete"}]
                     for completion in leftover_injections:
-                        if completion.trigger == "shell_job_complete":
+                        if completion.trigger in {"shell_job_complete", "repo_test_complete"}:
                             await Agent._queue_shell_followup(self, completion)
                     requeued = self._dispatcher.requeue_front(user_leftovers)
                     if requeued < len(user_leftovers):
@@ -3780,9 +3780,9 @@ class Agent:
             ) = mid_turn_injection.deactivate(event.channel_id)
             requeue_results = []
             if leftover_injections and self._dispatcher is not None:
-                user_leftovers = [e for e in leftover_injections if e.trigger != "shell_job_complete"]
+                user_leftovers = [e for e in leftover_injections if e.trigger not in {"shell_job_complete", "repo_test_complete"}]
                 for completion in leftover_injections:
-                    if completion.trigger == "shell_job_complete":
+                    if completion.trigger in {"shell_job_complete", "repo_test_complete"}:
                         await Agent._queue_shell_followup(self, completion)
                 if user_leftovers:
                     requeued = self._dispatcher.requeue_front(user_leftovers)
@@ -4546,8 +4546,12 @@ class Agent:
         # Use the frozen continuation identity as well as channel: one owner's
         # authority must never deliver another owner's output.
         auth = event.continuation_auth_context
-        key = (event.channel_id, getattr(auth, "canonical_principal", None),
+        key = (event.trigger, event.channel_id, getattr(auth, "canonical_principal", None),
                getattr(auth, "is_service", None), getattr(auth, "roles", None))
+        if event.trigger == "repo_test_complete":
+            # A durable result is acknowledged only after its own enqueue, not
+            # after joining an unacknowledged shell batch.
+            key += (event.extra["job_id"],)
         batches = self.__dict__.setdefault("_shell_completion_batches", {})
         # Same channel/principal does not imply equal continuation authority.
         # Keep different frozen grants in separate batches rather than run one
@@ -4565,7 +4569,7 @@ class Agent:
                 return await deliver()
             except Exception as exc:  # noqa: BLE001
                 await log_event(
-                    "shell_job_complete_enqueue_failed", job_id=event.extra["job_id"],
+                    f"{event.trigger}_enqueue_failed", job_id=event.extra["job_id"],
                     error=str(exc)[:500],
                 )
                 return False
@@ -4591,7 +4595,7 @@ class Agent:
                     )
                     continue
                 chain = item.extra.get("completion_chain_id") or item.extra.get("starting_turn_id") or item.extra["job_id"]
-                if counts.get(chain, 0) >= 3:
+                if item.trigger == "shell_job_complete" and counts.get(chain, 0) >= 3:
                     await log_event(
                         "shell_job_complete_suppressed", job_id=item.extra["job_id"],
                         turn_id=item.extra.get("starting_turn_id"), reason="chain_cap",
@@ -4626,15 +4630,15 @@ class Agent:
             try:
                 queued = await self._dispatcher.enqueue(followup)
             except Exception as exc:  # noqa: BLE001
-                await log_event("shell_job_complete_enqueue_failed", job_id=followup.extra["job_id"], error=str(exc)[:500])
+                await log_event(f"{followup.trigger}_enqueue_failed", job_id=followup.extra["job_id"], error=str(exc)[:500])
                 return False
             await log_event(
-                "shell_job_complete_enqueue_ok" if queued else "shell_job_complete_enqueue_failed",
+                f"{followup.trigger}_enqueue_ok" if queued else f"{followup.trigger}_enqueue_failed",
                 job_id=followup.extra["job_id"], job_ids=followup.extra["completion_job_ids"],
             )
             return bool(queued)
 
-        if window:
+        if window and event.trigger != "repo_test_complete":
             # Retained in _bg_tasks: the loop keeps only a weak reference to a
             # bare task, so an unretained flush could be collected before it runs.
             Agent._spawn_bg_task(self, flush())
@@ -4792,6 +4796,20 @@ class Agent:
             exit_code=job.exit_code,
             accepted=accepted,
         )
+
+    async def _on_repo_test_complete(self, event: AgentEvent) -> bool | None:
+        """Route bounded repository results with the shell continuation contract."""
+        folded = mid_turn_injection.inject_job_completion(
+            event.channel_id, event.extra.get("starting_turn_id"), event,
+        )
+        if folded == "injected":
+            await log_event("repo_test_complete_folded_pending", job_id=event.extra["job_id"])
+            return True
+        accepted = await Agent._queue_shell_followup(self, event)
+        await log_event(
+            "repo_test_complete_routed", job_id=event.extra["job_id"], accepted=accepted,
+        )
+        return accepted
 
     async def _log_injection_requeue(
         self, kind: str, channel_id: str, turn_id: str, count: int, requeued: int,
