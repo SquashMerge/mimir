@@ -74,7 +74,7 @@ def test_core_wheel_carries_unchanged_lease_helper(daemon_packages):
         for name in ("heavy_run.sh", "heavy_run.py"):
             assert archive.read(f"mimir/heavy_run/{name}") == (ROOT / "scripts" / name).read_bytes()
     with ZipFile(wheels["mimir-cultivate"]) as archive:
-        for name in ("pytest", "worklink_pytest.py", "sitecustomize.py"):
+        for name in ("pytest", "worklink_pytest.py", "worklink_pytest_args.py", "sitecustomize.py"):
             assert archive.read(f"mimir_cultivate/docker/pytest_guard/{name}") == (
                 SCRIPTS / "pytest_guard" / name).read_bytes()
 

@@ -10,6 +10,8 @@ from pathlib import Path
 import shutil
 import sys
 
+from worklink_pytest_args import pytest_arguments
+
 
 def single_node(arguments: list[str]) -> bool:
     # Unknown options (including -n, --pyargs, response files, repeats, option
@@ -39,13 +41,8 @@ def startup() -> None:
     if Path(sys.argv[0]).resolve() == Path(__file__).resolve().parents[1] / "bin/pytest":
         # This shim must resolve the project's executable/interpreter first.
         return
-    arguments = None
-    if Path(sys.argv[0]).name in {"pytest", "py.test"}:
-        arguments = sys.argv[1:]
-    elif sys.argv[0] == "-m" and "-m" in sys.orig_argv:
-        index = sys.orig_argv.index("-m")
-        if sys.orig_argv[index + 1:index + 2] == ["pytest"]:
-            arguments = sys.orig_argv[index + 2:]
+    arguments = pytest_arguments(getattr(sys, "argv", None),
+                                 getattr(sys, "orig_argv", None))
     if arguments is not None:
         enforce([sys.executable, "-m", "pytest", *arguments], arguments)
 

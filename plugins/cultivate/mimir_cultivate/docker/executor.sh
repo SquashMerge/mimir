@@ -13,7 +13,7 @@ guard = Path("/opt/mimir-worklink/pytest-guard")
 for directory in ("bin", "python"):
     (guard / directory).mkdir(parents=True, exist_ok=True)
 assets = Path(mimir_cultivate.__file__).parent / "docker/pytest_guard"
-for name in ("pytest", "worklink_pytest.py", "sitecustomize.py"):
+for name in ("pytest", "worklink_pytest.py", "worklink_pytest_args.py", "sitecustomize.py"):
     target = guard / ("bin" if name == "pytest" else "python") / name
     shutil.copyfile(assets / name, target)
     target.chmod(0o755 if name == "pytest" else 0o644)

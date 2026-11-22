@@ -6,20 +6,13 @@ import importlib.util
 import os
 import sys
 
+from worklink_pytest_args import pytest_arguments
+
 
 def _is_pytest_invocation() -> bool:
     # Keep this fallback independent of worklink_pytest: its import can fail.
-    # Embedded interpreters need not expose normal argv/orig_argv sequences.
-    argv = getattr(sys, "argv", None)
-    if isinstance(argv, (list, tuple)) and argv and isinstance(argv[0], str):
-        if os.path.basename(argv[0]) in {"pytest", "py.test"}:
-            return True
-    original = getattr(sys, "orig_argv", None)
-    if isinstance(original, (list, tuple)):
-        for index, value in enumerate(original[:-1]):
-            if value == "-m":
-                return original[index + 1] == "pytest"
-    return False
+    return pytest_arguments(getattr(sys, "argv", None),
+                            getattr(sys, "orig_argv", None)) is not None
 
 
 def _chain_sitecustomize() -> None:

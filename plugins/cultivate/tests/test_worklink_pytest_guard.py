@@ -19,6 +19,12 @@ from mimir_cultivate.worklink.daemon_sessions import session_environment
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "plugins/cultivate/mimir_cultivate/docker/pytest_guard"
+MODULE_ENTRIES = [
+    [sys.executable, "-m", "pytest"],
+    [sys.executable, "-mpytest"],
+    [sys.executable, "-X", "dev", "-m", "pytest"],
+    [sys.executable, "-X", "dev", "-mpytest"],
+]
 
 
 @pytest.fixture
@@ -26,7 +32,7 @@ def session(tmp_path, monkeypatch):
     guard = tmp_path / "executor/pytest-guard"
     (guard / "bin").mkdir(parents=True)
     (guard / "python").mkdir()
-    for name in ("worklink_pytest.py", "sitecustomize.py"):
+    for name in ("worklink_pytest.py", "worklink_pytest_args.py", "sitecustomize.py"):
         shutil.copyfile(SOURCE / name, guard / "python" / name)
     shutil.copyfile(SOURCE / "pytest", guard / "bin/pytest")
     (guard / "bin/pytest").chmod(0o755)
@@ -93,14 +99,11 @@ def test_builder_path_resolves_executor_shim(session):
     assert not guard.is_relative_to(session[0])
 
 
-@pytest.mark.parametrize("entry", ["shim", "module", "venv"])
+@pytest.mark.parametrize("entry", ["shim", "venv", *MODULE_ENTRIES])
 def test_multitest_requires_medium_lease(session, entry):
     """Mutation oracle: deleting enforce's exec must fail this test."""
-    command = {
-        "shim": ["pytest"],
-        "module": [sys.executable, "-m", "pytest"],
-        "venv": [str(session[0] / ".venv/bin/pytest")],
-    }[entry]
+    command = (["pytest"] if entry == "shim" else
+               [str(session[0] / ".venv/bin/pytest")] if entry == "venv" else entry)
     observed = result(run(session, command))
     assert observed["held"] == "1"
     assert observed["tier"] == "medium"
@@ -109,7 +112,7 @@ def test_multitest_requires_medium_lease(session, entry):
     assert observed["args"] == ["-q", "tests"]
 
 
-@pytest.mark.parametrize("entry", [["pytest"], [sys.executable, "-m", "pytest"]])
+@pytest.mark.parametrize("entry", [["pytest"], *MODULE_ENTRIES])
 def test_single_node_and_held_marker_pass_through(session, entry):
     observed = result(run(session, entry, arguments=("test_example.py::test_one",)))
     assert observed["held"] is None
@@ -117,6 +120,34 @@ def test_single_node_and_held_marker_pass_through(session, entry):
     observed = result(run(session, entry, MIMIR_HEAVY_LOCK_HELD="1"))
     assert observed["held"] == "1"
     assert observed["owners"] == []
+
+
+@pytest.mark.parametrize("entry", MODULE_ENTRIES)
+def test_multiple_module_nodes_require_lease(session, entry):
+    arguments = ("a.py::test_a", "b.py::test_b")
+    observed = result(run(session, entry, arguments=arguments))
+    assert observed["held"] == "1"
+    assert observed["tier"] == "medium"
+    assert len(observed["owners"]) == 1
+    assert observed["args"] == list(arguments)
+
+
+@pytest.mark.parametrize("original, expected", [
+    (["python", "-m", "pytest", "tests"], ["tests"]),
+    (("python", "-mpytest", "tests"), ["tests"]),
+    (["python", "-X", "dev", "-mpytest", "--version"], ["--version"]),
+    (["python", "-W", "-mpytest", "-m", "other"], None),
+    (["python", "-c", "-mpytest"], None),
+    (["python", "-m", "other", "-mpytest"], None),
+    (["python", "script.py", "-mpytest"], None),
+    (["python", "-m"], None),
+    (["python", "-mpytest_other"], None),
+])
+def test_shared_module_parser(monkeypatch, original, expected):
+    monkeypatch.syspath_prepend(str(SOURCE))
+    from worklink_pytest_args import pytest_arguments
+
+    assert pytest_arguments(["-m"], original) == expected
 
 
 def test_unconfigured_lease_passes_through(session):
@@ -141,7 +172,8 @@ def test_uv_run_venv_precedence_still_takes_lease(session):
     assert observed["owners"][0]["tier"] == "medium"
 
 
-def test_real_pytest_collects_and_runs_only_under_lease(session):
+@pytest.mark.parametrize("entry", MODULE_ENTRIES)
+def test_real_pytest_collects_and_runs_only_under_lease(session, entry):
     repo = session[0]
     (repo / "pytest.py").unlink()
     (repo / "test_lease.py").write_text(textwrap.dedent("""
@@ -152,7 +184,7 @@ def test_real_pytest_collects_and_runs_only_under_lease(session):
         def test_second():
             assert os.environ["MIMIR_HEAVY_LOCK_HELD"] == "1"
     """))
-    completed = run(session, [sys.executable, "-m", "pytest"],
+    completed = run(session, entry,
                     arguments=("-q", "test_lease.py"), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     assert completed.returncode == 0, (completed.stdout, completed.stderr)
     assert "2 passed" in completed.stdout
@@ -217,9 +249,10 @@ def test_broken_guard_fails_closed(session):
     assert completed.stdout == ""
 
 
-def test_startup_exception_cannot_continue_to_tests(session):
+@pytest.mark.parametrize("entry", MODULE_ENTRIES)
+def test_startup_exception_cannot_continue_to_tests(session, entry):
     (session[1] / "python/worklink_pytest.py").write_text("raise RuntimeError('broken guard')\n")
-    completed = run(session, [sys.executable, "-m", "pytest"])
+    completed = run(session, entry)
     assert completed.returncode == 125
     assert "startup guard failed" in completed.stderr
     assert completed.stdout == ""
@@ -298,6 +331,7 @@ def test_venv_sitecustomize_is_chained(session, broken_guard):
 
 
 def test_single_node_detection_is_conservative(monkeypatch):
+    monkeypatch.syspath_prepend(str(SOURCE))
     spec = importlib.util.spec_from_file_location("guard_under_test", SOURCE / "worklink_pytest.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
