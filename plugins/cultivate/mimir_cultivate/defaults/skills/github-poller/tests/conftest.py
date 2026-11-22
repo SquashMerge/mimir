@@ -18,6 +18,11 @@ def _trusted_pr_authors_by_default(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         poller, "_github_author_is_trusted", lambda *args, **kwargs: True,
     )
+    # Legacy selection tests own REST fixtures; queue-read/skip coverage lives
+    # in the provider's test_merge_queue_remediation.py.
+    monkeypatch.setattr(
+        poller.GitHubForgeClient, "is_pull_request_queued", lambda *args: False,
+    )
 
 
 @pytest.fixture(autouse=True)
