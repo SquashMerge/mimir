@@ -651,6 +651,20 @@ def _initialize_ifc_labels(
             for source in event.ifc_labels.sources
         ):
             integrity = Integrity.TRUSTED
+    elif (
+        event.trigger == "repo_test_complete"
+        and continuation_auth is not None
+        and event.ifc_labels is not None
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in extra
+        and not any(source.has_untrusted_active_ingest for source in event.ifc_labels.sources)
+    ):
+        # The job registry delivers a bounded, controller-computed test result.
+        # Its labels are the queueing turn's labels plus the repository source,
+        # which is untrusted unless the lease was attested. Inherit that
+        # verdict: the result is not new external content. Only the in-process
+        # registry can attach a continuation carrier, and a recovered (post-
+        # restart) completion has none, so it stays untrusted.
+        integrity = Integrity.TRUSTED
     if poller_own_channel:
         # The synthetic queue channel is framework-owned routing metadata, not
         # poller content. Exact equality with the server-carried authority's
