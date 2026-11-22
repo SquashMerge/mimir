@@ -3635,8 +3635,10 @@ def _deliver_pr_ci(
             "the failing test and its imported modules are outside the PR's changed "
             "paths, report the unrelated failure with pr_comment or operator escalation "
             "and leave the PR unchanged. Report insufficient evidence rather than "
-            "drafting a speculative fix. A dirty_lease_from_prior_turn refusal requires "
-            f"operator disposition before mutation.\n{pr.get('html_url', '')}"
+            "drafting a speculative fix. Prior-turn drafts are automatically archived "
+            "privately before checkout reset; preserved_prior_work names the artifact. "
+            "If safe archival cannot complete, report dirty_lease_from_prior_turn and "
+            f"leave the draft intact.\n{pr.get('html_url', '')}"
         )
         prompt += _remediation_logs(repo, pr, token, failures)
         _emit(

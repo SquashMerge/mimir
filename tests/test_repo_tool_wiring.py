@@ -978,6 +978,9 @@ async def test_poller_precheckout_refused_resume_is_no_work_without_renewal(
         raw["last_turn_id"] = "abandoned-turn-2193"
         raw_path.write_text(json.dumps(raw))
         (lease.path / "draft.txt").write_text("prior draft\n")
+        def unavailable(*_):
+            raise OSError("archive store unavailable")
+        monkeypatch.setattr("mimir_cultivate.repository._archive_prior_turn_draft", unavailable)
     state = RepoReviewState(scope)
     auth = replace(
         _auth(scope), repo_pr_scope_registry=RepoPRScopeRegistry((state,)), repo_review_state=state,

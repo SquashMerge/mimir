@@ -82,8 +82,11 @@ paths. When both the failing test and its imported modules are outside those
 paths, report the unrelated failure using `pr_comment` or operator escalation
 and leave the PR unchanged. Report insufficient evidence rather than drafting
 a speculative fix. Main-branch failures belong in a separate issue, not an
-unrelated PR's branch. A `dirty_lease_from_prior_turn` refusal preserves drafts
-in place; report it and await operator disposition before mutation.
+unrelated PR's branch. Prior-turn dirty leases are automatically archived under
+`state/pr-lease-drafts/` with private modes before reset and cleanup. Checkout's
+`preserved_prior_work` notice identifies the staged/worktree binary patches,
+untracked tar, history bundle and metadata. If safe archival cannot complete,
+`dirty_lease_from_prior_turn` preserves drafts in place; report that refusal.
 
 Optional enrichment: call `ci_run(repository, run_id)` for run metadata,
 `ci_run_jobs(repository, run_id)` for jobs and failed steps, and

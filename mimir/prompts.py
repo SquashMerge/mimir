@@ -331,6 +331,11 @@ def build_turn_prompt(
             f"(head `{checkout['head_sha']}`). You may use PR tools directly; "
             "repo_checkout will return this same lease.",
         )
+        if checkout.get("preserved_prior_work"):
+            _add_labeled(
+                "Preserved prior PR work",
+                json.dumps(checkout["preserved_prior_work"], sort_keys=True)[:4096],
+            )
     for stop in prechecked_pr_stops:
         _add_labeled(
             "Current PR remediation",

@@ -26,8 +26,8 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2193-ci-remediation-scope"
-CI_WATCH_RELEASE = "2193-ci-remediation-scope"
+GITHUB_POLLER_RELEASE = "2193-private-draft-archival"
+CI_WATCH_RELEASE = "2193-private-draft-archival"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.
 IDENTITY_EXCEPTIONS: dict[str, set[str]] = {}

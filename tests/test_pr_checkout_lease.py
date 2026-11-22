@@ -263,14 +263,17 @@ def test_later_turn_reuses_same_pr_fast_forward_candidate(
     )
 
     if work_kind == "uncommitted":
-        from mimir_cultivate.repository import DirtyPRCheckoutLeaseRefusal
-
-        with pytest.raises(DirtyPRCheckoutLeaseRefusal):
-            acquire_pr_checkout_lease(
-                scope, owner=scope.principal, lease_root=lease_root, review_state=state,
-            )
-        assert state.checkout_lease is None
-        assert (earlier.path / "fix.txt").read_text() == "same PR fix\n"
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *_a, **_kw: None)
+        resumed, _ = acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+        )
+        assert state.checkout_lease is resumed
+        assert not (resumed.path / "fix.txt").exists()
+        notice, = state.checkout_recovery_notices
+        import tarfile
+        with tarfile.open(Path(notice["artifact"]) / "untracked.tar") as archive:
+            assert archive.extractfile("fix.txt").read() == b"same PR fix\n"
         return
 
     resumed, candidates = acquire_pr_checkout_lease(

@@ -209,9 +209,14 @@ are outside those paths, report the unrelated failure using `pr_comment` or
 operator escalation and leave the PR unchanged. Report insufficient evidence
 rather than drafting a speculative fix. A green rerun ends investigation.
 
-A `dirty_lease_from_prior_turn` checkout refusal names the prior turn and
-preserves its edits in place. Report the structured refusal to the operator,
-who must preserve or discard the draft and clean the lease before mutation.
+Prior-turn dirty leases are automatically archived under
+`state/pr-lease-drafts/` before reset to the scoped head and cleanup. The private
+artifact retains staged and worktree binary patches, untracked paths, history,
+and prior-turn metadata. Checkout returns `preserved_prior_work` naming it, and
+the next turn receives that structured notice. Same-turn drafts are untouched.
+If archival or identity validation cannot complete (including a live holder or
+interrupted Git operation), `dirty_lease_from_prior_turn` refuses mutation and
+preserves edits in place; report the refusal rather than hand-cleaning the lease.
 
 Issue / PR / comment / review detection is filtered by `created_at > cursor`
 and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
