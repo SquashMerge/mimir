@@ -2061,8 +2061,11 @@ async def test_repo_test_legs_share_timeout_budget(
     assert state.full_tested_head is None
 
 
-def _repo_test_lease_fixture(tmp_path, monkeypatch, *, command="/usr/bin/true", wrapper=True):
-    _, _, _, state = _repo_scope_and_state(tmp_path)
+def _repo_test_lease_fixture(
+    tmp_path, monkeypatch, *, command="/usr/bin/true", wrapper=True,
+    event_type="pr_changes_requested_stale",
+):
+    _, _, _, state = _repo_scope_and_state(tmp_path, event_type=event_type)
     root = state.checkout_lease.path
     (root / "tests").mkdir()
     (root / "tests/test_changed.py").write_text("def test_changed(): pass\n")
@@ -2164,6 +2167,114 @@ async def test_repo_test_async_head_binding(tmp_path, monkeypatch, head_move):
         assert state.full_tested_head is None
         assert result["evidence"] is False
         assert "stale: head moved" in event.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["green", "head_moved", "selectors", "non_default"])
+@pytest.mark.usefixtures("repository_git_policy")
+async def test_repo_test_completion_followup_push_gate(tmp_path, monkeypatch, case):
+    """Real job -> completion routing -> turn auth -> registry -> repo_push gate.
+
+    Use a conflict remediation scope because its push actually requires the
+    full-suite proof; an ordinary remediation push would pass vacuously.
+    Neither state resolution, evidence recording nor the push gate is mocked.
+    """
+    from mimir import agent as agent_module, repo_test_jobs
+    from mimir.agent import Agent, _create_turn_auth_context
+    from mimir_cultivate import forge
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from unittest.mock import AsyncMock
+
+    state = _repo_test_lease_fixture(
+        tmp_path, monkeypatch, event_type="pr_mergeability_conflicting",
+    )
+    scope = state.action_scope
+    head = scope.observed_head_sha
+    state.record_conflict_evidence(scope.scope_id, head)
+    if case == "non_default":
+        _configure_test_suites(Path(os.environ["MIMIR_HOME"]), state, test_suites=[
+            *_two_leg_suites("/usr/bin/true"),
+            {"name": "other", "command": "/usr/bin/true"},
+        ])
+    auth = replace(
+        _untainted_ifc_auth(), principal=scope.principal,
+        channel_id="repo-test-push-gate", enforcement_enabled=False,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    owner = SimpleNamespace(
+        _shell_jobs=SimpleNamespace(get=lambda _: None),
+        _dispatcher=SimpleNamespace(enqueue=AsyncMock(return_value=True)),
+        _shell_completion_batch_seconds=0,
+    )
+    monkeypatch.setattr(agent_module, "log_event", AsyncMock())
+
+    async def complete(event):
+        return await Agent._on_repo_test_complete(owner, event)
+
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", complete)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(forge, "_client", lambda scope: object())
+    # The verified-push ledger is process-global: another case's successful
+    # push of this same fixture head would mark it superseded and refuse every
+    # later push for that reason instead of the guard each case exercises.
+    monkeypatch.setattr(repository, "_ancestral_verified_pushes", type(repository._ancestral_verified_pushes)())
+    live = {"head": head}
+    monkeypatch.setattr(forge, "_live_pr_head", lambda *args: live["head"])
+    started, release = asyncio.Event(), asyncio.Event()
+    real = repository.RepoProjectTests
+
+    async def runner(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return CollectedExecutionResult(
+            0, b"1 passed in 0.01s\n",
+            _lease_start(kwargs["identifier"], repository.time.monotonic()),
+            False, False, 0, 0,
+        )
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    # This is a gate test, not a passing-tests-with-stale-marker test.
+    with pytest.raises(repository.ToolException, match=r"\[full_test_required\].*configured full suite"):
+        repository.repo_push.func(scope.canonical_repo, scope.pr_number,
+                                  runtime=SimpleNamespace(context=auth))
+    queued = await repository.repo_test.coroutine(
+        scope.canonical_repo, scope.pr_number,
+        selectors=("tests/test_changed.py",) if case == "selectors" else (),
+        suite="other" if case == "non_default" else None,
+        runtime=SimpleNamespace(context=auth),
+    )
+    await started.wait()
+    if case == "head_moved":
+        live["head"] = "b" * 40
+    release.set()
+    job = registry.jobs[queued["job_id"]]
+    await job.task
+    owner._dispatcher.enqueue.assert_awaited_once()
+    event = owner._dispatcher.enqueue.call_args.args[0]
+    assert event.trigger == "repo_test_complete"
+    result = job.record["result"]
+    assert result["ok"]
+    # Each refusal must come from its own guard: a moved head is stale, while
+    # selected or non-default runs are current evidence that is not full-suite.
+    assert result["evidence"] is (case != "head_moved")
+    assert result.get("stale", False) is (case == "head_moved")
+    followup = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=False, ifc_labels=event.ifc_labels,
+    )
+    assert followup.trigger == "repo_test_complete"
+    runtime = SimpleNamespace(context=followup)
+    assert repository._state(runtime, scope.canonical_repo, scope.pr_number) is state
+    if case == "green":
+        # Removing record_full_test in _queue_repo_test must fail here.
+        assert repository.repo_push.func(
+            scope.canonical_repo, scope.pr_number, runtime=runtime,
+        )["ok"]
+    else:
+        with pytest.raises(repository.ToolException, match=r"\[full_test_required\].*configured full suite"):
+            repository.repo_push.func(scope.canonical_repo, scope.pr_number, runtime=runtime)
+    assert state.full_tested_head == (head if case == "green" else None)
 
 
 @pytest.mark.asyncio

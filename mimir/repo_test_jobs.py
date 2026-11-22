@@ -10,10 +10,20 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Awaitable, Callable
 import uuid
 
+from .event_logger import log_durable_event_sync
 from .models import AgentEvent, AuthContext, InformationFlowLabels
+
+_TERMINAL = frozenset({"completed", "failed", "cancelled", "interrupted"})
+_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_MAX_DELIVERED_RECORDS = 1000
+_REQUIRED_FIELDS = {
+    "job_id", "key", "status", "repository", "pull_request", "head_sha", "suite",
+    "selectors", "channel_id", "starting_turn_id", "workers", "snapshot", "delivered",
+}
 
 
 @dataclass
@@ -38,8 +48,75 @@ class RepoTestJobRegistry:
         self.on_complete = on_complete
         self.jobs: dict[str, RepoTestJob] = {}
         for path in directory.glob("rt_*.json"):
-            record = json.loads(path.read_text())
+            try:
+                record = json.loads(path.read_text())
+                self._validate_record(record, path)
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                self._quarantine(path, type(exc).__name__)
+                continue
             self.jobs[record["job_id"]] = RepoTestJob(record)
+        self.prune()
+
+    @staticmethod
+    def _validate_record(record: Any, path: Path) -> None:
+        if not isinstance(record, dict) or not _REQUIRED_FIELDS <= record.keys():
+            raise ValueError("incomplete repository test record")
+        if (
+            record["job_id"] != path.stem
+            or record["status"] not in _TERMINAL | {"queued"}
+            or not isinstance(record["delivered"], bool)
+            or not isinstance(record["key"], list)
+            or not isinstance(record["workers"], list)
+            or not all(isinstance(worker, str) for worker in record["workers"])
+            or not isinstance(record["selectors"], list)
+            or not all(isinstance(record[name], str) for name in (
+                "repository", "head_sha", "suite", "channel_id",
+            ))
+            or not isinstance(record["pull_request"], int)
+            or (record["starting_turn_id"] is not None
+                and not isinstance(record["starting_turn_id"], str))
+            or (record["snapshot"] is not None and not isinstance(record["snapshot"], dict))
+            or (record["status"] in _TERMINAL and not isinstance(record.get("result"), dict))
+        ):
+            raise ValueError("invalid repository test record")
+
+    def _quarantine(self, path: Path, error_type: str) -> None:
+        quarantine = self.directory / "quarantine"
+        destination = quarantine / (uuid.uuid4().hex + ".json")
+        try:
+            quarantine.mkdir(mode=0o700, exist_ok=True)
+            quarantine.chmod(0o700)
+            path.replace(destination)
+            destination.chmod(0o600)
+        except OSError:
+            # A read-only or disappearing record must not prevent healthy job
+            # recovery. Keep a durable warning without rendering file contents.
+            log_durable_event_sync("repo_test_record_quarantine_failed", error_type=error_type)
+        else:
+            log_durable_event_sync("repo_test_record_quarantined", error_type=error_type)
+
+    def prune(self) -> None:
+        """Bound delivered terminal history; never discard pending recovery."""
+        now = time.time()
+        delivered = []
+        for job in self.jobs.values():
+            if job.record["status"] not in _TERMINAL or not job.record["delivered"]:
+                continue
+            path = self.directory / f"{job.job_id}.json"
+            try:
+                # mtime also supports records written before retention existed.
+                delivered.append((path.stat().st_mtime, job.job_id, path))
+            except OSError:
+                continue
+        for index, (modified, job_id, path) in enumerate(sorted(delivered, reverse=True)):
+            if now - modified <= _RETENTION_SECONDS and index < _MAX_DELIVERED_RECORDS:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                log_durable_event_sync("repo_test_record_prune_failed")
+            else:
+                self.jobs.pop(job_id, None)
 
     def save(self, job: RepoTestJob, **updates: Any) -> None:
         job.record.update(updates)
@@ -116,6 +193,7 @@ class RepoTestJobRegistry:
         accepted = await self.on_complete(event)
         if accepted is not False:
             self.save(job, delivered=True)
+            self.prune()
 
     async def recover(self, cleanup: Callable[[dict], Awaitable[None]]) -> None:
         for job in tuple(self.jobs.values()):

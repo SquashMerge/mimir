@@ -72,6 +72,76 @@ async def test_repo_test_job_deduplication_and_durable_private_result(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["{partial", "[]", '{"job_id":"rt_broken"}', "invalid_types", "invalid_utf8"])
+async def test_repo_test_registry_quarantines_corruption_and_recovers_healthy(tmp_path, monkeypatch, bad):
+    from mimir import repo_test_jobs
+    warnings = []
+    monkeypatch.setattr(repo_test_jobs, "log_durable_event_sync",
+                        lambda kind, **fields: warnings.append((kind, fields)))
+    registry = RepoTestJobRegistry(tmp_path, AsyncMock())
+    queued = enqueue(registry, AsyncMock())
+    job = registry.jobs[queued["job_id"]]
+    job.task.cancel()
+    await asyncio.gather(job.task, return_exceptions=True)
+    path = tmp_path / "rt_broken.json"
+    if bad == "invalid_types":
+        path.write_text(json.dumps({**job.record, "job_id": "rt_broken", "status": []}))
+    elif bad == "invalid_utf8":
+        path.write_bytes(b"\xff")
+    else:
+        path.write_text(bad)
+    recovered = RepoTestJobRegistry(tmp_path, AsyncMock(return_value=True))
+    assert set(recovered.jobs) == {job.job_id}
+    assert not path.exists()
+    [quarantined] = (tmp_path / "quarantine").iterdir()
+    assert quarantined.stat().st_mode & 0o777 == 0o600
+    assert quarantined.parent.stat().st_mode & 0o777 == 0o700
+    assert warnings[0][0] == "repo_test_record_quarantined"
+    assert bad not in str(warnings)
+    await recovered.recover(AsyncMock())
+    recovered.on_complete.assert_awaited_once()
+    assert recovered.on_complete.call_args.args[0].continuation_auth_context is None
+    # Quarantine is not re-discovered or repeatedly warned about on next boot.
+    RepoTestJobRegistry(tmp_path, AsyncMock())
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [2, 4])
+async def test_repo_test_registry_retention_preserves_pending_records(tmp_path, monkeypatch, limit):
+    import os
+    from mimir import repo_test_jobs
+    monkeypatch.setattr(repo_test_jobs.time, "time", lambda: 2_000_000_000)
+    monkeypatch.setattr(repo_test_jobs, "_MAX_DELIVERED_RECORDS", limit)
+    registry = RepoTestJobRegistry(tmp_path, AsyncMock(return_value=False))
+    jobs = []
+    for index in range(7):
+        queued = enqueue(registry, AsyncMock(return_value={"ok": True}), head_sha=str(index) * 40)
+        job = registry.jobs[queued["job_id"]]
+        await job.task
+        jobs.append(job)
+    for index, job in enumerate(jobs):
+        # Three recent delivered, one expired delivered, one recent and one
+        # expired undelivered, and one old queued job all share the directory.
+        registry.save(job, delivered=index < 4, status="queued" if index == 6 else "completed")
+        modified = 2_000_000_000 - (8 * 86400 if index >= 3 else index)
+        os.utime(tmp_path / f"{job.job_id}.json", (modified, modified))
+    recovered = RepoTestJobRegistry(tmp_path, AsyncMock())
+    # The larger cap isolates age expiry: without the age guard, index 3
+    # would survive. The smaller cap independently isolates count retention.
+    survivors = (0, 1, 4, 5, 6) if limit == 2 else (0, 1, 2, 4, 5, 6)
+    expected = {jobs[index].job_id for index in survivors}
+    assert set(recovered.jobs) == expected
+    assert {path.stem for path in tmp_path.glob("rt_*.json")} == expected
+    # Enforce retention during a long-lived runtime too, not only at startup.
+    monkeypatch.setattr(repo_test_jobs, "_MAX_DELIVERED_RECORDS", 1)
+    await recovered.deliver(recovered.jobs[jobs[4].job_id])
+    # AsyncMock's default is accepted, so newly delivered history is bounded.
+    assert sum(job.record["delivered"] for job in recovered.jobs.values()) == 1
+    assert jobs[5].job_id in recovered.jobs and jobs[6].job_id in recovered.jobs
+
+
+@pytest.mark.asyncio
 async def test_repo_test_turn_cancel_does_not_cancel_job_but_operator_does(tmp_path):
     complete = AsyncMock(return_value=True)
     registry = RepoTestJobRegistry(tmp_path, complete)
