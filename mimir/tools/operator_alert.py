@@ -19,6 +19,33 @@ _config: Any = None
 _log = logging.getLogger(__name__)
 
 
+async def send_operator_notice(text: str) -> bool:
+    """Server-owned alert using the configured destination, without a model turn."""
+    channel = (getattr(_config, "operator_alert_channel", "") or "").strip()
+    if not channel or _channel_registry is None:
+        return False
+    if channel.startswith("web-"):
+        from ..history import get_global_buffer
+
+        buffer = get_global_buffer()
+        if buffer is None:
+            raise RuntimeError("operator alert history unavailable")
+        record = buffer.make_message(
+            channel_id=channel, kind="assistant_message", content=text,
+            msg_id=uuid.uuid4().hex[:12], source="web", integrity="trusted",
+        )
+        await buffer.append(record, require_disk=True)
+        try:
+            await _channel_registry.send(channel, text, final=False, message_id=record.msg_id)
+        except Exception:
+            _log.warning("operator alert persisted; live web fan-out failed")
+    else:
+        result = await _channel_registry.send(channel, text, final=True)
+        if not getattr(result, "sent", True):
+            raise RuntimeError("operator alert not delivered")
+    return True
+
+
 async def send_social_proposal_ping(text: str) -> None:
     """Server-owned proposal notification; no model-selected channel or text."""
     channel = (getattr(_config, "operator_alert_channel", "") or "").strip()
