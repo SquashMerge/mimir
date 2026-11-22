@@ -225,6 +225,78 @@ def test_startup_exception_cannot_continue_to_tests(session):
     assert completed.stdout == ""
 
 
+def test_startup_exception_allows_unrelated_python(session):
+    """Mutation oracle: an unconditional os._exit(125) must fail this test."""
+    (session[1] / "python/worklink_pytest.py").write_text("raise RuntimeError('broken guard')\n")
+    completed = run(session, [sys.executable, "-c", "print('unrelated tool ran')"], arguments=())
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout == "unrelated tool ran\n"
+    assert "startup guard failed: broken guard" in completed.stderr
+
+
+@pytest.mark.parametrize("argv, original", [
+    (None, None), ([], 42), (["tool.py"], ["python", "-m"]),
+    (["tool.py"], ["python", "-c", "pytest"]),
+])
+def test_unusual_interpreter_startup_does_not_kill_python(session, argv, original):
+    hook = session[1] / "python/sitecustomize.py"
+    # Start normally, then reproduce an embedded interpreter's missing/odd
+    # attributes while executing the real hook in an isolated process.
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('embedded_hook', {str(hook)!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        + ("del sys.argv\n" if argv is None else f"sys.argv = {argv!r}\n")
+        + ("del sys.orig_argv\n" if original is None else f"sys.orig_argv = {original!r}\n")
+        + "spec.loader.exec_module(module)\nprint('embedded tool ran')\n"
+    )
+    completed = run(session, [sys.executable, "-c", code], arguments=())
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout == "embedded tool ran\n"
+
+
+@pytest.mark.parametrize("entry", ["shim", "venv"])
+def test_startup_exception_blocks_console_pytest(session, entry):
+    (session[1] / "python/worklink_pytest.py").write_text("raise RuntimeError('broken guard')\n")
+    command = ["pytest"] if entry == "shim" else [str(session[0] / ".venv/bin/pytest")]
+    completed = run(session, command)
+    assert completed.returncode == 125
+    assert "startup guard failed" in completed.stderr
+    assert completed.stdout == ""
+
+
+@pytest.mark.parametrize("broken_guard", [False, True])
+def test_venv_sitecustomize_is_chained(session, broken_guard):
+    repo, guard, env = session
+    uv = shutil.which("uv")
+    assert uv, "uv is required for this repository's acceptance tests"
+    subprocess.run([uv, "venv", "--offline", "--python", sys.executable,
+                    "--allow-existing", ".venv"], cwd=repo, env=env,
+                   check=True, capture_output=True, timeout=20)
+    python = str(repo / ".venv/bin/python")
+    paths = run(session, [python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                arguments=())
+    assert paths.returncode == 0, paths.stderr
+    site_packages = Path(paths.stdout.strip())
+    (site_packages / "sitecustomize.py").write_text(textwrap.dedent("""
+        import os, sitecustomize, sys
+        assert sitecustomize.__file__ == __file__
+        assert os.environ['PYTHONPATH'] not in sys.path
+        os.environ['PROJECT_STARTUP_RAN'] = 'yes'
+    """))
+    if broken_guard:
+        (guard / "python/worklink_pytest.py").write_text("raise RuntimeError('broken guard')\n")
+    completed = run(session, [python, "-c", textwrap.dedent("""
+        import os, sys
+        assert os.environ['PROJECT_STARTUP_RAN'] == 'yes'
+        assert os.environ['PYTHONPATH'] in sys.path
+        print('project hook ran')
+    """)], arguments=())
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout == "project hook ran\n"
+    assert ("startup guard failed" in completed.stderr) == broken_guard
+
+
 def test_single_node_detection_is_conservative(monkeypatch):
     spec = importlib.util.spec_from_file_location("guard_under_test", SOURCE / "worklink_pytest.py")
     module = importlib.util.module_from_spec(spec)
