@@ -57,7 +57,7 @@ def _patch_api(monkeypatch, *, mergeable, behind, reviews=None,
 @pytest.fixture
 def events(monkeypatch):
     captured = []
-    monkeypatch.setattr(poller, "_conflict_pr_queued", lambda *args: False)
+    monkeypatch.setattr(poller, "_pr_merge_queue_status", lambda *args: False)
     monkeypatch.setattr(
         poller, "_emit", lambda prompt, **extra: captured.append({"prompt": prompt, **extra}),
     )
@@ -230,7 +230,7 @@ def test_conflict_attempts_share_backoff_and_named_exhaustion(monkeypatch, event
 @pytest.mark.parametrize("queued", [True, None])
 def test_conflict_queued_or_unknown_pr_has_no_resolution_authority(monkeypatch, events, queued):
     _patch_api(monkeypatch, mergeable=False, behind=2)
-    monkeypatch.setattr(poller, "_conflict_pr_queued", lambda *args: queued)
+    monkeypatch.setattr(poller, "_pr_merge_queue_status", lambda *args: queued)
     count, _ = poller._check_own_mergeability("o/r", "tok", "mimir-bot", {}, now=NOW)
     assert count == 0 and events == []
 
@@ -284,17 +284,22 @@ def test_conflict_backoff_and_gave_up_do_not_restart_same_head(monkeypatch, even
     ({"data": {"repository": None}}, None),
     ({"data": {"repository": {"pullRequest": {"headRefOid": HEAD, "mergeQueueEntry": {}}}}}, None),
 ])
-def test_conflict_queue_lookup_fails_closed(monkeypatch, response, expected):
+def test_conflict_queue_lookup_fails_closed(monkeypatch, response, expected, real_merge_queue_read):
     calls = []
+    if isinstance(response, dict):
+        pr = ((response.get("data") or {}).get("repository") or {}).get("pullRequest")
+        if isinstance(pr, dict):
+            pr["number"] = 42
 
-    def api(endpoint, token, **kwargs):
-        calls.append((endpoint, kwargs))
+    def request(self, method, endpoint, **kwargs):
+        calls.append((method, endpoint, kwargs))
         return response
 
-    monkeypatch.setattr(poller, "_gh_api", api)
-    assert poller._conflict_pr_queued("o/r", 42, HEAD, "tok") is expected
-    assert calls[0][0] == "graphql"
-    assert "mergeQueueEntry" in calls[0][1]["graphql_query"]
+    monkeypatch.setattr(poller.GitHubForgeClient, "_request", request)
+    assert poller._pr_merge_queue_status("o/r", 42, HEAD, "tok") is expected
+    assert calls[0][:2] == ("POST", "/graphql")
+    assert "mergeQueueEntry" in calls[0][2]["body"]["query"]
+    assert "headRefOid" in calls[0][2]["body"]["query"]
 
 
 def test_attempt_budget_backs_off_then_reports_named_exhaustion(monkeypatch, events):

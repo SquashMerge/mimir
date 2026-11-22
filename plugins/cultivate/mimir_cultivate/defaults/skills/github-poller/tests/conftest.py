@@ -6,8 +6,13 @@ import pytest
 from github_poller_test_support import poller
 
 
+@pytest.fixture
+def real_merge_queue_read():
+    """Opt queue contract tests out of the legacy selection-only stub."""
+
+
 @pytest.fixture(autouse=True)
-def _trusted_pr_authors_by_default(monkeypatch: pytest.MonkeyPatch):
+def _trusted_pr_authors_by_default(monkeypatch: pytest.MonkeyPatch, request):
     """Keep legacy selection tests focused; trust-policy tests override this."""
     monkeypatch.setattr(
         poller, "_pr_author_is_trusted", lambda *args, **kwargs: True,
@@ -18,6 +23,12 @@ def _trusted_pr_authors_by_default(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         poller, "_github_author_is_trusted", lambda *args, **kwargs: True,
     )
+    # Legacy selection tests own REST fixtures; queue-read/skip coverage lives
+    # in the provider's test_merge_queue_remediation.py.
+    if "real_merge_queue_read" not in request.fixturenames:
+        monkeypatch.setattr(
+            poller.GitHubForgeClient, "is_pull_request_queued", lambda *args, **kwargs: False,
+        )
 
 
 @pytest.fixture(autouse=True)

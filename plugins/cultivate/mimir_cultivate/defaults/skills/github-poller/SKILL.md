@@ -200,6 +200,10 @@ For each repo in `GITHUB_REPOS`:
   are bounded per PR/head/reason, and end in the named
   `pr_mergeability_rebase_gave_up` signal. At most one such attempt is emitted
   across all repositories in a poll cycle. This path never merges a PR.
+  A typed GraphQL `mergeQueueEntry` read skips this automatic remediation while
+  the PR is queued (or queue status is unavailable), before emitting any checkout,
+  test or push work. The merge queue already tests the current base. Requested
+  reviews and operator asks still run.
 - **Completed check failures on open PRs** (`pr_ci_failure`) — a newly failed
   check set on a PR authored by `MIMIR_GITHUB_SELF_LOGIN` starts one remediation
   turn bound to the repository, PR number, immutable head SHA, failed check IDs,

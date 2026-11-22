@@ -161,6 +161,7 @@ from mimir.pollers import (
 from mimir.prompt_safety import sanitize_prompt_field
 from mimir.github_identity import own_conflict_pr_author
 from mimir_cultivate.ci import capture_job_log, clean_log_tail, classify_cancelled_run
+from mimir_cultivate.forge import ForgeError, GitHubForgeClient
 from mimir_cultivate.github_trust import partition, sanitize_login, sanitize_url
 from mimir_cultivate.review_checks import approval_blocker
 from mimir_cultivate.repository import RepositoryInventory
@@ -3656,28 +3657,20 @@ def _deliver_pr_ci(
     }
 
 
-def _conflict_pr_queued(repo: str, number: int, head: str, token: str) -> bool | None:
-    """REST mergeability does not expose queue membership; unknown fails closed."""
-    owner, name = repo.split("/", 1)
-    result = _gh_api("graphql", token, graphql_query=(
-        "query { repository(owner: " + json.dumps(owner) + ", name: " + json.dumps(name)
-        + ") { pullRequest(number: " + str(number)
-        + ") { headRefOid mergeQueueEntry { id } } } }"
-    ))
-    if not isinstance(result, dict) or result.get("errors"):
+def _pr_merge_queue_status(repo: str, number: int, head: str, token: str) -> bool | None:
+    """Bound the typed queue read by the same hard deadline as REST reads."""
+    budget = _ACTIVE_TICK_BUDGET
+    timeout = budget.call_timeout() if budget is not None else float(GH_API_TIMEOUT_SECONDS)
+    if timeout is None:
+        budget.note_truncation("merge_queue_read_refused", 1)
         return None
     try:
-        pr = result["data"]["repository"]["pullRequest"]
-        if pr["headRefOid"] != head or "mergeQueueEntry" not in pr:
-            return None
-        entry = pr["mergeQueueEntry"]
-        if entry is None:
-            return False
-        if isinstance(entry, dict) and entry.get("id"):
-            return True
-    except (KeyError, TypeError):
-        pass
-    return None
+        with _wall_clock_deadline(timeout):
+            return GitHubForgeClient(token=token, timeout=timeout).is_pull_request_queued(
+                repo, number, expected_head=head,
+            )
+    except (ForgeError, _DeadlineExceeded):
+        return None
 
 
 def _check_own_mergeability(
@@ -3738,12 +3731,22 @@ def _check_own_mergeability(
         # response may authorize work if the PR merges between those requests.
         if pr.get("state") != "open" or pr.get("merged") is True or pr.get("merged_at"):
             continue
+        # The merge queue already rebuilds/tests against the current base and
+        # rejects branch pushes. Do not authorize even a checkout/test turn.
+        # Review requests and operator asks use separate, unaffected paths.
         head = pr.get("head") or {}
         base = pr.get("base") or {}
         head_sha = head.get("sha") or ""
         base_sha = base.get("sha") or ""
         mergeable = pr.get("mergeable")
         if not head_sha or not base_sha or not isinstance(mergeable, bool):
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        queued = _pr_merge_queue_status(repo, number, head_sha, token)
+        if queued is not False:
+            reason = "in merge queue" if queued is True else "merge queue status unavailable"
+            _eprint(f"Skipping non-review remediation for PR #{number}: {reason}")
             if key in prior:
                 new[key] = prior[key]
             continue
@@ -3781,12 +3784,6 @@ def _check_own_mergeability(
             # Moving the head could make an unaddressed blocking review appear
             # stale. The changes-requested reconciler owns this PR until cleared.
             continue
-        if not mergeable and _conflict_pr_queued(repo, number, head_sha, token) is not False:
-            # A queued or unverified PR remains escalation-only.
-            if key in prior:
-                new[key] = prior[key]
-            continue
-
         reason = "conflicting" if not mergeable else "behind_base"
         attempts = 0
         last_attempt: datetime | None = None

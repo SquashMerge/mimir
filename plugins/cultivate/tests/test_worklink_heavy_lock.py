@@ -7,7 +7,13 @@ MIMIR_* names, so the controller's lease path and timeout are carried explicitly
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
+import json
 import os
+from pathlib import Path
+import shlex
+import sys
+from textwrap import dedent
 
 import pytest
 import yaml
@@ -32,6 +38,125 @@ INVALID = (
     "/locks/heavy\nlock",
     "/locks/heavy:lock",
 )
+
+
+@pytest.mark.parametrize(
+    ("lease", "invalid"),
+    [
+        ({}, None),
+        ({"MIMIR_HEAVY_LOCK_FILE": LOCK}, None),
+        ({"MIMIR_HEAVY_LOCK_FILE": LOCK, "MIMIR_HEAVY_LOCK_TIMEOUT": TIMEOUT,
+          "MIMIR_HEAVY_TIER": "medium"}, None),
+        ({"MIMIR_HEAVY_LOCK_FILE": "relative.lock"}, "MIMIR_HEAVY_LOCK_FILE"),
+        ({"MIMIR_HEAVY_LOCK_FILE": LOCK, "MIMIR_HEAVY_LOCK_TIMEOUT": "0"},
+         "MIMIR_HEAVY_LOCK_TIMEOUT"),
+        ({"MIMIR_HEAVY_LOCK_FILE": LOCK, "MIMIR_HEAVY_TIER": "small"}, "MIMIR_HEAVY_TIER"),
+    ],
+    ids=["unset", "lock-only", "full-lease", "bad-path", "bad-timeout", "bad-tier"],
+)
+async def test_ready_queue_dispatch_carries_lease_to_gate_and_builder(
+    tmp_path, monkeypatch, lease, invalid,
+):
+    """Real poller scrub -> shipped dispatch -> detached run -> worker envs.
+
+    Substitute only issue selection and the CLI probe, not environment assembly
+    or the detached launcher. No live queue, worker daemon or deployment needed.
+    """
+    from mimir.event_logger import init_logger
+    from mimir.plugins.manager import load_plugins
+    from mimir.pollers import discover_pollers, run_poller
+
+    root = Path(__file__).resolve().parents[3]
+    skill = root / "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator"
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    result_path = tmp_path / "result.json"
+    init_logger(home / "events.jsonl", session_id="heavy-lock-dispatch")
+    monkeypatch.setattr(os, "environ", {
+        "PATH": os.environ.get("PATH", ""), "HOME": str(home),
+        "WORKLINK_REPO": str(repo), "MIMIR_PLUGINS": "cultivate",
+        "MIMIR_API_KEY": "controller-secret", **lease,
+    })
+    [cfg] = discover_pollers(
+        skill, state_root=home / "state" / "pollers",
+        policy=load_plugins(enable="cultivate").policy, plugin_candidates=(),
+    )
+    driver = tmp_path / "dispatch.py"
+    driver.write_text(dedent(f"""
+        import importlib.util, json, os, subprocess, sys
+        from pathlib import Path
+        sys.path.insert(0, {str(root)!r})
+        def lease_only(env):
+            return {{k: v for k, v in env.items() if k.startswith("MIMIR_HEAVY_")}}
+        if "--probe" in sys.argv:
+            from mimir_cultivate.contained_execution import base_worker_environment
+            from mimir_cultivate.worklink.compute import WorkSpec, _enabled_child_env
+            from mimir_cultivate.worklink.daemon_sessions import session_environment
+            assert sys.argv[2:5] == ["worklink", "run", "2196"]
+            assert "MIMIR_API_KEY" not in os.environ
+            spec = WorkSpec(2196, 1, "repo", "main", "issue/2196", "prompt",
+                            None, "true", "opencode", 30)
+            result = {{"run": lease_only(os.environ)}}
+            for name, build in [
+                ("base", lambda: base_worker_environment({IDENTIFIER!r})),
+                ("gate", lambda: _enabled_child_env(spec, {IDENTIFIER!r})),
+                ("builder", lambda: session_environment(
+                    {{}}, home=Path({str(home)!r}), git_settings=(), credentials={{}})),
+            ]:
+                try:
+                    result[name] = lease_only(build())
+                except ValueError as exc:
+                    result[name] = {{"error": str(exc)}}
+            Path({str(result_path)!r}).write_text(json.dumps(result))
+        else:
+            loader = importlib.util.spec_from_file_location(
+                "queue_under_test", {str(skill / "scripts/poller.py")!r})
+            queue = importlib.util.module_from_spec(loader)
+            sys.modules[loader.name] = queue
+            loader.loader.exec_module(queue)
+            children = []
+            real_popen = subprocess.Popen
+            def tracked_popen(*args, **kwargs):
+                child = real_popen(*args, **kwargs)
+                children.append(child)
+                return child
+            queue.subprocess.Popen = tracked_popen
+            assert queue._dispatch(
+                item=queue.DispatchItem(2196, "leaf"),
+                home=Path(os.environ["MIMIR_HOME"]), repo=os.environ["WORKLINK_REPO"],
+                state_dir=Path(os.environ["STATE_DIR"]),
+                run_bin=[sys.executable, __file__, "--probe"],
+                active=0, leaf_cap=2, factory_cap=1)
+            assert len(children) == 1
+            try:
+                assert children[0].wait(timeout=15) == 0
+            finally:
+                if children[0].poll() is None:
+                    children[0].kill()
+                    children[0].wait()
+    """), encoding="utf-8")
+    cfg = replace(
+        cfg, command=f"{shlex.quote(sys.executable)} {shlex.quote(str(driver))}", hooks=None,
+    )
+
+    async def enqueue(_event):
+        pytest.fail("the dispatch probe must not enqueue agent turns")
+
+    assert await run_poller(cfg, enqueue=enqueue, home=home, timeout=30) == 0
+    dispatch_log = cfg.resolved_persist_dir() / "run-2196.log"
+    assert result_path.exists(), (
+        (home / "events.jsonl").read_text(),
+        dispatch_log.read_text() if dispatch_log.exists() else "no dispatch log",
+    )
+    result = json.loads(result_path.read_text())
+    assert result["run"] == lease
+    for name in ("base", "gate", "builder"):
+        if invalid is not None:
+            assert invalid in result[name]["error"]
+        else:
+            assert result[name] == heavy_lock_environment(lease)
 
 
 def test_unset_or_empty_means_no_lease(monkeypatch):
