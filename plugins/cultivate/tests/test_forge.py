@@ -202,6 +202,19 @@ def test_registered_forge_writes_all_publish_provenance() -> None:
             # A variable verb must not silently disappear from this inventory.
             assert call.args and isinstance(call.args[0], ast.Constant), node.name
             assert call.args[0].value in {"GET", "POST", "PATCH", "PUT", "DELETE"}, node.name
+            if (len(call.args) > 1 and isinstance(call.args[1], ast.Constant)
+                    and call.args[1].value == "/graphql"):
+                # GraphQL queries use POST without mutating GitHub. Exempt only
+                # a literal query operation, never a dynamic query or mutation.
+                assert call.args[0].value == "POST", node.name
+                body = next(kw.value for kw in call.keywords if kw.arg == "body")
+                assert isinstance(body, ast.Dict), node.name
+                query = next(value for key, value in zip(body.keys, body.values)
+                             if isinstance(key, ast.Constant) and key.value == "query")
+                assert isinstance(query, ast.Constant) and isinstance(query.value, str), node.name
+                assert query.value.lstrip().startswith("query("), node.name
+                assert "mutation" not in query.value, node.name
+                continue
             if call.args[0].value != "GET":
                 mutations.add(node.name)
     assert mutations
