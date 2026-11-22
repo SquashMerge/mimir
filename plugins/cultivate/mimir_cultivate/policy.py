@@ -698,7 +698,15 @@ def _valid_interrupted_operation(scope, state, tool_name, turn_nonce, *, interru
             or f"refs/heads/{scope.base_ref}" not in _PROTECTED_BRANCH_REFS
             or evidence.original_head != state.git_expected_head):
         return False
-    allowed = {"repo_status", "repo_unmerged"}
+    # Escalating a limitation and reporting it must remain possible while our
+    # own checkout is interrupted. These names still require the same scope,
+    # lease, turn nonce and Git markers checked here, plus their ordinary action
+    # grants and IFC gates. Only the exact content-free escalation status is
+    # non-ingesting; PR reads retain their normal content provenance.
+    allowed = {
+        "repo_status", "repo_unmerged", "unsupported_operation",
+        "pr_metadata", "pr_comments", "pr_reviews", "pr_comment",
+    }
     if evidence.kind == "rebase":
         allowed.add("repo_rebase_abort")
         if scope.event_type == "pr_mergeability_conflicting":

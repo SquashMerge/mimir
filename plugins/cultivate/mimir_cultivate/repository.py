@@ -4397,13 +4397,14 @@ def is_tracked_file_in_pr_checkout(state: RepoReviewState, path: Path) -> bool:
 import ast
 import asyncio
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
 import stat
+import sys
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 import uuid
@@ -4431,7 +4432,7 @@ from .worklink.identities import get_identities
 from .worklink.worker_client import StaleWorkerExecutorError
 
 
-#: Wall-clock ceiling for one project-test invocation.
+#: Run-only ceiling for one project-test invocation (lease queueing is separate).
 #:
 #: 300s could not run this repository's own suite. Every measured full-suite run
 #: sits between 492s and 597s, so ``repo_test`` timed out on the gate command
@@ -4454,6 +4455,16 @@ from .worklink.worker_client import StaleWorkerExecutorError
 #: denies the agent any full-suite evidence of its own, which is what happened
 #: through nine review rounds on #1594.
 _TIMEOUT_SECONDS = 1800.0
+_LEASE_TIMEOUT_SECONDS = 14400
+_LEASE_KILL_GRACE_SECONDS = 10
+# Executed inside the run-only timeout, after the lease has been acquired.
+# Contained workers are local: their monotonic clock shares the controller's
+# epoch. The first nonce-bound frame precedes all output from the leg itself.
+_LEASE_RUN_START = (
+    "import os,sys,time; "
+    "os.write(2, (sys.argv[1]+str(time.monotonic())+'\\n').encode()); "
+    "os.execvp(sys.argv[2], sys.argv[2:])"
+)
 # A full suite includes wheel builds and dependency setup, not just one command:
 # allow 16x shell_exec's 1 MiB per stream, matching Worklink's 16 MiB stderr
 # budget while staying at one quarter of its 64 MiB stdout budget. Overflow
@@ -5050,6 +5061,53 @@ def _remap_command(root: Path, command: tuple[str, ...]) -> tuple[str, ...]:
     return (f"./{relative.as_posix()}", *command[1:])
 
 
+def _lease_test_command(
+    command: tuple[str, ...], environment: dict[str, str], identifier: str, remaining: float,
+) -> tuple[str, ...]:
+    """Use the lease helper's timeout selection, in the worker's fixed PATH."""
+    tool = environment.get("MIMIR_HEAVY_TIMEOUT_TOOL") or environment.get("MIMIR_HEAVY_GTIMEOUT")
+    if not tool:
+        candidates = ("gtimeout", "timeout") if sys.platform == "darwin" else ("timeout", "gtimeout")
+        tool = next(
+            (name for name in candidates if shutil.which(name, path=environment["PATH"])),
+            candidates[0],
+        )
+    return (
+        "sh", "./scripts/heavy_run.sh", tool, "-k", "10s", f"{remaining}s",
+        "python3", "-c", _LEASE_RUN_START, f"\x1erepo-test-{identifier}:",
+        *command,
+    )
+
+
+def _lease_test_result(
+    result: CollectedExecutionResult, identifier: str, launched: float, finished: float,
+) -> tuple[CollectedExecutionResult, float]:
+    """Strip internal telemetry and return queue time, never trusting test prose."""
+    marker = f"\x1erepo-test-{identifier}:".encode()
+    before, found, after = result.stderr.partition(marker)
+    if not found:
+        if result.timed_out or result.exit_code in {124, 137}:
+            raise ProjectTestRefusal(
+                "repo_test_lease_wait_timeout", "project tests did not start before the lease wait expired",
+                execution_started=False,
+            )
+        # A successful leg must have passed the in-lease start trampoline.
+        if result.exit_code == 0 and not result.output_overflow:
+            raise RuntimeError("project test lease start telemetry is missing")
+        return result, 0.0
+    timestamp, newline, output = after.partition(b"\n")
+    try:
+        started = float(timestamp)
+    except ValueError:
+        started = float("nan")
+    if not newline or not launched <= started <= finished:
+        raise RuntimeError("project test lease start telemetry is invalid")
+    return replace(
+        result, stderr=before + output,
+        timed_out=result.timed_out or result.exit_code in {124, 137},
+    ), started - launched
+
+
 def _safe_output(
     value: bytes,
     scrubber: SensitiveMaterialScrubber,
@@ -5243,7 +5301,7 @@ class RepoProjectTests:
                         execution_started=False,
                     )
         try:
-            heavy_lock_environment()
+            lease_environment = heavy_lock_environment()
         except ValueError as exc:
             raise ProjectTestRefusal("heavy_lock_invalid", str(exc), execution_started=False) from None
         git_tools: RepoGitTools | None = None
@@ -5354,6 +5412,13 @@ class RepoProjectTests:
             ) from exc
 
         scrubber.add_path(checkout.path)
+        leased = bool(lease_environment)
+        if leased and not (checkout.path / "scripts/heavy_run.sh").is_file():
+            await safe_log_event(
+                "repo_test_lease_warning", reason_code="wrapper_missing", level="warning",
+                repository=repository, pull_request=issue,
+            )
+            leased = False
         prepared = []
         for leg in legs:
             identifier = str(uuid.uuid4())
@@ -5373,6 +5438,12 @@ class RepoProjectTests:
                 # Disable ambient uv config above the fd-entered checkout.
                 environment["UV_NO_CONFIG"] = "1"
                 environment["UV_CACHE_DIR"] = f'{environment["XDG_CACHE_HOME"]}/uv'
+            if leased:
+                environment.setdefault("MIMIR_HEAVY_TIER", "medium")
+                environment.setdefault("MIMIR_HEAVY_LOCK_TIMEOUT", str(_LEASE_TIMEOUT_SECONDS))
+                for name in ("MIMIR_HEAVY_TIMEOUT_TOOL", "MIMIR_HEAVY_GTIMEOUT"):
+                    if name in os.environ:
+                        environment[name] = os.environ[name]
             if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
                 try:
                     await _checkout_io(checkout.close)
@@ -5400,8 +5471,8 @@ class RepoProjectTests:
                  stdout_relative, stderr_relative) = prepared_leg
                 try:
                     try:
-                        # All legs share one budget, starting at the first run.
-                        # Keep the single-command timeout unchanged.
+                        # All legs share one run budget. Each acquired lease's
+                        # queue interval extends this deadline, not the run budget.
                         if deadline is None:
                             remaining = self._timeout
                             deadline = time.monotonic() + remaining
@@ -5411,12 +5482,30 @@ class RepoProjectTests:
                             # Never launch another worker with an expired budget.
                             result = CollectedExecutionResult(None, b"", b"", True, False, 0, 0)
                         else:
+                            argv = (*command, *paths)
+                            wait_timeout = remaining
+                            if leased:
+                                argv = _lease_test_command(argv, environment, identifier, remaining)
+                                # Leave room for the helper's queue+run bound and
+                                # both timeout tools' termination grace periods.
+                                wait_timeout += (
+                                    int(environment["MIMIR_HEAVY_LOCK_TIMEOUT"])
+                                    + 2 * _LEASE_KILL_GRACE_SECONDS
+                                )
+                            launched = time.monotonic()
                             result = await self._runner(
-                                (*command, *paths), checkout.capability, environment, (),
-                                identifier=identifier, timeout_s=remaining,
+                                argv, checkout.capability, environment, (),
+                                identifier=identifier, timeout_s=wait_timeout,
                                 stdout_limit=self._output_limit, stderr_limit=self._output_limit,
                                 scrubber=scrubber, stdout_path=stdout_path, stderr_path=stderr_path,
                             )
+                            if leased:
+                                result, queued = _lease_test_result(
+                                    result, identifier, launched, time.monotonic(),
+                                )
+                                deadline += queued
+                    except ProjectTestRefusal:
+                        raise
                     except StaleWorkerExecutorError as exc:
                         await safe_log_event(
                             "repo_test_containment_refused", reason_code="stale_root_executor",
@@ -6328,6 +6417,8 @@ def _remediation_test_guidance(code: str, *, scoped: bool) -> str:
     """Publication advice, not authorization or a replacement for CI checks."""
     if code == "test_suite_selection_refused":
         return "No tests ran. Retry with exactly one declared suite using suite=<name>."
+    if code == "repo_test_lease_wait_timeout":
+        return "No tests ran: the shared heavy-run lease wait expired. Retry when the host lease is available."
     publish = (
         "After scoped tests pass, commit, push the fix to the PR branch, and "
         "re-request review. In the PR comment state that the in-runner full suite "

@@ -317,7 +317,7 @@ def _auth(policy, state, enforce, *, discovered=False):
     )
 
 
-def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=False, behind_base=False, file_tools=False, event_type=None):
+def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=False, behind_base=False, file_tools=False, event_type=None, pull_request_author=None, enforce=True):
     from mimir import access_control
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import policy_scope
@@ -339,8 +339,9 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
             root = state.checkout_lease.lease_root
             state = RepoReviewState(scope)
             create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
-    if event_type is not None:
-        scope = replace(scope, event_type=event_type)
+    if event_type is not None or pull_request_author is not None:
+        scope = replace(scope, event_type=event_type or scope.event_type,
+                        pull_request_author=pull_request_author or scope.pull_request_author)
         root = state.checkout_lease.lease_root
         state = RepoReviewState(scope)
         create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
@@ -350,7 +351,7 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
     policy = load_plugins(enable="cultivate").policy
     labels = InformationFlowLabels()
     auth = replace(
-        _auth(policy, state, True, discovered=discovered),
+        _auth(policy, state, enforce, discovered=discovered),
         ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
         _plugin_slot_policy=policy,
     )
@@ -377,7 +378,7 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
     }
 
     def invoke(name, _artifact=None, **extra):
-        arguments = extra if name in filesystem_tools else {**args, **extra}
+        arguments = extra if name in filesystem_tools or name == "shell_exec" else {**args, **extra}
         request = ToolCallRequest(
             tool_call={"name": name, "args": arguments, "id": name,
                        "type": "tool_call"},
@@ -386,6 +387,8 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
         )
 
         def handler(call):
+            if name == "shell_exec":
+                pytest.fail("repo_review must refuse npm before executing a shell")
             if name in filesystem_tools:
                 method = backend.edit if name == "edit_file" else backend.write
                 result = method(**call.tool_call["args"])
@@ -1321,6 +1324,107 @@ def test_unsupported_escalation_preserves_trusted_turn_for_pr_comment(tmp_path, 
         "pr_comment", destination, auth.ifc_labels, auth, enforce=True,
         repo_pr_action_scope=scope,
     ).reason != "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
+@pytest.mark.parametrize("abort_first", [False, True], ids=["interrupted", "aborted"])
+@pytest.mark.parametrize("enforce", [False, True], ids=["shadow", "enforced"])
+def test_conflicted_merge_unsupported_operation_keeps_remediation_authorized(
+    tmp_path, monkeypatch, discovered, abort_first, enforce,
+):
+    """#2188: a bound conflict must not force escalation through channel fallback."""
+    from mimir import event_logger
+    from mimir_cultivate import forge
+    from tests.test_forge_tools import FakeForge
+
+    _, scope, state, auth, invoke = _remediation_turn(
+        tmp_path, monkeypatch, discovered=discovered, conflicting=True,
+        file_tools=True, pull_request_author="author", enforce=enforce,
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(event_logger, "log_durable_event_sync", lambda *_args, **_kw: None)
+    client = FakeForge()
+    metadata = client.get_pull_request
+    monkeypatch.setattr(client, "get_pull_request", lambda target: replace(
+        metadata(target), number=scope.pr_number, head_sha=scope.observed_head_sha,
+        head_ref=scope.head_ref,
+    ))
+    client.identity_head_repo = scope.head_repo
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: True, raising=False)
+    monkeypatch.setattr(forge, "_client", lambda _: client)
+    for name in ("pr_metadata", "pr_comments", "pr_reviews"):
+        result = invoke(name)
+        assert result.status == "success", (name, result.content)
+    conflict = invoke("repo_merge")
+    assert conflict.status == "error" and "tracked.txt" in conflict.content
+    assert state.interrupted_operation is not None
+    assert invoke("repo_unmerged").status == "success"
+    if abort_first:
+        assert invoke("repo_merge_abort").status == "success"
+    refused = invoke("shell_exec", command="npm pack", cwd=str(state.checkout_lease.path))
+    assert refused.status == "error", refused.content
+    assert "repo_review" in refused.content
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+
+    # Before the fix _valid_interrupted_operation omitted this tool, so the
+    # scoped grant failed and channel fallback set would_block=True. The exact
+    # status classifier correctly refused that shadow authorization.
+    decision = _decision(auth, scope, "unsupported_operation")
+    result = invoke("unsupported_operation", description="npm pack is unavailable",
+                    attempted_operations=["repo_merge", "repo_unmerged", "shell_exec"])
+    assert result.status == "success", result.content
+    assert json.loads(result.content)["status"] == "unsupported_operation"
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    assert decision.allowed and not decision.would_block, decision
+    assert decision.repo_pr_action_scope is scope
+    for name in ("pr_metadata", "pr_comments", "pr_reviews"):
+        result = invoke(name)
+        assert result.status == "success", (name, result.content)
+    for name in ("pr_comment", "repo_merge_abort", "repo_commit", "repo_test"):
+        decision = _decision(auth, scope, name)
+        assert decision.allowed and not decision.would_block, (name, decision)
+    result = invoke("pr_comment", body="Merge conflicted; escalated the unavailable operation.")
+    assert result.status == "success", result.content
+    if not abort_first:
+        assert invoke("repo_merge_abort").status == "success"
+    assert state.interrupted_operation is None
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    # Escalation cannot launder unrelated ingest.
+    auth.ifc_state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="attacker", domain="web", resource_id="external",
+        bridge_instance="web", sensitivity="public", source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ),)))
+    for name in ("pr_comment", "repo_merge_abort", "repo_commit", "repo_test"):
+        assert not _decision(auth, scope, name).allowed, name
+
+
+@pytest.mark.parametrize("kind", ["merge", "rebase"])
+@pytest.mark.parametrize("tool", [
+    "unsupported_operation", "pr_metadata", "pr_comments", "pr_reviews", "pr_comment",
+])
+@pytest.mark.parametrize("invalid", [None, "no_evidence", "scope_id", "lease_identity", "turn_nonce"])
+def test_interrupted_escalation_and_reporting_require_same_turn_binding(
+    tmp_path, monkeypatch, kind, tool, invalid,
+):
+    from mimir_cultivate.policy import _valid_interrupted_operation
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke(f"repo_{kind}").status == "error"
+    evidence = state.interrupted_operation
+    assert evidence is not None
+    if invalid == "no_evidence":
+        object.__setattr__(state, "interrupted_operation", None)
+    elif invalid is not None:
+        value = ("other-path", "other-recovery") if invalid == "lease_identity" else "other"
+        object.__setattr__(state, "interrupted_operation", replace(evidence, **{invalid: value}))
+    # Check the exact boundary too: other grant/lease checks must not mask a
+    # missing receipt equality in mutation testing.
+    assert _valid_interrupted_operation(
+        scope, state, tool, auth.scoped_pr_grants.nonce,
+    ) is (invalid is None)
+    decision = _decision(auth, scope, tool)
+    assert decision.allowed is (invalid is None), (tool, invalid, decision)
 
 
 @pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
