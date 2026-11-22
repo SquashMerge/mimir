@@ -77,7 +77,11 @@ for function in tree.body:
         continue
     for node in ast.walk(function):
         if isinstance(node, ast.If) and node.body and isinstance(node.body[0], ast.Raise):
-            replace_node(module, f"{function.name}: deny line {node.lineno}", node.test, "False")
+            if function.name == "integrity_tokens" and ast.unparse(node.test).startswith("all("):
+                replace_node(module, "allow SHA-1-only integrity", node.test, "False",
+                             "test_registry_sha1_only_integrity_is_refused")
+            else:
+                replace_node(module, f"{function.name}: deny line {node.lineno}", node.test, "False")
         if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant) and node.value.value is False:
             replace_node(module, f"{function.name}: return False line {node.lineno}", node, "return True")
 add(module, "closed schema permits extra content", 'extra="forbid"', 'extra="ignore"', "contract_rejects_file_bytes")
