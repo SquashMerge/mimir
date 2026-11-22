@@ -3697,6 +3697,13 @@ class Agent:
         except Exception as exc:
             from .redaction import redact_text
 
+            try:
+                from .codex_auth_alerts import notify_codex_refresh_failure
+
+                await notify_codex_refresh_failure(exc)
+            except Exception:
+                # Never include provider error text (which may carry a body).
+                log.warning("Codex refresh operator alert unavailable")
             if event.trigger == "poller":
                 transient_reason, retry_after_s = _transient_provider_failure(exc)
             error = redact_text(f"{type(exc).__name__}: {exc}")[:2048]

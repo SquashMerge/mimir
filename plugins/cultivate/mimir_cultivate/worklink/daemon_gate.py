@@ -32,7 +32,7 @@ def prepare_daemon_health(environ: dict[str, str], *, paths: RuntimePaths | None
     deadline = time.monotonic() + status_timeout
     while True:
         health = inspect()
-        if (health.get("ok") or health.get("daemon_error") or outcome not in {"seeded", "agent_newer"}
+        if (health.get("ok") or health.get("daemon_error") or outcome not in {"seeded", "agent_newer", "refreshed"}
                 or time.monotonic() >= deadline):
             return health
         time.sleep(.2)
