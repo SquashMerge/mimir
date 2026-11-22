@@ -236,6 +236,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # never woke the spawning channel — the operator sees a missing
     # wake-up before they'd notice without surfacing here.
     "shell_job_complete_enqueue_failed": ("negative", "shell_job_complete_enqueue_failed"),
+    "repo_test_complete_enqueue_failed": ("negative", "repo_test_complete_enqueue_failed"),
     # chainlink #193: wait-on-pending guard refused a bash_async respawn
     # because a same-intent job was already running on this channel.
     # Negative so dashboards + introspection-report can surface "agent
@@ -344,6 +345,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
+    "repo_test_complete_enqueue_ok": ("positive", "repo_test_complete_enqueue_ok"),
     # Discord bridge supervisor — surfaces sustained Discord-side
     # degradation (5xx at token-auth, gateway disconnect storms) that
     # would otherwise live only in container logs. ``discord_bridge_retry``
@@ -521,6 +523,7 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # completes. Same shape as git_*_failed — dedup so the operator
     # sees the latest failure, not N stale copies.
     "shell_job_complete_enqueue_failed",
+    "repo_test_complete_enqueue_failed",
     # chainlink #65 (sub B): paired positives. Latest-only on both
     # polarities — a healthy ntfy/git/shell pipeline fires success
     # on every poll/turn, which would otherwise crowd out the rest
@@ -531,6 +534,7 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "git_pull_ok",
     "git_fetch_ok",
     "shell_job_complete_enqueue_ok",
+    "repo_test_complete_enqueue_ok",
     # Discord bridge supervisor: a sustained outage fires
     # ``discord_bridge_retry`` every backoff tick (5s → 5min cap).
     # Without dedup the algedonic block would fill with retry lines
@@ -825,6 +829,15 @@ def _build_valence_groups() -> dict[str, ValenceGroup]:
             verb_map={
                 "shell_job_complete_enqueue_ok": "enqueued",
                 "shell_job_complete_enqueue_failed": "enqueue-failed",
+            },
+        ),
+        "repo_test": ValenceGroup(
+            label="repository tests",
+            positive_kinds=frozenset({"repo_test_complete_enqueue_ok"}),
+            negative_kinds=frozenset({"repo_test_complete_enqueue_failed"}),
+            verb_map={
+                "repo_test_complete_enqueue_ok": "enqueued",
+                "repo_test_complete_enqueue_failed": "enqueue-failed",
             },
         ),
     }

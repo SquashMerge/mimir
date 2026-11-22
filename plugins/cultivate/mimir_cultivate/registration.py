@@ -281,6 +281,9 @@ class CultivateProvider:
         registrar.register_server_hook("github_identity_initialize", initialize_github_forge_identity)
         registrar.register_server_hook("github_identity_recovery_pending", github_identity_recovery_pending)
         registrar.register_server_hook("forge_client_clear", lambda: set_forge_client(None))
+        from .repository import recover_repo_test_job
+
+        registrar.register_server_hook("repo_test_job_recovery", recover_repo_test_job)
         registrar.register_turn_hook("failure_intervention", is_dispatch_failure_intervention)
         registrar.register_turn_hook("budget_continuation", maybe_create_worklink_budget_continuation)
         from .feedback import feedback_extension

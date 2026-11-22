@@ -33,7 +33,8 @@ const triggerFilters: Array<{ id: TriggerFilter; label: string }> = [
   { id: "saga_session_end", label: "Synthesis" },
   { id: "poller", label: "Poller" },
   { id: "claude_code_spawn", label: "Spawn" },
-  { id: "shell_job_complete", label: "Job" }
+  { id: "shell_job_complete", label: "Job" },
+  { id: "repo_test_complete", label: "Tests" }
 ];
 
 const SESSION_PAGE_SIZE = 200;

@@ -13837,7 +13837,7 @@ def get_trusted_service_from_auth_context(
     service = getattr(auth_context, "service_authority", None)
     if not isinstance(service, ServicePrincipal):
         trigger = getattr(auth_context, "trigger", None)
-        if trigger == "shell_job_complete":
+        if trigger in {"shell_job_complete", "repo_test_complete"}:
             # Service identity is provenance; human-request guards use trigger.
             trigger = getattr(auth_context, "origin_trigger", None)
         if not isinstance(trigger, str):

@@ -719,6 +719,25 @@ def _install_runtime_globals(bundle: AgentRuntimeBundle) -> None:
         bundle.agent._shell_jobs,
         on_complete=bundle.agent._handle_shell_job_complete,
     )
+    from .repo_test_jobs import RepoTestJobRegistry, set_registry
+
+    manager = getattr(bundle.config, "plugin_manager", None)
+    hooks = manager.policy.server_hooks if manager is not None else {}
+    recovery = next((hook for (owner, name), hook in hooks.items()
+                     if owner != "core" and name == "repo_test_job_recovery"), None)
+    if recovery is not None:
+        registry = RepoTestJobRegistry(
+            bundle.config.home / "state" / "repo-test-jobs",
+            bundle.agent._on_repo_test_complete,
+        )
+        set_registry(registry)
+        bundle.agent._repo_test_jobs = registry
+        bundle._owned_closers.append(("repo_test_jobs", registry.close))
+        task = bundle.adapters.spawn_background_task(
+            registry.recover(recovery), "repo-test-job-recovery",
+        )
+        bundle._runtime_background_tasks.add(task)
+        task.add_done_callback(bundle._runtime_background_tasks.discard)
     web_tools.set_home(bundle.config.home)
     tools.set_mcp_tools([])
 
@@ -727,6 +746,7 @@ def _clear_runtime_globals(policy: Any = None) -> None:
     from . import tools
     from .history import set_global_buffer
     from .tools import web as web_tools
+    from .repo_test_jobs import set_registry
 
     resetters: tuple[Callable[[], None], ...] = (
         lambda: tools.set_memory_client(None),
@@ -743,6 +763,7 @@ def _clear_runtime_globals(policy: Any = None) -> None:
         lambda: tools.set_commitments_store(None),
         lambda: tools.set_spawn_config(None),
         lambda: tools.set_shell_job_registry(None),
+        lambda: set_registry(None),
         lambda: web_tools.set_home(None),
         lambda: tools.set_mcp_tools([]),
     )

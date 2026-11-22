@@ -7,7 +7,8 @@ export type TriggerFilter =
   | "saga_session_end"
   | "poller"
   | "claude_code_spawn"
-  | "shell_job_complete";
+  | "shell_job_complete"
+  | "repo_test_complete";
 
 export type SafeTurn = Omit<TurnRecord, "events" | "saga_calls" | "injected_inputs"> & {
   turn_id: string;
