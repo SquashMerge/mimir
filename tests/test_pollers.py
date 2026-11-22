@@ -8956,6 +8956,54 @@ print('{"poller": "x", "prompt": "ok"}')
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lease_set", [False, True])
+async def test_run_poller_mimir_passthrough_is_exactly_the_lease(
+    tmp_path: Path, home: Path, monkeypatch, lease_set: bool,
+):
+    lease = {
+        "MIMIR_HEAVY_LOCK_FILE": "/locks/heavy.lock",
+        "MIMIR_HEAVY_LOCK_TIMEOUT": "14400",
+        "MIMIR_HEAVY_TIER": "medium",
+    } if lease_set else {}
+    denied = {
+        "MIMIR_API_KEY": "secret",
+        "MIMIR_MODEL_SPEC": "private-config",
+        "MIMIR_HEAVY_OTHER": "not-a-lease-setting",
+        "MIMIR_HEAVY_LOCK_FILE_EXTRA": "not-an-exact-name",
+        "MIMIR_HEAVY_LOCK_TIMEOUT_TOKEN": "secret",
+        "MIMIR_HEAVY_TIER_SECRET": "secret",
+        "MIMIR_HOME": "stale-host-home",
+    }
+    monkeypatch.setattr(os, "environ", {
+        "PATH": os.environ.get("PATH", ""), **lease, **denied,
+        # Even explicitly allowlisting these names cannot bypass the deny.
+        "MIMIR_POLLER_ENV_ALLOWLIST": ",".join(denied),
+    })
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+from pathlib import Path
+Path(os.environ["STATE_DIR"], "env.json").write_text(json.dumps({
+    k: v for k, v in os.environ.items() if k.startswith("MIMIR_")
+}))
+""")
+    cfg = PollerConfig(
+        name="lease-env", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    assert await run_poller(cfg, enqueue=_CapturingEnqueue(), home=home) == 0
+    assert json.loads((skill_dir / "env.json").read_text()) == {
+        **lease, "MIMIR_HOME": str(home),
+    }
+    from mimir.pollers import _poller_env_available_at_discovery
+
+    available = _poller_env_available_at_discovery(env_raw={}, pass_env=[])
+    assert {key for key in available if key.startswith("MIMIR_")} == {
+        *lease, "MIMIR_HOME",
+    }
+
+
+@pytest.mark.asyncio
 async def test_run_poller_env_allowlist_override_works(
     tmp_path: Path, home: Path, monkeypatch,
 ):
