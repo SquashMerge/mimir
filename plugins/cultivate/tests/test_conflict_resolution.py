@@ -182,7 +182,7 @@ def test_conflict_resolution_outside_pr_paths_refuses_push(conflict, change):
 
 
 @pytest.mark.parametrize("modes", [("",), ("cultivate",), ("", "other")])
-def test_conflict_full_marker_requires_core_and_cultivate(conflict, modes):
+def test_conflict_full_marker_accepts_every_configured_leg(conflict, modes):
     _, _, state, _, home = conflict
     _resolve(conflict)
     _configure_test_suites(home, state, test_suites=[{
@@ -191,8 +191,11 @@ def test_conflict_full_marker_requires_core_and_cultivate(conflict, modes):
             for n, mode in enumerate(modes)
         ],
     }])
-    assert _test(state).ok
-    assert state.full_tested_head is None
+    result = _test(state)
+    assert result.ok and result.full_suite_evidence
+    assert len(result.legs) == len(modes)
+    assert state.full_tested_head == state.git_expected_head
+    assert conflict[3].execute(repo.GitPush()).ok
 
 
 @pytest.mark.parametrize("failure", ["core", "cultivate"])
@@ -270,6 +273,57 @@ def test_conflict_full_tests_bind_snapshot_and_final_commit(conflict, change):
     ).execute())
     assert state.full_tested_head is None
     assert result.ok
+
+
+@pytest.mark.parametrize("outside", [False, True])
+def test_conflict_scope_clean_merge_records_empty_proof_and_keeps_gates(tmp_path, monkeypatch, outside):
+    from tests.test_repo_tools import _repo_scope_and_state
+    from mimir_cultivate.repository import create_pr_checkout_lease
+    from mimir_cultivate.policy import RepoReviewState
+
+    origin, source, old_scope, old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "main")
+    (source / "base-only.txt").write_text("base change\n")
+    _git(source, "add", "base-only.txt")
+    _git(source, "commit", "-m", "advance base without conflicts")
+    base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "origin", "HEAD:main")
+    scope = replace(old_scope, event_type="pr_mergeability_conflicting", observed_base_sha=base)
+    state = RepoReviewState(scope)
+    create_pr_checkout_lease(scope, owner="mimir-bot",
+                             lease_root=old_state.checkout_lease.lease_root, review_state=state)
+    tools = repo.RepoGitTools(state)
+    assert tools.execute(repo.GitMerge()).ok
+    proof = state.conflict_merge
+    assert proof.conflicted_paths == frozenset()
+    assert proof.original_head == scope.observed_head_sha
+    assert proof.base == scope.observed_base_sha
+    assert state.conflict_evidence_head == state.git_expected_head
+    with pytest.raises(repo.GitRefusal) as raised:
+        tools.execute(repo.GitPush())
+    assert raised.value.code == "full_test_required"
+    if outside:
+        (state.checkout_lease.path / "outside.txt").write_text("unrelated\n")
+        _git(state.checkout_lease.path, "add", "outside.txt")
+        _git(state.checkout_lease.path, "-c", "user.name=test", "-c", "user.email=test@example.test",
+             "commit", "-m", "unrelated edit")
+        tools._refresh_expected_head()
+        # Isolate the independent path boundary from the exact-head marker.
+        state.record_conflict_evidence(scope.scope_id, state.git_expected_head)
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, test_suites=[{
+        "name": "default", "default": True, "command": "/usr/bin/true",
+    }])
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE", raising=False)
+    assert _test(state).full_suite_evidence
+    if outside:
+        with pytest.raises(repo.GitRefusal) as raised:
+            tools.execute(repo.GitPush())
+        assert raised.value.code == "conflict_resolution_outside_pr_paths"
+    else:
+        assert tools.execute(repo.GitPush()).ok
+        assert _git(origin, "rev-parse", scope.destination_ref) == state.git_expected_head
 
 
 def test_conflict_rebase_is_refused_without_starting(conflict):

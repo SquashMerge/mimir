@@ -26,7 +26,7 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2195-merge-conflict-resolution-main-integration"
+GITHUB_POLLER_RELEASE = "2195-merge-conflict-resolution-async-integration"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.
 IDENTITY_EXCEPTIONS: dict[str, set[str]] = {}

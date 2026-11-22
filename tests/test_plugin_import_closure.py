@@ -139,6 +139,9 @@ def test_runtime_construction_coding_imports(tmp_path, coding_enabled: bool) -> 
             async def on_message_injected(self, event):
                 pass
 
+            async def _on_repo_test_complete(self, event):
+                return True
+
         async def main():
             home = Path(sys.argv[1])
             from mimir.plugins.manager import load_plugins

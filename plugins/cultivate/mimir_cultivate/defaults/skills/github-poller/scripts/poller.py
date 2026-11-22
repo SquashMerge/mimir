@@ -790,7 +790,7 @@ _GH_API_BUDGET_REFUSED = _GhApiBudgetRefused()
 
 
 def _gh_api(
-    endpoint: str, token: str, *, graphql_query: str | None = None,
+    endpoint: str, token: str,
 ) -> list | dict | None | _GhApiBudgetRefused:
     """Call ``gh api <endpoint> --paginate`` and return parsed JSON.
 
@@ -824,8 +824,6 @@ def _gh_api(
                 return _GH_API_BUDGET_REFUSED
             timeout = allowed
         argv = ["gh", "api", endpoint, "--paginate"]
-        if graphql_query is not None:
-            argv.extend(["-f", f"query={graphql_query}"])
         result = subprocess.run(
             argv,
             capture_output=True, text=True, timeout=timeout, env=env,

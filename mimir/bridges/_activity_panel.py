@@ -39,6 +39,7 @@ ACTIVITY_PANEL_INCLUDED_TRIGGERS = frozenset(
         "poller",  # Autonomous external work operators may allow-list.
         "scheduled_tick",  # Scheduled autonomous work on allow-listed channels.
         "shell_job_complete",  # Async job continuation the user/work initiated.
+        "repo_test_complete",
     }
 )
 
