@@ -131,7 +131,9 @@ class ForgeClient(Protocol):
 
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection: ...
 
-    def is_pull_request_queued(self, repository: str, number: int) -> bool: ...
+    def is_pull_request_queued(
+        self, repository: str, number: int, *, expected_head: str | None = None,
+    ) -> bool: ...
 
     def list_pull_requests(
         self, repository: str, *, state: str, base: str | None,
@@ -649,12 +651,17 @@ class GitHubForgeClient:
         """Read the PR's identity/ref snapshot without projecting PR text."""
         return self.get_pull_request_snapshot(repository, number)
 
-    def is_pull_request_queued(self, repository: str, number: int) -> bool:
-        """Read queue membership; only an explicit null entry means unqueued."""
+    def is_pull_request_queued(
+        self, repository: str, number: int, *, expected_head: str | None = None,
+    ) -> bool:
+        """Read queue membership, optionally bound to the observed immutable head."""
         if (
             _REPOSITORY.fullmatch(repository) is None
             or type(number) is not int
             or number < 1
+            or (expected_head is not None and (
+                not isinstance(expected_head, str) or _SHA.fullmatch(expected_head) is None
+            ))
         ):
             raise ForgeError("invalid pull-request selector")
         owner, name = repository.split("/")
@@ -662,7 +669,7 @@ class GitHubForgeClient:
             "query": (
                 "query($owner: String!, $name: String!, $number: Int!) {"
                 " repository(owner: $owner, name: $name) {"
-                " pullRequest(number: $number) { number mergeQueueEntry { id } } } }"
+                " pullRequest(number: $number) { number headRefOid mergeQueueEntry { id } } } }"
             ),
             "variables": {"owner": owner, "name": name, "number": number},
         })
@@ -676,6 +683,7 @@ class GitHubForgeClient:
             not isinstance(pr, Mapping)
             or type(pr.get("number")) is not int
             or pr["number"] != number
+            or (expected_head is not None and pr.get("headRefOid") != expected_head)
             or "mergeQueueEntry" not in pr
         ):
             raise ForgeError(diagnostic)
