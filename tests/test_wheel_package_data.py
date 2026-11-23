@@ -205,13 +205,17 @@ def _force_include() -> dict:
     )
 
 
+def test_wheel_excludes_preserve_every_shared_build_exclusion() -> None:
+    build = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["hatch"]["build"]
+    assert set(build["exclude"]) <= set(build["targets"]["wheel"]["exclude"])
+
+
 def test_heavy_helper_has_one_packaged_location() -> None:
     assert _force_include()["scripts/heavy_run.py"] == "mimir/heavy_run/heavy_run.py"
     assert _sdist_force_include()["scripts/heavy_run.py"] == "scripts/heavy_run.py"
     build = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["hatch"]["build"]
     wheel_excludes = build["targets"]["wheel"]["exclude"]
     assert "mimir/heavy_run/heavy_run.py" in wheel_excludes
-    assert set(build["exclude"]) <= set(wheel_excludes)
     # The editable/source layout mirrors the force-included bytes. Keep the
     # protocol unchanged and prevent checkout-only tests from hiding drift.
     assert (REPO_ROOT / "mimir/heavy_run/heavy_run.py").read_bytes() == (

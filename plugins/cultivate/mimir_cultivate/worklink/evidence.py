@@ -1083,6 +1083,8 @@ def _gate_lease_legs(command: str) -> tuple[str, ...]:
 # This child is NOT the gate. Only the controller-owned helper can write its
 # stdout; the worker never inherits this pipe or supplies timing telemetry.
 _GATE_LEASE_READY = "import sys; sys.stdout.write('ready\\n'); sys.stdout.flush(); sys.stdin.buffer.read()"
+_GATE_LEASE_TERM_GRACE_S = 10.0
+_GATE_LEASE_KILL_GRACE_S = 5.0
 
 
 class _GateLeaseWaitTimeout(TimeoutError):
@@ -1137,30 +1139,53 @@ async def _gate_heavy_lease(
         except TimeoutError as exc:
             raise _GateLeaseWaitTimeout from exc
         if ready != b"ready\n":
-            code = await process.wait()
-            raise ComputeLaunchError(f"gate lease helper failed (exit {code})")
+            # Retirement below owns all waits, including a malformed live helper.
+            raise ComputeLaunchError(f"gate lease helper failed (exit {process.returncode})")
         yield
     finally:
-        # TERM, not KILL: the helper releases its ticket and any reserved slot.
-        # Do not abandon this reap when cancellation arrives during cleanup.
-        async def retire() -> None:
-            if process.returncode is None:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            await process.wait()
-        retired = asyncio.create_task(retire())
-        while True:
-            try:
-                await asyncio.shield(retired)
-                break
-            except asyncio.CancelledError:
-                interrupted = True
+        # Let the private readiness child exit even if its helper cannot forward
+        # signals. TERM normally releases tickets; KILL leaves stale recovery to
+        # the unchanged heavy-run protocol. Neither wait may be unbounded.
         if process.stdin is not None:
             process.stdin.close()
-        if interrupted:
-            raise asyncio.CancelledError
+
+        def signal_group(signum: int) -> None:
+            try:
+                os.killpg(process.pid, signum)
+            except ProcessLookupError:
+                pass
+
+        async def retire() -> None:
+            waiter = asyncio.create_task(process.wait())
+            try:
+                if process.returncode is None:
+                    signal_group(signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(asyncio.shield(waiter), _GATE_LEASE_TERM_GRACE_S)
+                    return
+                except TimeoutError:
+                    signal_group(signal.SIGKILL)
+                try:
+                    await asyncio.wait_for(asyncio.shield(waiter), _GATE_LEASE_KILL_GRACE_S)
+                except TimeoutError:
+                    raise ComputeLaunchError("gate lease helper retirement timed out") from None
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+
+        retired = asyncio.create_task(retire())
+        try:
+            while True:
+                try:
+                    await asyncio.shield(retired)
+                    break
+                except asyncio.CancelledError:
+                    # Repeated cancellation cannot reset retirement's deadlines.
+                    interrupted = True
+        finally:
+            if interrupted:
+                raise asyncio.CancelledError
 
 
 async def _run_compute_gate(

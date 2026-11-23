@@ -428,6 +428,155 @@ async def test_gate_untrusted_helper_readiness_fails_closed(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("queued_helper", [False, True], ids=["held", "queued"])
+@pytest.mark.parametrize("cancel_retirement", [False, True], ids=["ordinary", "repeated-cancel"])
+async def test_gate_term_ignoring_helper_is_killed_and_stale_state_reclaimed(
+    tmp_path, monkeypatch, lease, queued_helper, cancel_retirement,
+):
+    from contextlib import AsyncExitStack
+    from mimir.heavy_run import helper_path
+
+    # Use the actual queue/slot protocol. On TERM, deliberately freeze inside
+    # the signal handler: no heartbeat or finally cleanup can make progress.
+    marker = tmp_path / "term-observed"
+    wrapper = tmp_path / "stuck-helper.py"
+    wrapper.write_text(
+        "import importlib.util, pathlib, signal, sys, time\n"
+        f"spec = importlib.util.spec_from_file_location('protocol', {str(helper_path())!r})\n"
+        "protocol = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(protocol)\n"
+        "def ignore_term(signum, frame):\n"
+        f"    pathlib.Path({str(marker)!r}).write_text('TERM')\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    while True: time.sleep(0.01)\n"
+        "protocol._interrupt = ignore_term\n"
+        "sys.exit(protocol.run(sys.argv[1:]))\n"
+    )
+    monkeypatch.setattr(ev, "_GATE_LEASE_TERM_GRACE_S", 0.3)
+    monkeypatch.setattr(ev, "_GATE_LEASE_KILL_GRACE_S", 0.5)
+    lease.update(MIMIR_HEAVY_HEARTBEAT_SECONDS="0.03", MIMIR_HEAVY_STALE_SECONDS="0.2")
+    original = asyncio.create_subprocess_exec
+    processes = []
+    signals = []
+    original_killpg = os.killpg
+
+    def observed_signal(pid, signum):
+        if processes and pid == processes[0].pid:
+            signals.append(signum)
+        return original_killpg(pid, signum)
+
+    async def spawn(*args, **kwargs):
+        args = (*args[:2], str(wrapper), *args[3:])
+        process = await original(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    entered = asyncio.Event()
+    leave = asyncio.Event()
+
+    async def participant():
+        async with ev._gate_heavy_lease(lease):
+            entered.set()
+            await leave.wait()
+
+    task = canceller = None
+    async with AsyncExitStack() as holders:
+        if queued_helper:
+            await holders.enter_async_context(ev._gate_heavy_lease(lease))
+        monkeypatch.setattr(ev.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(ev.os, "killpg", observed_signal)
+        task = asyncio.create_task(participant())
+        try:
+            if queued_helper:
+                await queued(lease)
+                # Wait until this ticket has a handler and a live heartbeat.
+                queue = Path(lease["MIMIR_HEAVY_LOCK_FILE"] + ".queue")
+                async with asyncio.timeout(5):
+                    while not any((p / "heartbeat").exists() for p in queue.iterdir()):
+                        await asyncio.sleep(0.01)
+                task.cancel()  # Enter retirement while still queued.
+            else:
+                await asyncio.wait_for(entered.wait(), 5)
+                leave.set()
+
+            async def interrupt_retirement():
+                async with asyncio.timeout(5):
+                    while not marker.exists():
+                        await asyncio.sleep(0.005)
+                if cancel_retirement:
+                    for _ in range(3):
+                        task.cancel()
+                        await asyncio.sleep(0.02)
+
+            canceller = asyncio.create_task(interrupt_retirement())
+            done, _ = await asyncio.wait({task}, timeout=5)
+            assert task in done, "retirement exceeded its bound"
+            await canceller
+            if queued_helper or cancel_retirement:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                await task
+            assert signals == [signal.SIGTERM, signal.SIGKILL]
+            assert processes[0].returncode == -signal.SIGKILL
+            base = lease["MIMIR_HEAVY_LOCK_FILE"]
+            if queued_helper:
+                assert list(Path(base + ".queue").iterdir()), "KILL must leave a stale ticket"
+            else:
+                assert Path(base + ".lease").exists(), "KILL must leave stale slots"
+        finally:
+            # Test-owned interlock: deleting production escalation must fail the
+            # assertion, not leak a participant or hang pytest's teardown.
+            for process in processes:
+                if process.returncode is None:
+                    original_killpg(process.pid, signal.SIGKILL)
+                await asyncio.wait_for(process.wait(), 2)
+            if task is not None and not task.done():
+                task.cancel()
+            if canceller is not None:
+                canceller.cancel()
+            await asyncio.gather(*[t for t in (task, canceller) if t is not None], return_exceptions=True)
+        monkeypatch.setattr(ev.asyncio, "create_subprocess_exec", original)
+    # A fresh real participant must reclaim the frozen generation/ticket,
+    # not merely observe that the killed PID disappeared.
+    async with asyncio.timeout(5):
+        async with ev._gate_heavy_lease(lease):
+            pass
+    assert_released(lease)
+
+
+@pytest.mark.asyncio
+async def test_gate_post_kill_reap_is_bounded(tmp_path, monkeypatch, lease):
+    class Unreapable:
+        pid = 123456789
+        returncode = None
+        stdin = None
+
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_data(b"ready\n")
+
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    process = Unreapable()
+    signals = []
+
+    async def spawn(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr(ev.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(ev.os, "killpg", lambda pid, signum: signals.append(signum))
+    monkeypatch.setattr(ev, "_GATE_LEASE_TERM_GRACE_S", 0.01)
+    monkeypatch.setattr(ev, "_GATE_LEASE_KILL_GRACE_S", 0.01)
+    async with asyncio.timeout(1):
+        with pytest.raises(ev.ComputeLaunchError, match="retirement timed out"):
+            async with ev._gate_heavy_lease(lease):
+                pass
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+@pytest.mark.asyncio
 async def test_factory_gate_lease_budget_is_retained_in_evidence(tmp_path, monkeypatch, lease):
     import subprocess
     from datetime import UTC, datetime
