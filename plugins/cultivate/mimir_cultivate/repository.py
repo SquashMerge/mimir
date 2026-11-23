@@ -6324,6 +6324,28 @@ def repo_status(
     return _execute(runtime, repository, pull_request, GitStatus(include_untracked))
 
 
+def _project_test_refusal(
+    exc: RuntimeError | ValueError, selectors: tuple[str, ...],
+) -> ToolException:
+    """Use the same agent-facing refusal for execution and queue admission."""
+    code = getattr(exc, "code", "project_test_failed")
+    message = f"project test rejected ({code}): {exc}"
+    message += "\n" + _remediation_test_guidance(code, scoped=bool(selectors))
+    if (
+        isinstance(exc, ProjectTestRefusal)
+        and exc.fixed_message
+        and str(exc) in _FIXED_TEST_REFUSALS.get(code, ())
+    ):
+        return ToolPolicyRefusal(message)
+    return _tool_refusal(
+        message,
+        exc,
+        execution_started=(
+            exc.execution_started if isinstance(exc, ProjectTestRefusal) else True
+        ),
+    )
+
+
 async def _repo_test_unlocked(
     repository: str,
     pull_request: int,
@@ -6409,24 +6431,7 @@ async def _repo_test_unlocked(
             and str(exc) in _FIXED_TEST_REFUSALS.get(exc.code, ())
         ):
             _publish_attested_lease_result(runtime, state)
-        code = getattr(exc, "code", "project_test_failed")
-        message = f"project test rejected ({code}): {exc}"
-        message += "\n" + _remediation_test_guidance(code, scoped=bool(selectors))
-        if (
-            isinstance(exc, ProjectTestRefusal)
-            and exc.fixed_message
-            and str(exc) in _FIXED_TEST_REFUSALS.get(code, ())
-        ):
-            raise ToolPolicyRefusal(message) from exc
-        raise _tool_refusal(
-            message,
-            exc,
-            execution_started=(
-                exc.execution_started
-                if isinstance(exc, ProjectTestRefusal)
-                else True
-            ),
-        ) from exc
+        raise _project_test_refusal(exc, selectors) from exc
 
 
 async def recover_repo_test_job(record: dict[str, Any]) -> None:
@@ -6616,10 +6621,11 @@ async def repo_test(
             registry = get_registry()
             if registry is None:
                 raise ToolPolicyRefusal("project test rejected: background job registry unavailable")
-            return _retained_result(
-                runtime, retained,
-                await _queue_repo_test(registry, runtime, retained, selectors, suite),
-            )
+            try:
+                queued = await _queue_repo_test(registry, runtime, retained, selectors, suite)
+            except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
+                raise _project_test_refusal(exc, selectors) from exc
+            return _retained_result(runtime, retained, queued)
         return await _repo_test_unlocked(
             repository, pull_request, selectors, runtime, suite, include_output,
         )
@@ -6628,7 +6634,10 @@ async def repo_test(
         registry = get_registry()
         if registry is None:
             raise ToolPolicyRefusal("project test rejected: background job registry unavailable")
-        queued = await _queue_repo_test(registry, runtime, state, selectors, suite)
+        try:
+            queued = await _queue_repo_test(registry, runtime, state, selectors, suite)
+        except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
+            raise _project_test_refusal(exc, selectors) from exc
         # The queued result is a repository result like the synchronous one. Without
         # published provenance it defaults to untrusted active ingest, and the turn
         # that queued its tests could no longer commit, push or comment.
