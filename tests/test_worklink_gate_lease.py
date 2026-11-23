@@ -96,6 +96,72 @@ def assert_released(lease):
 
 
 @pytest.mark.asyncio
+async def test_gate_uses_installed_core_helper_outside_checkout(tmp_path, monkeypatch, lease):
+    from mimir import heavy_run
+
+    installed = tmp_path / "venv/lib/python/site-packages/mimir/heavy_run"
+    installed.mkdir(parents=True)
+    helper = installed / "heavy_run.py"
+    helper.write_bytes(heavy_run.helper_path().read_bytes())
+    anchors = []
+
+    def package_files(anchor):
+        anchors.append(anchor)
+        return installed
+
+    monkeypatch.setattr(heavy_run.resources, "files", package_files)
+    monkeypatch.setattr(ev, "__file__", str(tmp_path / "unrelated/plugin/evidence.py"))
+    original = asyncio.create_subprocess_exec
+    launched = []
+
+    async def spawn(*args, **kwargs):
+        launched.append(args)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(ev.asyncio, "create_subprocess_exec", spawn)
+    compute = ProcessCompute(tmp_path)
+    result = await ev._run_compute_gate(
+        command("import os; assert os.environ['MIMIR_HEAVY_LOCK_HELD'] == '1'; print('installed')"),
+        checkout=tmp_path, work_spec=spec(tmp_path, 5), compute=compute,
+    )
+    assert result.exit_code == 0
+    assert result.stdout == "installed\n"
+    assert anchors == ["mimir.heavy_run"]
+    assert launched[0][2] == str(helper)
+    assert_released(lease)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["file", "package"])
+async def test_gate_missing_packaged_helper_fails_before_enqueue(tmp_path, monkeypatch, lease, missing):
+    from mimir import heavy_run
+
+    def missing_files(anchor):
+        if missing == "package":
+            raise ModuleNotFoundError("private installation detail")
+        return tmp_path / "empty-installed-package"
+
+    monkeypatch.setattr(heavy_run.resources, "files", missing_files)
+    launched = []
+
+    async def forbidden_spawn(*args, **kwargs):
+        launched.append(args)
+        pytest.fail("missing helper must fail before spawning or enqueuing")
+
+    monkeypatch.setattr(ev.asyncio, "create_subprocess_exec", forbidden_spawn)
+    compute = ProcessCompute(tmp_path)
+    with pytest.raises(ev.ComputeLaunchError) as caught:
+        await ev._run_compute_gate(
+            command("print('must not run')"), checkout=tmp_path,
+            work_spec=spec(tmp_path), compute=compute,
+        )
+    assert str(caught.value) == "gate lease packaged helper unavailable"
+    assert not launched
+    assert not compute.processes
+    assert_released(lease)
+
+
+@pytest.mark.asyncio
 async def test_gate_queue_wait_longer_than_run_budget_passes(tmp_path, lease):
     compute = ProcessCompute(tmp_path)
     async with ev._gate_heavy_lease(lease):

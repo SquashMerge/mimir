@@ -1094,7 +1094,13 @@ async def _gate_heavy_lease(
     environment: dict[str, str],
     on_launch: Callable[[LaunchHandle], None] | None = None,
 ):
-    helper = Path(__file__).resolve().parents[4] / "scripts" / "heavy_run.py"
+    try:
+        from mimir.heavy_run import helper_path
+
+        helper = helper_path()
+    except (OSError, ModuleNotFoundError):
+        # Fixed, path-free diagnostic; no subprocess or FIFO ticket exists yet.
+        raise ComputeLaunchError("gate lease packaged helper unavailable") from None
     # Use the unchanged protocol helper directly. Its shell wrapper's timeout
     # covers queue + run; here the controller owns the two independent budgets.
     launch = asyncio.create_task(asyncio.create_subprocess_exec(
