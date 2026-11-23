@@ -2091,6 +2091,194 @@ def _lease_start(identifier, started, stderr=b""):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retained", [False, True], ids=["pr", "retained"])
+@pytest.mark.parametrize("refusal", [
+    "unknown_selector", "invalid_suite", "ambiguous_suite", "missing_configuration",
+])
+async def test_repo_test_async_admission_refusal_continues_turn(
+    tmp_path, monkeypatch, retained, refusal,
+):
+    from langchain_core.messages import AIMessage
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.prebuilt import ToolNode
+    from mimir import repo_test_jobs
+    from mimir.access_control import begin_protected_result_capture, end_protected_result_capture
+    from mimir.models import AuthContext
+    from mimir_cultivate.policy import RetainedFactoryScope
+    from unittest.mock import AsyncMock
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope = state.action_scope
+    home = tmp_path / "home"
+    _configure_test_suites(
+        home, state, test_suites=_suite_declarations("python", "unit"),
+    )
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+    retained_scope = None
+    if retained:
+        retained_scope = RetainedFactoryScope(
+            issue_id=scope.pr_number, signature="signature", occurrence_id="occurrence",
+            run_id="run", attempt=1, session="session", repository=scope.canonical_repo,
+            branch="worklink/fix", sandbox=str(state.checkout_lease.path),
+        )
+        # Retained checkout validation normally crosses the executor boundary.
+        # Keep command/selector validation real, without a live Worklink executor.
+        monkeypatch.setattr(repository, "RepoGitTools", lambda **kwargs: SimpleNamespace(
+            validated_checkout_root=lambda: state.checkout_lease.path.resolve(),
+            _command=lambda args: SimpleNamespace(stdout=scope.observed_head_sha),
+        ))
+    auth = replace(
+        _untainted_ifc_auth(), channel_id="repo-test-refusal",
+        repo_review_state=state, retained_factory_scope=retained_scope,
+    )
+    delivered = AsyncMock(return_value=True)
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", delivered)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    selectors = ("tests/test_missing.py",) if refusal == "unknown_selector" else ()
+    suite = "missing" if refusal == "invalid_suite" else "python"
+    code = "test_selector_not_found"
+    detail = "test selector was not found in checkout: tests/test_missing.py"
+    if refusal in {"invalid_suite", "ambiguous_suite"}:
+        code = "test_suite_selection_refused"
+        detail = "select exactly one declared test suite: python, unit"
+        if refusal == "ambiguous_suite":
+            suite = None
+    elif refusal == "missing_configuration":
+        monkeypatch.delenv("MIMIR_HOME")
+        code, detail = "test_not_configured", "MIMIR_HOME is not configured"
+    arguments = {
+        "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+        "selectors": selectors, "suite": suite,
+    }
+    continued = []
+    refusals = []
+
+    def tool_error(exc: repository.ToolException) -> str:
+        refusals.append(exc)
+        return str(exc)
+
+    def continue_turn(messages):
+        continued.append(True)
+        assert messages["messages"][-1].status == "error"
+        return {"messages": [AIMessage(content="Recovered from tool refusal")]}
+
+    graph = StateGraph(MessagesState, context_schema=AuthContext)
+    # Match the production middleware's ToolException boundary. In particular,
+    # raw ProjectTestRefusal/RuntimeError must escape and fail this regression.
+    graph.add_node("tools", ToolNode([repository.repo_test], handle_tool_errors=tool_error))
+    graph.add_node("continue", continue_turn)
+    graph.add_edge(START, "tools")
+    graph.add_edge("tools", "continue")
+    graph.add_edge("continue", END)
+    capture = begin_protected_result_capture()
+    try:
+        result = await graph.compile().ainvoke({"messages": [AIMessage(
+            content="", tool_calls=[{"name": "repo_test", "args": arguments, "id": "refused"}],
+        )]}, context=auth)
+    finally:
+        provenance = end_protected_result_capture(capture)
+    message = result["messages"][-2]
+    expected = (
+        f"project test rejected ({code}): {detail}\n"
+        + repository._remediation_test_guidance(code, scoped=bool(selectors))
+    )
+    assert message.status == "error"
+    assert message.content == expected
+    assert len(refusals) == 1
+    assert type(refusals[0]) is repository.ToolPolicyRefusal
+    assert isinstance(refusals[0].__cause__, repository.ProjectTestRefusal)
+    assert refusals[0].__cause__.execution_started is False
+    assert continued == [True]
+    assert provenance is None
+    assert registry.jobs == {}
+    assert not list(registry.directory.glob("*.json"))
+    delivered.assert_not_called()
+    assert state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["sync", "async_pr", "async_retained"])
+@pytest.mark.parametrize("failure, policy_refusal", [
+    ("pre_execution", True), ("post_execution", False),
+    ("runtime", False), ("value", False),
+    ("fixed", True), ("unrecognized_message", False),
+    ("unrecognized_code", False), ("not_fixed", False), ("untyped_fixed", False),
+])
+async def test_repo_test_refusal_conversion_parity(
+    tmp_path, monkeypatch, path, failure, policy_refusal,
+):
+    from langchain_core.tools import ToolException
+    from mimir import repo_test_jobs
+    from mimir.access_control import begin_protected_result_capture, end_protected_result_capture
+    from mimir_cultivate.policy import RetainedFactoryScope
+    from unittest.mock import AsyncMock, Mock
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope = state.action_scope
+    if failure == "runtime":
+        exc = RuntimeError("checkout unavailable")
+    elif failure == "value":
+        exc = ValueError("invalid checkout")
+    elif failure == "untyped_fixed":
+        exc = RuntimeError("project test command is invalid")
+        exc.code = "test_config_invalid"
+        exc.fixed_message = True
+    else:
+        exc = repository.ProjectTestRefusal(
+            "other_code" if failure == "unrecognized_code" else "test_config_invalid",
+            "unrecognized detail" if failure == "unrecognized_message"
+            else "project test command is invalid",
+            execution_started=failure != "pre_execution",
+            fixed_message=failure in {"fixed", "unrecognized_message", "unrecognized_code"},
+        )
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda *args: SimpleNamespace(
+        execute=AsyncMock(side_effect=exc),
+    ))
+    queue = AsyncMock(side_effect=exc)
+    monkeypatch.setattr(repository, "_queue_repo_test", queue)
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=True))
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    publish = Mock()
+    monkeypatch.setattr(repository, "_publish_attested_lease_result", publish)
+    retained = None
+    if path == "async_retained":
+        retained = RetainedFactoryScope(
+            issue_id=scope.pr_number, signature="signature", occurrence_id="occurrence",
+            run_id="run", attempt=1, session="session", repository=scope.canonical_repo,
+            branch="worklink/fix", sandbox=str(state.checkout_lease.path),
+        )
+    runtime = SimpleNamespace(context=replace(
+        _untainted_ifc_auth(), channel_id=None if path == "sync" else "refusal-parity",
+        retained_factory_scope=retained,
+    ))
+    selectors = ("tests/test_changed.py",)
+    capture = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException) as raised:
+            await repository.repo_test.coroutine(
+                scope.canonical_repo, scope.pr_number, selectors, runtime=runtime,
+            )
+    finally:
+        provenance = end_protected_result_capture(capture)
+    expected_type = repository.ToolPolicyRefusal if policy_refusal else ToolException
+    assert type(raised.value) is expected_type
+    assert raised.value.__cause__ is exc
+    code = getattr(exc, "code", "project_test_failed")
+    assert str(raised.value) == (
+        f"project test rejected ({code}): {exc}\n"
+        + repository._remediation_test_guidance(code, scoped=True)
+    )
+    assert provenance is None
+    if path == "sync" and failure not in {"pre_execution", "fixed"}:
+        publish.assert_called_once_with(runtime, state)
+    else:
+        publish.assert_not_called()
+    assert queue.await_count == (0 if path == "sync" else 1)
+    assert registry.jobs == {}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("head_move", ["none", "remote", "scope", "local", "superseded", "snapshot"])
 async def test_repo_test_async_head_binding(tmp_path, monkeypatch, head_move):
     from mimir import repo_test_jobs
