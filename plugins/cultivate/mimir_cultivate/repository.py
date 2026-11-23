@@ -6968,7 +6968,8 @@ def repo_commit(
     For pr_mergeability_conflicting, supply one conflict_evidence entry per
     conflicted path: path, base_property, base_verification, head_property,
     head_verification. Both sides' intent and verification are recorded in the
-    merge commit. Run the configured full core and cultivate legs after committing.
+    merge commit. Run repo_test with no selectors; every configured leg of the
+    default suite must pass at the merge commit.
     """
     return _execute(runtime, repository, pull_request, GitCommit(paths, message, conflict_evidence))
 
@@ -6985,8 +6986,9 @@ def repo_merge(
     On conflicts: repo_unmerged, resolve, repo_stage, then repo_commit listing
     every staged path (the merge stages auto-merged files too), then repo_push.
     A pr_mergeability_conflicting scope additionally requires per-path
-    repo_commit conflict_evidence and passing full core and cultivate test legs
-    at the merge commit before pushing. After push, comment on each resolution
+    repo_commit conflict_evidence. Run repo_test with no selectors; every configured
+    leg of the default suite must pass at the merge commit before pushing.
+    After push, comment on each resolution
     and re-request review. Never rebase a conflicting scope.
     """
     return _execute(runtime, repository, pull_request, GitMerge())

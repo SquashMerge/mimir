@@ -18,6 +18,15 @@ from tests.test_repo_tools import (
 )
 
 
+@pytest.mark.parametrize("tool", [repo.repo_commit, repo.repo_merge])
+def test_conflict_tool_guidance_uses_configured_default_suite(tool):
+    description = " ".join(tool.description.split())
+    assert "repo_test with no selectors" in description
+    assert "every configured leg of the default suite must pass at the merge commit" in description
+    assert "core and cultivate" not in description
+    assert "MIMIR_PLUGINS" not in description
+
+
 @pytest.fixture(autouse=True)
 def policy():
     with policy_scope(load_plugins(enable="cultivate").policy):
