@@ -6,13 +6,45 @@ import importlib.util
 import os
 import sys
 
-from worklink_pytest_args import pytest_arguments
-
 
 def _is_pytest_invocation() -> bool:
-    # Keep this fallback independent of worklink_pytest: its import can fail.
-    return pytest_arguments(getattr(sys, "argv", None),
-                            getattr(sys, "orig_argv", None)) is not None
+    # This emergency detector must import NEITHER guard module: either one
+    # may be absent or syntax-broken. Keep CPython option scanning in sync with
+    # worklink_pytest_args, with subprocess coverage for both failure paths.
+    argv = getattr(sys, "argv", None)
+    original = getattr(sys, "orig_argv", None)
+    if not isinstance(argv, (list, tuple)) or not argv or not isinstance(argv[0], str):
+        return False
+    if os.path.basename(argv[0]) in {"pytest", "py.test"}:
+        return True
+    if argv[0] != "-m" or not isinstance(original, (list, tuple)):
+        return False
+    index = 1
+    while index < len(original):
+        value = original[index]
+        if not isinstance(value, str):
+            return False
+        if value == "--check-hash-based-pycs":
+            index += 2
+            continue
+        if value == "-" or not value.startswith("-") or value.startswith("--"):
+            return False
+        for position, flag in enumerate(value[1:], start=1):
+            if flag not in {"c", "m", "W", "X"}:
+                continue
+            operand = value[position + 1:]
+            if not operand:
+                index += 1
+                if index >= len(original) or not isinstance(original[index], str):
+                    return False
+                operand = original[index]
+            if flag == "m":
+                return operand == "pytest"
+            if flag == "c":
+                return False
+            break
+        index += 1
+    return False
 
 
 def _chain_sitecustomize() -> None:

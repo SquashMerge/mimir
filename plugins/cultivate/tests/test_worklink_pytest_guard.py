@@ -24,6 +24,12 @@ MODULE_ENTRIES = [
     [sys.executable, "-mpytest"],
     [sys.executable, "-X", "dev", "-m", "pytest"],
     [sys.executable, "-X", "dev", "-mpytest"],
+    [sys.executable, "-Bm", "pytest"],
+    [sys.executable, "-Bmpytest"],
+    [sys.executable, "-bbm", "pytest"],
+    [sys.executable, "-OOm", "pytest"],
+    [sys.executable, "-BWignore", "-m", "pytest"],
+    [sys.executable, "-BX", "dev", "-Bmpytest"],
 ]
 
 
@@ -142,6 +148,27 @@ def test_multiple_module_nodes_require_lease(session, entry):
     (["python", "script.py", "-mpytest"], None),
     (["python", "-m"], None),
     (["python", "-mpytest_other"], None),
+    (["python", "-Bm", "pytest", "tests"], ["tests"]),
+    (["python", "-Bmpytest", "tests"], ["tests"]),
+    (["python", "-bbm", "pytest", "tests"], ["tests"]),
+    (["python", "-OOm", "pytest", "tests"], ["tests"]),
+    (["python", "-BWignore", "-Bmpytest", "tests"], ["tests"]),
+    (["python", "-BX", "dev", "-m", "pytest", "tests"], ["tests"]),
+    (["python", "--check-hash-based-pycs", "always", "-Bmpytest", "tests"], ["tests"]),
+    (["python", "-BW", "-mpytest", "-m", "other"], None),
+    (["python", "-BX", "-mpytest", "-m", "other"], None),
+    (["python", "-BWmpytest"], None),
+    (["python", "-BXmpytest"], None),
+    (["python", "-Bc", "print(1)", "-mpytest"], None),
+    (["python", "-Bcprint(1)", "-mpytest"], None),
+    (["python", "-Bm", "other", "-mpytest"], None),
+    (["python", "-Bmpytest_other"], None),
+    (["python", "-Bm"], None),
+    (["python", "-BW"], None),
+    (["python", "-BX"], None),
+    (["python", "--", "-mpytest"], None),
+    (["python", "-", "-mpytest"], None),
+    (["python", "--check-hash-based-pycs", "-mpytest"], None),
 ])
 def test_shared_module_parser(monkeypatch, original, expected):
     monkeypatch.syspath_prepend(str(SOURCE))
@@ -258,13 +285,56 @@ def test_startup_exception_cannot_continue_to_tests(session, entry):
     assert completed.stdout == ""
 
 
-def test_startup_exception_allows_unrelated_python(session):
+@pytest.mark.parametrize("option", ["-c", "-Bc"])
+def test_startup_exception_allows_unrelated_python(session, option):
     """Mutation oracle: an unconditional os._exit(125) must fail this test."""
     (session[1] / "python/worklink_pytest.py").write_text("raise RuntimeError('broken guard')\n")
-    completed = run(session, [sys.executable, "-c", "print('unrelated tool ran')"], arguments=())
+    completed = run(session, [sys.executable, option, "print('unrelated tool ran')"], arguments=())
     assert completed.returncode == 0, (completed.stdout, completed.stderr)
     assert completed.stdout == "unrelated tool ran\n"
     assert "startup guard failed: broken guard" in completed.stderr
+
+
+def break_parser(session, failure):
+    parser = session[1] / "python/worklink_pytest_args.py"
+    if failure == "missing":
+        parser.unlink()
+    else:
+        parser.write_text("def broken(:\n")
+
+
+@pytest.mark.parametrize("failure", ["missing", "syntax"])
+@pytest.mark.parametrize("entry", ["shim", "venv", *MODULE_ENTRIES])
+def test_broken_parser_cannot_continue_to_tests(session, failure, entry):
+    # Never import the parser into the parent: the real startup hook must
+    # enforce before the child reaches even a controlled pytest stand-in.
+    break_parser(session, failure)
+    command = (["pytest"] if entry == "shim" else
+               [str(session[0] / ".venv/bin/pytest")] if entry == "venv" else entry)
+    completed = run(session, command)
+    assert completed.returncode == 125, (completed.stdout, completed.stderr)
+    assert "startup guard failed" in completed.stderr
+    assert completed.stdout == ""
+
+
+@pytest.mark.parametrize("failure", ["missing", "syntax"])
+@pytest.mark.parametrize("option", ["-c", "-Bc"])
+def test_broken_parser_allows_unrelated_python(session, failure, option):
+    break_parser(session, failure)
+    completed = run(session, [sys.executable, option, "print('unrelated tool ran')"], arguments=())
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout == "unrelated tool ran\n"
+    assert "startup guard failed" in completed.stderr
+
+
+@pytest.mark.parametrize("option", ["-c", "-Bc"])
+def test_command_mode_does_not_take_lease(session, option):
+    completed = run(session, [sys.executable, option,
+                             "import os; print(os.environ.get('MIMIR_HEAVY_LOCK_HELD'))"],
+                    arguments=("-mpytest",))
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    assert completed.stdout == "None\n"
+    assert "taking medium heavy-run lease" not in completed.stderr
 
 
 @pytest.mark.parametrize("argv, original", [

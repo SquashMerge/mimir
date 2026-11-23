@@ -17,16 +17,26 @@ def pytest_arguments(argv: object, original: object) -> list[str] | None:
         value = original[index]
         if not isinstance(value, str):
             return None
-        if value == "-m":
-            if index + 1 < len(original) and original[index + 1] == "pytest":
-                return list(original[index + 2:])
-            return None
-        if value.startswith("-m"):
-            return list(original[index + 1:]) if value == "-mpytest" else None
-        if value in {"-W", "-X", "--check-hash-based-pycs"}:
-            index += 2  # These interpreter options consume an operand.
+        if value == "--check-hash-based-pycs":
+            index += 2
             continue
-        if value in {"-c", "--"} or not value.startswith("-"):
+        if value == "-" or not value.startswith("-") or value.startswith("--"):
             return None
+        # CPython scans short-option bundles until an operand-taking flag.
+        # Its operand is the remainder of this token, or the next token.
+        for position, flag in enumerate(value[1:], start=1):
+            if flag not in {"c", "m", "W", "X"}:
+                continue
+            operand = value[position + 1:]
+            if not operand:
+                index += 1
+                if index >= len(original) or not isinstance(original[index], str):
+                    return None
+                operand = original[index]
+            if flag == "m":
+                return list(original[index + 1:]) if operand == "pytest" else None
+            if flag == "c":
+                return None
+            break  # W/X consume the rest; it cannot contain another flag.
         index += 1
     return None
