@@ -9295,44 +9295,52 @@ async def test_shipped_github_poller_forwards_operator_bot_allowlist(
 
 
 
+def test_shipped_github_poller_forwarded_identities_are_redaction_exempt() -> None:
+    """Every login the shipped github-poller forwards is exempt from payload redaction.
+
+    #169 forwarded MIMIR_FACTORY_PUBLISHING_IDENTITY (normally the bot's own login)
+    without exempting it, so every occurrence of the login in poller output,
+    including the PR author, became [REDACTED], and each turn on the bot's own
+    PRs failed lease attestation with pr_author_mismatch.
+    """
+    from mimir.pollers import _NON_SECRET_FORWARDED_ENV_KEYS
+
+    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
+    forwarded = {
+        key for entry in json.loads(manifest.read_text())["pollers"] for key in entry.get("pass_env", ())
+    }
+    identities = {"MIMIR_GITHUB_SELF_LOGIN", "MIMIR_FACTORY_PUBLISHING_IDENTITY",
+                  "MIMIR_GITHUB_TRUSTED_BOT_LOGINS"}
+    assert identities <= forwarded
+    assert identities <= _NON_SECRET_FORWARDED_ENV_KEYS
+
+
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("selected_cultivate_policy")
-async def test_shipped_github_poller_identity_env_is_never_redacted(
+async def test_forwarded_publishing_identity_survives_payload_redaction(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every identity the shipped github-poller forwards survives payload redaction.
-
-    #169 forwarded MIMIR_FACTORY_PUBLISHING_IDENTITY, whose value is normally the
-    bot's own login. Without a redaction exemption, every occurrence of that login
-    in poller output (including the PR author) became [REDACTED], so each turn on
-    the bot's own PRs failed lease attestation with pr_author_mismatch.
-    """
     login = "mimir-bot-login"
-    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
-    [entry] = [p for p in json.loads(manifest.read_text())["pollers"] if p["name"] == "github-activity"]
-    identity_keys = [key for key in entry["pass_env"] if key in {
-        "MIMIR_GITHUB_SELF_LOGIN", "MIMIR_FACTORY_PUBLISHING_IDENTITY",
-    }]
-    assert identity_keys == ["MIMIR_GITHUB_SELF_LOGIN", "MIMIR_FACTORY_PUBLISHING_IDENTITY"]
-    for key in identity_keys:
+    keys = ("MIMIR_GITHUB_SELF_LOGIN", "MIMIR_FACTORY_PUBLISHING_IDENTITY")
+    for key in keys:
         monkeypatch.setenv(key, login)
-    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
-    skill_dir = tmp_path / "skills" / "github-poller"
-    skill_dir.mkdir(parents=True)
-    shutil.copy(manifest, skill_dir / "pollers.json")
-    _install_script(skill_dir, "probe.py", """
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
 import json, os
-login = os.environ['MIMIR_GITHUB_SELF_LOGIN']
-print(json.dumps({"poller": "github-activity", "prompt": "comment on PR by @" + login,
+login = os.environ['MIMIR_FACTORY_PUBLISHING_IDENTITY']
+print(json.dumps({"poller": "identity-redaction", "prompt": "comment on PR by @" + login,
                   "author": login, "pr_author": login}))
 """)
-    [cfg] = [c for c in discover_pollers(tmp_path / "skills") if c.name == "github-activity"]
+    cfg = PollerConfig(
+        name="identity-redaction", command=f"{sys.executable} poller.py",
+        cron="* * * * *", skill_dir=skill_dir, env={}, pass_env=keys,
+    )
     enq = _CapturingEnqueue()
-    await run_poller(replace(cfg, command=f"{sys.executable} probe.py"), enqueue=enq)
+    assert await run_poller(cfg, enqueue=enq) == 1
     [event] = enq.events
-    assert "[REDACTED]" not in event.content and "[REDACTED]" not in json.dumps(event.extra)
+    payload = event.content + json.dumps(event.extra)
+    assert "[REDACTED]" not in payload
     assert "@" + login in event.content
-    assert login in json.dumps(event.extra)
+    assert json.dumps(login) in json.dumps(event.extra)
 
 def test_discover_pollers_parses_pass_env_list(tmp_path: Path) -> None:
     """``pass_env`` field in pollers.json is parsed into PollerConfig.pass_env."""
