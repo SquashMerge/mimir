@@ -754,6 +754,12 @@ def _create_turn_auth_context(
             ifc_state=InformationFlowState(labels=ifc_labels),
             ingested_url_state=IngestedURLState(),
         )
+    if event.trigger == "repo_test_complete":
+        from .access_control import remint_repo_test_grants
+
+        # Never retain the queueing turn's grants on a failed/recovered result.
+        # An admitted completion gets its own nonce and normal turn lifetime.
+        context = replace(context, scoped_pr_grants=remint_repo_test_grants(event, context))
     from .proposals import ProposalRevision, PollerProposalScope, poller_worktree_path
     from .access_control import get_trusted_service_from_auth_context
 
