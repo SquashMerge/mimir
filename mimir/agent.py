@@ -2241,6 +2241,25 @@ class Agent:
         saga_session_id: str | None = None,
     ) -> TurnRecord:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
+        try:
+            return await self._run_turn_impl(
+                event, turn_id=turn_id, session_id=session_id,
+                saga_session_id=saga_session_id,
+            )
+        finally:
+            # An accepted completion may never acquire its checkout (including
+            # preflight refusal or cancellation). Retire only its job, not a
+            # newer reservation for the same PR.
+            from .repo_test_jobs import get_registry
+
+            registry = get_registry()
+            if registry is not None and event.trigger == "repo_test_complete":
+                registry.release_completion(event.extra.get("job_id"))
+
+    async def _run_turn_impl(
+        self, event: AgentEvent, *, turn_id: str | None = None,
+        session_id: str | None = None, saga_session_id: str | None = None,
+    ) -> TurnRecord:
         from .operator_approval import _is_authenticated_operator
         from .memory_proposals import complete_reply, is_mp_reply, sync_pending
         from .pairing_approval import complete_reply as complete_pairing_reply, sync_pending as sync_pairings
@@ -3805,6 +3824,13 @@ class Agent:
                 folded_records,
                 deferred_records,
             ) = mid_turn_injection.deactivate(event.channel_id)
+            from .repo_test_jobs import get_registry
+
+            registry = get_registry()
+            if registry is not None:
+                for completion, _fold_time in folded_records:
+                    if completion.trigger == "repo_test_complete":
+                        registry.release_completion(completion.extra.get("job_id"))
             requeue_results = []
             if leftover_injections and self._dispatcher is not None:
                 user_leftovers = [e for e in leftover_injections if e.trigger not in {"shell_job_complete", "repo_test_complete"}]

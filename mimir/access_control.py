@@ -1077,6 +1077,12 @@ def _repo_pr_scope_resolution(
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    from .github_identity import own_conflict_pr_author
+
+    own_conflict = (
+        event_type == "pr_mergeability_conflicting"
+        and own_conflict_pr_author(principal, self_login)
+    )
     is_fresh_changes_requested_remediation = (
         event_type == "pr_review"
         and review_state == "CHANGES_REQUESTED"
@@ -1138,7 +1144,7 @@ def _repo_pr_scope_resolution(
             )
         )
     root, origin = binding_resolution.binding
-    if principal != self_login and pr_author_is_trusted is not True:
+    if principal != self_login and not own_conflict and pr_author_is_trusted is not True:
         from .event_logger import log_event_sync
 
         reason = (
@@ -1170,7 +1176,7 @@ def _repo_pr_scope_resolution(
             "pull request withheld: its author is not a repository collaborator; "
             "the item was withheld and logged"
         ))
-    if is_remediation and principal != self_login:
+    if is_remediation and principal != self_login and not own_conflict:
         return RepoPRScopeResolution(
             refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
         )
@@ -9301,12 +9307,15 @@ class RepoTestGrantBinding:
     scope: Any
     actions: frozenset[str]
     lease_identity: tuple[str, str]
+    tested_head: str
+    observed_head_sha: str
     starting_turn_id: str | None
     queue_grants: Any = field(repr=False, compare=False)
 
 
 def bind_repo_test_grant(
     auth: AuthContext, scope: Any, state: Any, starting_turn_id: str | None,
+    *, tested_head: str,
 ) -> RepoTestGrantBinding | None:
     grants = auth.scoped_pr_grants
     if not isinstance(grants, ScopedPRGrants):
@@ -9324,7 +9333,8 @@ def bind_repo_test_grant(
     if protocol.checkout_action.value not in actions or lease is None:
         return None
     return RepoTestGrantBinding(
-        scope, actions, (str(lease.path), lease.recovery_id), starting_turn_id, grants,
+        scope, actions, (str(lease.path), lease.recovery_id),
+        tested_head, scope.observed_head_sha, starting_turn_id, grants,
     )
 
 
@@ -9363,9 +9373,15 @@ def remint_repo_test_grants(event: Any, auth: AuthContext) -> ScopedPRGrants | N
         state is None or state.action_scope is not scope
         or completion.repository != scope.canonical_repo
         or completion.pull_request != scope.pr_number
-        or completion.head != scope.observed_head_sha
+        # Forge authority and the tested local commit are separate identities:
+        # a remediation may have merged main or committed without pushing yet.
+        or scope.observed_head_sha != binding.observed_head_sha
+        or completion.head != binding.tested_head
         or state.git_expected_head != completion.head
     ):
+        return None
+    lease = state.checkout_lease
+    if lease is None or (str(lease.path), lease.recovery_id) != binding.lease_identity:
         return None
     old = event.continuation_auth_context.scoped_pr_grants
     if old is not binding.queue_grants or old.principal != auth.canonical_principal:
@@ -9631,10 +9647,6 @@ def _recovery_tool_refusal(review_state: Any, tool_name: str | None) -> str | No
     if interrupted is None or tool_name is None or not tool_name.startswith("repo_"):
         return None
     if tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"}:
-        return None
-    scope = getattr(review_state, "action_scope", None)
-    if (tool_name == "repo_rebase" and interrupted.kind == "rebase"
-            and getattr(scope, "event_type", None) == "pr_mergeability_conflicting"):
         return None
     return f"Interrupted {interrupted.kind} on {interrupted.branch}; call {interrupted.abort_tool} first."
 

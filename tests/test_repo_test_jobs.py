@@ -73,7 +73,7 @@ async def test_repo_test_job_deduplication_and_durable_private_result(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["success", "test_failure", "exception", "cancel"])
-async def test_repo_test_reserves_bound_scope_until_delivery(tmp_path, outcome):
+async def test_repo_test_reserves_bound_scope_until_takeover(tmp_path, outcome):
     registry = RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=False))
     started, release = asyncio.Event(), asyncio.Event()
     binding = SimpleNamespace(lease_identity=("checkout", "identity"))
@@ -107,8 +107,32 @@ async def test_repo_test_reserves_bound_scope_until_delivery(tmp_path, outcome):
 
     registry.on_complete = AsyncMock(return_value=True)
     await registry.deliver(job)
-    assert job.record["delivered"] and job.grant_binding is None
+    assert job.record["delivered"] and job.grant_binding is binding
+    assert registry.pending_for_scope("o/r", 9) is job
+    registry.release_binding(SimpleNamespace(**vars(binding)))
+    assert registry.pending_for_scope("o/r", 9) is job
+    registry.release_binding(binding)
+    assert job.grant_binding is None
     assert registry.pending_for_scope("o/r", 9) is None
+
+
+@pytest.mark.asyncio
+async def test_repo_test_prune_preserves_delivered_reservation(tmp_path, monkeypatch):
+    from mimir import repo_test_jobs
+
+    monkeypatch.setattr(repo_test_jobs, "_MAX_DELIVERED_RECORDS", 0)
+    registry = RepoTestJobRegistry(tmp_path, AsyncMock(return_value=True))
+    binding = SimpleNamespace(lease_identity=("checkout", "identity"))
+    queued = enqueue(registry, AsyncMock(return_value={"ok": True}), grant_binding=binding)
+    job = registry.jobs[queued["job_id"]]
+    await job.task
+    registry.prune()
+    assert job.record["delivered"]
+    assert registry.pending_for_scope("o/r", 9) is job
+    assert (tmp_path / f"{job.job_id}.json").exists()
+    registry.release_completion(job.job_id)
+    registry.prune()
+    assert job.job_id not in registry.jobs
 
 
 @pytest.mark.asyncio

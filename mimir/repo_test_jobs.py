@@ -113,7 +113,8 @@ class RepoTestJobRegistry:
         now = time.time()
         delivered = []
         for job in self.jobs.values():
-            if job.record["status"] not in _TERMINAL or not job.record["delivered"]:
+            if (job.grant_binding is not None or job.record["status"] not in _TERMINAL
+                    or not job.record["delivered"]):
                 continue
             path = self.directory / f"{job.job_id}.json"
             try:
@@ -181,10 +182,23 @@ class RepoTestJobRegistry:
         """
         return next((
             job for job in tuple(self.jobs.values())
-            if job.grant_binding is not None and not job.record["delivered"]
+            if job.grant_binding is not None
             and job.record["repository"].casefold() == repository.casefold()
             and job.record["pull_request"] == pull_request
         ), None)
+
+    def release_binding(self, binding: Any) -> None:
+        """Successful takeover retires only the identical host binding."""
+        if binding is not None:
+            for job in tuple(self.jobs.values()):
+                if job.grant_binding is binding:
+                    job.grant_binding = None
+
+    def release_completion(self, job_id: str | None) -> None:
+        """Turn-end abandonment is keyed by the delivered completion's job ID."""
+        job = self.jobs.get(job_id)
+        if job is not None:
+            job.grant_binding = None
 
     def release_lease(self, identity: tuple[str, str]) -> None:
         """Retire only the binding belonging to a reclaimed checkout identity."""
@@ -233,7 +247,8 @@ class RepoTestJobRegistry:
         accepted = await self.on_complete(event)
         if accepted is not False:
             self.save(job, delivered=True)
-            job.grant_binding = None
+            # Enqueue acceptance is not completion-turn takeover. The binding
+            # stays reserved until successful resume or explicit abandonment.
             self.prune()
 
     async def recover(self, cleanup: Callable[[dict], Awaitable[None]]) -> None:
