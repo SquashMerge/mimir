@@ -408,6 +408,7 @@ _POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"}
 
 _NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
     "MIMIR_GITHUB_SELF_LOGIN",
+    "MIMIR_FACTORY_PUBLISHING_IDENTITY",
     "MIMIR_GITHUB_TRUSTED_BOT_LOGINS",
     "MIMIR_HOME",
     "MIMIR_SOURCE_DIR",
@@ -420,9 +421,10 @@ _NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
 })
 """Forwarded configuration values that poller payload redaction must preserve.
 
-The GitHub login and the operator's trusted-bot logins are identity used by
-authorization and review reconciliation (a masked bot login reads as a PR-author
-mismatch and refuses the review);
+The GitHub login, the factory publishing identity (normally the same login) and
+the operator's trusted-bot logins are identity used by authorization and review
+reconciliation (a masked login reads as a PR-author mismatch and refuses the
+review or remediation);
 the two home/source values are filesystem locations; the repository values are
 public repository selectors; plugin selection; the Jira site host is a public
 tenant selector; and the remaining values are feature flags or a review-skill path. None is a credential. This is deliberately closed: every

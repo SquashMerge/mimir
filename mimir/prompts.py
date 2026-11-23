@@ -571,7 +571,7 @@ def build_turn_prompt(
         # not external message/output data; deliberately leave them unprefixed.
         body = event.content or HEARTBEAT_DEFAULT_PROMPT
         sections.append(f"{header}\n{body}")
-    elif event.trigger == "shell_job_complete":
+    elif event.trigger in {"shell_job_complete", "repo_test_complete"}:
         # Async shell job completion wake-up. The agent body already
         # contains the rendered summary (status, exit_code, command,
         # stdout/stderr tails) built by ``Agent._on_shell_job_complete``.
@@ -584,7 +584,7 @@ def build_turn_prompt(
             if saga_session_id else ""
         )
         header = (
-            f"[shell_job_complete: {header_channel}, job_id: {job_id}, "
+            f"[{event.trigger}: {header_channel}, job_id: {job_id}, "
             f"exit_code: {exit_code}, ts: {ts}{saga_part}]"
         )
         # Prefix the entire mixed summary at the rendering boundary: command

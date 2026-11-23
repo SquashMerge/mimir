@@ -2061,8 +2061,13 @@ async def test_repo_test_legs_share_timeout_budget(
     assert state.full_tested_head is None
 
 
-def _repo_test_lease_fixture(tmp_path, monkeypatch, *, command="/usr/bin/true", wrapper=True):
-    _, _, _, state = _repo_scope_and_state(tmp_path)
+def _repo_test_lease_fixture(
+    tmp_path, monkeypatch, *, command="/usr/bin/true", wrapper=True,
+    event_type="pr_changes_requested_stale", advance_base=False,
+):
+    _, _, _, state = _repo_scope_and_state(
+        tmp_path, event_type=event_type, advance_base=advance_base,
+    )
     root = state.checkout_lease.path
     (root / "tests").mkdir()
     (root / "tests/test_changed.py").write_text("def test_changed(): pass\n")
@@ -2085,6 +2090,1005 @@ def _repo_test_lease_fixture(tmp_path, monkeypatch, *, command="/usr/bin/true", 
 
 def _lease_start(identifier, started, stderr=b""):
     return f"\x1erepo-test-{identifier}:{started}\n".encode() + stderr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", [False, True], ids=["pr", "retained"])
+@pytest.mark.parametrize("refusal", [
+    "unknown_selector", "invalid_suite", "ambiguous_suite", "missing_configuration",
+])
+async def test_repo_test_async_admission_refusal_continues_turn(
+    tmp_path, monkeypatch, retained, refusal,
+):
+    from langchain_core.messages import AIMessage
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.prebuilt import ToolNode
+    from mimir import repo_test_jobs
+    from mimir.access_control import begin_protected_result_capture, end_protected_result_capture
+    from mimir.models import AuthContext
+    from mimir_cultivate.policy import RetainedFactoryScope
+    from unittest.mock import AsyncMock
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope = state.action_scope
+    home = tmp_path / "home"
+    _configure_test_suites(
+        home, state, test_suites=_suite_declarations("python", "unit"),
+    )
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+    retained_scope = None
+    if retained:
+        retained_scope = RetainedFactoryScope(
+            issue_id=scope.pr_number, signature="signature", occurrence_id="occurrence",
+            run_id="run", attempt=1, session="session", repository=scope.canonical_repo,
+            branch="worklink/fix", sandbox=str(state.checkout_lease.path),
+        )
+        # Retained checkout validation normally crosses the executor boundary.
+        # Keep command/selector validation real, without a live Worklink executor.
+        monkeypatch.setattr(repository, "RepoGitTools", lambda **kwargs: SimpleNamespace(
+            validated_checkout_root=lambda: state.checkout_lease.path.resolve(),
+            _command=lambda args: SimpleNamespace(stdout=scope.observed_head_sha),
+        ))
+    auth = replace(
+        _untainted_ifc_auth(), channel_id="repo-test-refusal",
+        repo_review_state=state, retained_factory_scope=retained_scope,
+    )
+    delivered = AsyncMock(return_value=True)
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", delivered)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    selectors = ("tests/test_missing.py",) if refusal == "unknown_selector" else ()
+    suite = "missing" if refusal == "invalid_suite" else "python"
+    code = "test_selector_not_found"
+    detail = "test selector was not found in checkout: tests/test_missing.py"
+    if refusal in {"invalid_suite", "ambiguous_suite"}:
+        code = "test_suite_selection_refused"
+        detail = "select exactly one declared test suite: python, unit"
+        if refusal == "ambiguous_suite":
+            suite = None
+    elif refusal == "missing_configuration":
+        monkeypatch.delenv("MIMIR_HOME")
+        code, detail = "test_not_configured", "MIMIR_HOME is not configured"
+    arguments = {
+        "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+        "selectors": selectors, "suite": suite,
+    }
+    continued = []
+    refusals = []
+
+    def tool_error(exc: repository.ToolException) -> str:
+        refusals.append(exc)
+        return str(exc)
+
+    def continue_turn(messages):
+        continued.append(True)
+        assert messages["messages"][-1].status == "error"
+        return {"messages": [AIMessage(content="Recovered from tool refusal")]}
+
+    graph = StateGraph(MessagesState, context_schema=AuthContext)
+    # Match the production middleware's ToolException boundary. In particular,
+    # raw ProjectTestRefusal/RuntimeError must escape and fail this regression.
+    graph.add_node("tools", ToolNode([repository.repo_test], handle_tool_errors=tool_error))
+    graph.add_node("continue", continue_turn)
+    graph.add_edge(START, "tools")
+    graph.add_edge("tools", "continue")
+    graph.add_edge("continue", END)
+    capture = begin_protected_result_capture()
+    try:
+        result = await graph.compile().ainvoke({"messages": [AIMessage(
+            content="", tool_calls=[{"name": "repo_test", "args": arguments, "id": "refused"}],
+        )]}, context=auth)
+    finally:
+        provenance = end_protected_result_capture(capture)
+    message = result["messages"][-2]
+    expected = (
+        f"project test rejected ({code}): {detail}\n"
+        + repository._remediation_test_guidance(code, scoped=bool(selectors))
+    )
+    assert message.status == "error"
+    assert message.content == expected
+    assert len(refusals) == 1
+    assert type(refusals[0]) is repository.ToolPolicyRefusal
+    assert isinstance(refusals[0].__cause__, repository.ProjectTestRefusal)
+    assert refusals[0].__cause__.execution_started is False
+    assert continued == [True]
+    assert provenance is None
+    assert registry.jobs == {}
+    assert not list(registry.directory.glob("*.json"))
+    delivered.assert_not_called()
+    assert state.full_tested_head is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["sync", "async_pr", "async_retained"])
+@pytest.mark.parametrize("failure, policy_refusal", [
+    ("pre_execution", True), ("post_execution", False),
+    ("runtime", False), ("value", False),
+    ("fixed", True), ("unrecognized_message", False),
+    ("unrecognized_code", False), ("not_fixed", False), ("untyped_fixed", False),
+])
+async def test_repo_test_refusal_conversion_parity(
+    tmp_path, monkeypatch, path, failure, policy_refusal,
+):
+    from langchain_core.tools import ToolException
+    from mimir import repo_test_jobs
+    from mimir.access_control import begin_protected_result_capture, end_protected_result_capture
+    from mimir_cultivate.policy import RetainedFactoryScope
+    from unittest.mock import AsyncMock, Mock
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope = state.action_scope
+    if failure == "runtime":
+        exc = RuntimeError("checkout unavailable")
+    elif failure == "value":
+        exc = ValueError("invalid checkout")
+    elif failure == "untyped_fixed":
+        exc = RuntimeError("project test command is invalid")
+        exc.code = "test_config_invalid"
+        exc.fixed_message = True
+    else:
+        exc = repository.ProjectTestRefusal(
+            "other_code" if failure == "unrecognized_code" else "test_config_invalid",
+            "unrecognized detail" if failure == "unrecognized_message"
+            else "project test command is invalid",
+            execution_started=failure != "pre_execution",
+            fixed_message=failure in {"fixed", "unrecognized_message", "unrecognized_code"},
+        )
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda *args: SimpleNamespace(
+        execute=AsyncMock(side_effect=exc),
+    ))
+    queue = AsyncMock(side_effect=exc)
+    monkeypatch.setattr(repository, "_queue_repo_test", queue)
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=True))
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    publish = Mock()
+    monkeypatch.setattr(repository, "_publish_attested_lease_result", publish)
+    retained = None
+    if path == "async_retained":
+        retained = RetainedFactoryScope(
+            issue_id=scope.pr_number, signature="signature", occurrence_id="occurrence",
+            run_id="run", attempt=1, session="session", repository=scope.canonical_repo,
+            branch="worklink/fix", sandbox=str(state.checkout_lease.path),
+        )
+    runtime = SimpleNamespace(context=replace(
+        _untainted_ifc_auth(), channel_id=None if path == "sync" else "refusal-parity",
+        retained_factory_scope=retained,
+    ))
+    selectors = ("tests/test_changed.py",)
+    capture = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException) as raised:
+            await repository.repo_test.coroutine(
+                scope.canonical_repo, scope.pr_number, selectors, runtime=runtime,
+            )
+    finally:
+        provenance = end_protected_result_capture(capture)
+    expected_type = repository.ToolPolicyRefusal if policy_refusal else ToolException
+    assert type(raised.value) is expected_type
+    assert raised.value.__cause__ is exc
+    code = getattr(exc, "code", "project_test_failed")
+    assert str(raised.value) == (
+        f"project test rejected ({code}): {exc}\n"
+        + repository._remediation_test_guidance(code, scoped=True)
+    )
+    assert provenance is None
+    if path == "sync" and failure not in {"pre_execution", "fixed"}:
+        publish.assert_called_once_with(runtime, state)
+    else:
+        publish.assert_not_called()
+    assert queue.await_count == (0 if path == "sync" else 1)
+    assert registry.jobs == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("head_move", ["none", "remote", "scope", "local", "superseded", "snapshot"])
+async def test_repo_test_async_head_binding(tmp_path, monkeypatch, head_move):
+    from mimir import repo_test_jobs
+    from mimir.models import AuthContext
+    from mimir_cultivate import forge
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope = state.action_scope
+    head = scope.observed_head_sha
+    events = []
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def complete(event):
+        events.append(event)
+        return True
+
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", complete)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+    monkeypatch.setattr(forge, "_client", lambda scope: object())
+    monkeypatch.setattr(forge, "_live_pr_head", lambda *args: "b" * 40 if head_move == "remote" else head)
+    monkeypatch.setattr(repository, "was_superseded_by_own_push", lambda *args: head_move == "superseded")
+    real = repository.RepoProjectTests
+    calls = []
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        calls.append(argv)
+        started.set()
+        await release.wait()
+        return CollectedExecutionResult(
+            0, b"1 passed in 0.01s\n",
+            _lease_start(kwargs["identifier"], repository.time.monotonic()),
+            False, False, 0, 0,
+        )
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    runtime = SimpleNamespace(context=replace(
+        _untainted_ifc_auth(), principal=scope.principal, channel_id="repo-test-async",
+        repo_review_state=state,
+    ))
+    queued = await repository.repo_test.coroutine(scope.canonical_repo, scope.pr_number, runtime=runtime)
+    assert queued["status"] == "queued" and queued["head_sha"] == head
+    await started.wait()
+    assert state.full_tested_head is None
+    assert await repository.repo_test.coroutine(scope.canonical_repo, scope.pr_number, runtime=runtime) == queued
+    job = registry.jobs[queued["job_id"]]
+    assert job.record["snapshot"]["head_sha"] == head
+    assert job.record["workers"]
+    if head_move == "scope":
+        object.__setattr__(scope, "observed_head_sha", "b" * 40)
+    elif head_move == "local":
+        object.__setattr__(state, "git_expected_head", "b" * 40)
+    elif head_move == "snapshot":
+        registry.save(job, snapshot={**job.record["snapshot"], "head_sha": "b" * 40})
+    release.set()
+    await job.task
+    assert len(calls) == 2
+    [event] = events
+    data = json.loads(event.content)
+    result = data["result"]
+    assert event.trigger == "repo_test_complete"
+    assert event.continuation_auth_context.repo_review_state is state
+    assert event.channel_id == "repo-test-async"
+    assert event.ifc_labels.sources[-1].resource_id == f"{scope.canonical_repo}#pull/{scope.pr_number}@{head}"
+    assert "path" not in data["snapshot"]
+    assert [leg["returncode"] for leg in result["legs"]] == [0, 0]
+    if head_move == "none":
+        assert state.full_tested_head == head
+        assert result["evidence"] is True
+    else:
+        assert state.full_tested_head is None
+        assert result["evidence"] is False
+        assert "stale: head moved" in event.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "green", "single_leg", "head_moved", "selectors", "non_default", "dirty",
+    "dirty_then_clean", "dirty_after", "git_head", "missing_leg", "failed_leg",
+])
+@pytest.mark.usefixtures("repository_git_policy")
+async def test_repo_test_completion_followup_push_gate(tmp_path, monkeypatch, case):
+    """Real job -> completion routing -> turn auth -> registry -> repo_push gate.
+
+    Use a conflict remediation scope because its push actually requires the
+    full-suite proof; an ordinary remediation push would pass vacuously.
+    Neither state resolution, evidence recording nor the push gate is mocked.
+    """
+    from mimir import agent as agent_module, repo_test_jobs
+    from mimir.agent import Agent, _create_turn_auth_context
+    from mimir_cultivate import forge
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from unittest.mock import AsyncMock
+
+    from tests.test_repo_tools import _two_sided_conflict_tools, _conflict_commit_evidence
+
+    _, scope, state, tools = _two_sided_conflict_tools(tmp_path)
+    with pytest.raises(repository.GitRefusal, match="merge conflict"):
+        tools.execute(repository.GitMerge())
+    root = state.checkout_lease.path
+    (root / "tracked.txt").write_text("base property\nhead property\n")
+    tools.execute(repository.GitStage(("tracked.txt",)))
+    tools.execute(repository.GitCommit(
+        ("tracked.txt", "base-test", "head-test", "suite"), "resolve merge",
+        _conflict_commit_evidence(),
+    ))
+    head = state.git_expected_head
+    assert head != scope.observed_head_sha
+    home = tmp_path / "home"
+    legs = [{"name": "primary", "command": "/usr/bin/true"}]
+    if case != "single_leg":
+        legs.append({"name": "other-environment", "command": "/usr/bin/true",
+                     "env": {"MIMIR_PLUGINS": "other"}})
+    _configure_test_suites(home, state, test_suites=[
+        {"name": "python", "default": True, "legs": legs},
+        {"name": "other", "command": "/usr/bin/true"},
+    ])
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", str(tmp_path / "heavy.lock"))
+    clean = (root / "tracked.txt").read_text()
+    if case in {"dirty", "dirty_then_clean"}:
+        (root / "tracked.txt").write_text(clean + "untested edit\n")
+    auth = replace(
+        _untainted_ifc_auth(), principal=scope.principal,
+        channel_id="repo-test-push-gate", enforcement_enabled=False,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    owner = SimpleNamespace(
+        _shell_jobs=SimpleNamespace(get=lambda _: None),
+        _dispatcher=SimpleNamespace(enqueue=AsyncMock(return_value=True)),
+        _shell_completion_batch_seconds=0,
+    )
+    monkeypatch.setattr(agent_module, "log_event", AsyncMock())
+
+    async def complete(event):
+        return await Agent._on_repo_test_complete(owner, event)
+
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", complete)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(forge, "_client", lambda scope: object())
+    # The verified-push ledger is process-global: another case's successful
+    # push of this same fixture head would mark it superseded and refuse every
+    # later push for that reason instead of the guard each case exercises.
+    monkeypatch.setattr(repository, "_ancestral_verified_pushes", type(repository._ancestral_verified_pushes)())
+    live = {"head": scope.observed_head_sha}
+    monkeypatch.setattr(forge, "_live_pr_head", lambda *args: live["head"])
+    started, release = asyncio.Event(), asyncio.Event()
+    real = repository.RepoProjectTests
+    calls = []
+
+    async def runner(*args, **kwargs):
+        calls.append(args)
+        started.set()
+        await release.wait()
+        if case == "dirty_then_clean":
+            (root / "tracked.txt").write_text(clean)
+        elif case == "dirty_after":
+            (root / "tracked.txt").write_text(clean + "new edit\n")
+        elif case == "git_head" and len(calls) == 1:
+            tree = _git(root, "rev-parse", "HEAD^{tree}")
+            advanced = _git(root, "-c", "user.name=test", "-c", "user.email=test@example.test",
+                            "commit-tree", tree, "-p", "HEAD", "-m", "concurrent commit")
+            _git(root, "update-ref", scope.destination_ref, advanced)
+        return CollectedExecutionResult(
+            1 if case == "failed_leg" and len(calls) == 2 else 0,
+            b"1 passed in 0.01s\n", b"", False, False, 0, 0,
+        )
+
+    if case == "missing_leg":
+        # Simulate an executor skipping a configured leg; all commands actually
+        # launched still succeed. Qualification must check complete coverage.
+        real_zip = zip
+        def skip_leg(*items):
+            rows = real_zip(*items)
+            return iter(list(rows)[:1]) if len(items) == 3 else rows
+        monkeypatch.setattr(repository, "zip", skip_leg, raising=False)
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    # This is a gate test, not a passing-tests-with-stale-marker test.
+    with pytest.raises(repository.ToolException, match=r"\[full_test_required\]"):
+        repository.repo_push.func(scope.canonical_repo, scope.pr_number,
+                                  runtime=SimpleNamespace(context=auth))
+    queued = await repository.repo_test.coroutine(
+        scope.canonical_repo, scope.pr_number,
+        selectors=("tracked.txt",) if case == "selectors" else (),
+        suite="other" if case == "non_default" else "python",
+        runtime=SimpleNamespace(context=auth),
+    )
+    await started.wait()
+    if case == "head_moved":
+        live["head"] = "b" * 40
+    release.set()
+    job = registry.jobs[queued["job_id"]]
+    await job.task
+    owner._dispatcher.enqueue.assert_awaited_once()
+    event = owner._dispatcher.enqueue.call_args.args[0]
+    assert event.trigger == "repo_test_complete"
+    result = job.record["result"]
+    assert result["ok"] is (case != "failed_leg")
+    qualifies = case in {"green", "single_leg"}
+    assert result["full_suite_evidence"] is (qualifies or case == "head_moved")
+    if case == "git_head":
+        # Restore the independent checkout identity after proving qualification
+        # refused the changed real HEAD, so the push reaches the full-test gate.
+        _git(root, "update-ref", scope.destination_ref, head)
+    assert len(result["legs"]) == (1 if case in {"single_leg", "missing_leg", "non_default"} else 2)
+    # Each refusal must come from its own guard: a moved head is stale, while
+    # selected or non-default runs are current evidence that is not full-suite.
+    assert result["evidence"] is (case != "head_moved")
+    assert result.get("stale", False) is (case == "head_moved")
+    followup = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=False, ifc_labels=event.ifc_labels,
+    )
+    assert followup.trigger == "repo_test_complete"
+    runtime = SimpleNamespace(context=followup)
+    assert repository._state(runtime, scope.canonical_repo, scope.pr_number) is state
+    if qualifies:
+        # Removing record_full_test in _queue_repo_test must fail here.
+        assert repository.repo_push.func(
+            scope.canonical_repo, scope.pr_number, runtime=runtime,
+        )["ok"]
+    else:
+        with pytest.raises(repository.ToolException, match=r"\[full_test_required\]"):
+            repository.repo_push.func(scope.canonical_repo, scope.pr_number, runtime=runtime)
+    assert state.full_tested_head == (head if qualifies else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("repository_git_policy")
+@pytest.mark.parametrize("case", [
+    "green", "evidence_false", "head_moved", "no_carrier", "wrong_channel",
+    "http", "inherited_http", "tainted", "unheld_scope", "interrupted",
+    "missing_binding", "stale", "result_repository", "result_pr", "result_head",
+    "superseded_scope", "local_head", "no_queue_grants", "expired_queue",
+    "reduced_actions", "expired_after_queue", "different_carrier", "different_principal",
+    "lease_scope", "lease_identity", "lease_turn", "lease_unattested", "lease_missing",
+    "missing_completion", "tainted_preload", "restart", "shell", "discovered_scope",
+    "wrong_carrier_type", "wrong_completion_type",
+    "lease_metadata", "lease_metadata_symlink",
+    "local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge",
+    "changed_lease", "missing_lease_before_mint", "failed",
+])
+async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
+    """Real mint -> queue -> route -> fresh mint -> enforced grant validation."""
+    from mimir import access_control as ac, agent as agent_module, repo_test_jobs
+    from mimir.agent import Agent, _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.models import AgentEvent, InformationFlowLabels, SourceLabel
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from unittest.mock import AsyncMock
+
+    local_merge = case in {"local_merge", "forge_moved_after_merge", "tested_head_after_merge"}
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch, advance_base=local_merge)
+    scope = state.action_scope
+    lease = state.checkout_lease
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    policy = selected_policy_registry()
+    protocol = policy.scoped_actions["cultivate"]
+    # Production ingress mint, followed by host scope/checkout observations.
+    # No fabricated ScopedPRGrants or patched validator.
+    authority = ac.build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=ac.CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=tuple(policy.authority_profiles["github"]),
+        creation_path="mimir.pollers.run_poller", policy=policy, poller_owner="cultivate",
+    )
+    auth = ac.create_auth_context(
+        AgentEvent(trigger="poller", channel_id="poller:github-activity", source="poller",
+                   service_principal=authority.canonical, service_authority=authority,
+                   extra={"poller_name": "github-activity", "items": []}),
+        enforce=True, ifc_labels=InformationFlowLabels(), policy=policy,
+    )
+    auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((state,)))
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    auth.scoped_pr_grants.issue(scope)
+    token = ac.consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    if local_merge:
+        # The fixture advanced main independently of the PR; merge only locally.
+        repository.RepoGitTools(state, auth_context=auth).execute(repository.GitMerge())
+        assert len(_git(lease.path, "rev-list", "--parents", "-n", "1", "HEAD").split()) == 3
+        assert state.git_expected_head != scope.observed_head_sha
+        assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) == scope.observed_head_sha
+    elif case == "local_commit":
+        (lease.path / "tracked.txt").write_text("local committed work\n")
+        repository.RepoGitTools(state, auth_context=auth).execute(
+            repository.GitCommit(("tracked.txt",), "local fix"),
+        )
+        assert state.git_expected_head != scope.observed_head_sha
+    queue_grants = auth.scoped_pr_grants
+    if case == "unheld_scope":
+        # Same PR/head is insufficient: scope_id must also have been held.
+        queue_grants._follow.clear()
+    elif case == "no_queue_grants":
+        auth = replace(auth, scoped_pr_grants=None)
+    elif case == "expired_queue":
+        queue_grants._follow[("cultivate", scope.scope_id)] = {
+            action: replace(grant, expires_at=0)
+            for action, grant in queue_grants._follow[("cultivate", scope.scope_id)].items()
+        }
+    elif case == "reduced_actions":
+        del queue_grants._follow[("cultivate", scope.scope_id)]["pr.edit"]
+    owner = SimpleNamespace(
+        _shell_jobs=SimpleNamespace(get=lambda _: None),
+        _dispatcher=SimpleNamespace(enqueue=AsyncMock(return_value=True)),
+        _shell_completion_batch_seconds=0,
+    )
+    monkeypatch.setattr(agent_module, "log_event", AsyncMock())
+    from mimir import event_logger
+
+    handoffs = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: handoffs.append((kind, fields)))
+    registry = repo_test_jobs.RepoTestJobRegistry(
+        tmp_path / "jobs", lambda event: Agent._on_repo_test_complete(owner, event),
+    )
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(forge, "_client", lambda _: object())
+    monkeypatch.setattr(forge, "_live_pr_head", lambda *_: scope.observed_head_sha)
+    monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: True)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(ac, "_github_repo_from_remote", lambda _: scope.canonical_repo)
+    monkeypatch.setattr(repository, "_ancestral_verified_pushes", type(repository._ancestral_verified_pushes)())
+    real = repository.RepoProjectTests
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(
+            0, b"1 passed in 0.01s\n",
+            _lease_start(kwargs["identifier"], repository.time.monotonic()),
+            False, False, 0, 0,
+        )
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    draft = lease.path / "tracked.txt"
+    draft.write_text("queueing turn's uncommitted draft\n")
+    queue_turn = _ifc_turn(auth)
+    queue_turn.turn_id = "queue-turn"
+    turn_token = set_current_turn(queue_turn)
+    try:
+        queued = await repository.repo_test.coroutine(
+            scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+        )
+    finally:
+        reset_current_turn(turn_token)
+    job = registry.jobs[queued["job_id"]]
+    await job.task
+    assert job.record["result"]["evidence"] is True
+    event = owner._dispatcher.enqueue.call_args.args[0]
+    if case == "shell":
+        event.trigger = "shell_job_complete"
+        assert ac.remint_repo_test_grants(event, replace(auth, ifc_labels=job.labels)) is None
+        shell_auth = _create_turn_auth_context(
+            event, None, policy_version=None, enforce=True, ifc_labels=job.labels, policy=policy,
+        )
+        assert shell_auth.scoped_pr_grants is queue_grants  # no new shell authority
+        return
+    if case == "restart":
+        registry.save(job, delivered=False)
+        recovered = repo_test_jobs.RepoTestJobRegistry(registry.directory, registry.on_complete)
+        await recovered.recover(AsyncMock())
+        event = owner._dispatcher.enqueue.call_args.args[0]
+        assert event.continuation_auth_context is None
+    completion = event.extra["_repo_test_completion"]
+    if case in {"local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge"}:
+        assert completion.head == state.git_expected_head != scope.observed_head_sha
+        assert completion.binding.tested_head == completion.head
+        assert completion.binding.observed_head_sha == scope.observed_head_sha
+    if case == "expired_after_queue":
+        # Expiry after queueing is precisely why this completion needs renewal.
+        queue_grants.expires_at = 0
+        queue_grants._follow[("cultivate", scope.scope_id)] = {
+            action: replace(grant, expires_at=0)
+            for action, grant in queue_grants._follow[("cultivate", scope.scope_id)].items()
+        }
+        assert not ac._valid_scoped_pr_grant(
+            auth, "cultivate", protocol.action_type.COMMIT, protocol, scope, state,
+            tool_name="repo_commit",
+        )
+    elif case == "different_carrier":
+        event.continuation_auth_context = replace(
+            event.continuation_auth_context,
+            scoped_pr_grants=ac.ScopedPRGrants(
+                auth.canonical_principal, (), protocols=policy.scoped_actions,
+                _issuer=ac._SCOPED_PR_ISSUER,
+            ),
+        )
+    elif case == "different_principal":
+        event.continuation_auth_context = replace(
+            event.continuation_auth_context, canonical_principal="other",
+        )
+    if case == "evidence_false":
+        completion = replace(completion, evidence=False)
+    elif case == "interrupted":
+        completion = replace(completion, status="interrupted")
+    elif case == "failed":
+        completion = replace(completion, status="failed")
+    elif case == "missing_binding":
+        completion = replace(completion, binding=None)
+    elif case == "result_repository":
+        completion = replace(completion, repository="other/repo")
+    elif case == "result_pr":
+        completion = replace(completion, pull_request=99)
+    elif case == "result_head":
+        completion = replace(completion, head="b" * 40)
+    elif case == "head_moved":
+        object.__setattr__(scope, "observed_head_sha", "b" * 40)
+    elif case == "local_head":
+        object.__setattr__(state, "git_expected_head", "b" * 40)
+    elif case == "forge_moved_after_merge":
+        # The completed job still has evidence; the forge observation advances
+        # while it waits for its continuation turn.
+        moved = _git(
+            lease.path, "-c", "user.name=test", "-c", "user.email=test@example.com",
+            "commit-tree", "HEAD^{tree}", "-p", scope.observed_head_sha, "-m", "someone else pushed",
+        )
+        _git(lease.path, "push", "origin", f"{moved}:{scope.destination_ref}")
+        object.__setattr__(scope, "observed_head_sha", moved)
+    elif case == "tested_head_after_merge":
+        # Changing both the completion and mutable local state must not bypass
+        # the immutable queue-time tested-head binding.
+        completion = replace(completion, head="b" * 40)
+        object.__setattr__(state, "git_expected_head", completion.head)
+    elif case == "changed_lease":
+        object.__setattr__(lease, "recovery_id", "different-lease")
+    elif case == "missing_lease_before_mint":
+        # Isolate the missing-lease guard from the independent local-head guard.
+        object.__setattr__(state, "checkout_lease", None)
+    elif case in {"superseded_scope", "discovered_scope"}:
+        replacement_state = RepoReviewState(replace(scope, event_type="pr_synchronize"))
+        object.__setattr__(replacement_state, "git_expected_head", scope.observed_head_sha)
+        if case == "superseded_scope":
+            event.continuation_auth_context = replace(
+                event.continuation_auth_context,
+                repo_pr_scope_registry=RepoPRScopeRegistry((replacement_state,)),
+            )
+        else:
+            from mimir_cultivate.policy import ServerDiscoveredPRStates
+
+            discovered = ServerDiscoveredPRStates()
+            discovered.remember(replacement_state)
+            event.continuation_auth_context = replace(
+                event.continuation_auth_context, server_discovered_pr_states=discovered,
+            )
+    elif case == "no_carrier":
+        event.continuation_auth_context = None
+    elif case == "wrong_carrier_type":
+        event.continuation_auth_context = SimpleNamespace(
+            channel_id=event.channel_id, scoped_pr_grants=queue_grants,
+        )
+    elif case == "wrong_channel":
+        event.channel_id = "another-channel"
+    elif case == "http":
+        event.extra[ac.HTTP_EVENT_INGRESS_EXTRA_KEY] = None
+    elif case == "inherited_http":
+        event.continuation_auth_context = replace(event.continuation_auth_context, event_ingress="http")
+    elif case == "tainted":
+        event.ifc_labels = event.ifc_labels.with_source(SourceLabel(
+            principal="outside", domain="web", resource_id="tainted",
+            bridge_instance="web", sensitivity="public",
+            integrity="untrusted", integrity_effect="active_ingest",
+        ))
+    elif case == "stale":
+        registry.save(job, result={**job.record["result"], "stale": True})
+        await registry.deliver(job)
+        event = owner._dispatcher.enqueue.call_args.args[0]
+        completion = event.extra["_repo_test_completion"]
+    event.extra["_repo_test_completion"] = completion
+    if case == "missing_completion":
+        event.extra.pop("_repo_test_completion")
+    elif case == "wrong_completion_type":
+        event.extra["_repo_test_completion"] = SimpleNamespace(**vars(completion))
+    labels = _initialize_ifc_labels(event, policy=policy)
+    if case == "tainted_preload":
+        labels = labels.with_source(SourceLabel(
+            principal="outside", domain="web", resource_id="preloaded-taint",
+            bridge_instance="web", sensitivity="public", integrity="untrusted",
+            integrity_effect="active_ingest",
+        ))
+    followup = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True,
+        ifc_labels=labels, policy=policy,
+    )
+    has_grant = case in {
+        "green", "reduced_actions", "expired_after_queue", "local_merge", "local_commit",
+    } or case.startswith("lease_")
+    if not has_grant:
+        # Isolate mint admission from the independent ingress IFC classifier:
+        # HTTP/channel violations must refuse even with clean supplied labels.
+        from mimir.models import AuthContext
+
+        direct_auth = replace(
+            event.continuation_auth_context
+            if isinstance(event.continuation_auth_context, AuthContext) else auth,
+            ifc_labels=job.labels if case in {"http", "wrong_channel", "wrong_carrier_type"} else labels,
+        )
+        assert ac.remint_repo_test_grants(event, direct_auth) is None, case
+        assert followup.scoped_pr_grants is None, case
+        assert not ac._valid_scoped_pr_grant(
+            followup, "cultivate", protocol.checkout_action, protocol, scope, state,
+            tool_name="repo_checkout",
+        )
+        checkout = ac.get_tool_registry().authorize_tool(
+            "repo_checkout", followup, enforce=True,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+            policy=policy,
+        )
+        assert not checkout.allowed
+        refused = ac.get_tool_registry().authorize_tool(
+            "repo_commit", followup, enforce=True,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                       "paths": ("tracked.txt",), "message": "must refuse"}, policy=policy,
+        )
+        assert not refused.allowed
+        return
+    grants = followup.scoped_pr_grants
+    assert grants is not None
+    assert grants is not queue_grants and grants.nonce != queue_grants.nonce
+    assert grants.expires_at > repository.time.monotonic() + 3500
+    assert set(grants._prelease) == {("cultivate", scope.scope_id)}
+    other_scope = replace(scope, pr_number=99)
+    grants.issue(other_scope)
+    assert grants.get("cultivate", other_scope, "repo.checkout") is None
+    assert ac._valid_scoped_pr_grant(
+        followup, "cultivate", protocol.checkout_action, protocol, scope, state,
+        tool_name="repo_checkout",
+    )
+    checkout = ac.get_tool_registry().authorize_tool(
+        "repo_checkout", followup, enforce=True,
+        arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        policy=policy,
+    )
+    assert checkout.allowed, checkout.as_log_fields()
+    turn = _ifc_turn(followup)
+    turn.turn_id = "completion-turn"
+    turn_token = set_current_turn(turn)
+    try:
+        checkout_token = ac.consume_scoped_pr_checkout(followup, scope, "cultivate")
+        if case.startswith("lease_"):
+            if case == "lease_scope":
+                grants.repo_test_continuation = replace(grants.repo_test_continuation, scope=other_scope)
+            elif case == "lease_identity":
+                grants.repo_test_continuation = replace(grants.repo_test_continuation, lease_identity=("other", "other"))
+            elif case == "lease_turn":
+                object.__setattr__(lease, "last_turn_id", "unrelated-turn")
+            elif case == "lease_missing":
+                state.revoke_checkout_lease(lease)
+            elif case == "lease_metadata":
+                metadata = lease.path / repository._METADATA
+                metadata.write_text(json.dumps({**json.loads(metadata.read_text()), "recovery_id": "other"}))
+            elif case == "lease_metadata_symlink":
+                metadata = lease.path / repository._METADATA
+                target = tmp_path / "not-lease-metadata"
+                target.write_text("must not be overwritten\n")
+                metadata.unlink()
+                metadata.symlink_to(target)
+            else:
+                monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: False)
+            with pytest.raises(repository.ToolPolicyRefusal):
+                repository.repo_checkout.func(
+                    scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=followup),
+                )
+            assert draft.read_text() == "queueing turn's uncommitted draft\n"
+            if case == "lease_metadata_symlink":
+                assert target.read_text() == "must not be overwritten\n"
+            assert not grants._follow
+            return
+        result = repository.repo_checkout.func(
+            scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=followup),
+        )
+        assert result["status"] == "resumed"
+        assert state.checkout_lease is lease
+        assert draft.read_text() == "queueing turn's uncommitted draft\n"
+        assert lease.last_turn_id == "completion-turn"
+        assert ("pr_checkout_lease_completion_handoff", {
+            "scope_id": scope.scope_id, "previous_turn_id": "queue-turn",
+            "last_turn_id": "completion-turn",
+        }) in handoffs
+        assert json.loads((lease.path / repository._METADATA).read_text())["last_turn_id"] == "completion-turn"
+        assert not state.checkout_recovery_notices
+        assert ac.observe_scoped_pr_checkout(
+            followup, scope, state, checkout_token, "cultivate", protocol,
+        )
+        if case == "reduced_actions":
+            assert grants.get("cultivate", scope, "pr.edit", checkout=False) is None
+            assert set(grants._follow[("cultivate", scope.scope_id)]) == scope.allowed_operations - {"pr.edit"}
+        for tool_name, arguments in (
+            ("repo_commit", {"paths": ("tracked.txt",), "message": "complete queued draft"}),
+            ("repo_push", {}),
+        ):
+            allowed = ac.get_tool_registry().authorize_tool(
+                tool_name, followup, enforce=True,
+                arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                           **arguments}, policy=policy,
+            )
+            assert allowed.allowed, allowed.as_log_fields()
+            assert getattr(repository, tool_name).func(
+                scope.canonical_repo, scope.pr_number, **arguments,
+                runtime=SimpleNamespace(context=followup),
+            )["ok"]
+        assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) != job.record["head_sha"]
+    finally:
+        reset_current_turn(turn_token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel,leased", [(False, True), (True, False)])
+async def test_repo_test_synchronous_fallback_unchanged(tmp_path, monkeypatch, channel, leased):
+    from mimir.models import AuthContext
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    if not leased:
+        monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE")
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+    real = repository.RepoProjectTests
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(0, b"", (
+            _lease_start(kwargs["identifier"], repository.time.monotonic()) if leased else b""
+        ), False, False, 0, 0)
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    runtime = SimpleNamespace(context=replace(_untainted_ifc_auth(), channel_id="async-test" if channel else None))
+    result = await repository.repo_test.coroutine(state.repo, state.pr_number, runtime=runtime)
+    assert result["ok"] and result["code"] == "tests_passed"
+    assert state.full_tested_head == state.action_scope.observed_head_sha
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["queue_timeout", "failure"])
+async def test_repo_test_async_completion_preserves_refusal_and_failure_nodes(tmp_path, monkeypatch, outcome):
+    from mimir import repo_test_jobs
+    from mimir.models import AuthContext
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from unittest.mock import AsyncMock
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    delivered = AsyncMock(return_value=True)
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", delivered)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+    real = repository.RepoProjectTests
+
+    async def runner(*args, **kwargs):
+        if outcome == "queue_timeout":
+            return CollectedExecutionResult(124, b"", b"", False, False, 0, 0)
+        return CollectedExecutionResult(
+            1, (
+                b"================ short test summary info ================\n"
+                b"FAILED tests/test_changed.py::test_changed - AssertionError\n"
+                b"================ 1 failed in 0.01s ================\n"
+            ), _lease_start(kwargs["identifier"], repository.time.monotonic()),
+            False, False, 0, 0,
+        )
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    queued = await repository.repo_test.coroutine(
+        state.repo, state.pr_number,
+        runtime=SimpleNamespace(context=replace(_untainted_ifc_auth(), channel_id="repo-test-outcome")),
+    )
+    await registry.jobs[queued["job_id"]].task
+    event = delivered.call_args.args[0]
+    result = json.loads(event.content)["result"]
+    assert state.full_tested_head is None
+    if outcome == "queue_timeout":
+        assert result["code"] == "repo_test_lease_wait_timeout"
+    else:
+        assert result["code"] == "tests_failed"
+        assert result["legs"][0]["failing_node_ids"] == ["tests/test_changed.py::test_changed"]
+        assert result["failing_node_ids"] == ["tests/test_changed.py::test_changed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["queued", "running"])
+async def test_repo_test_async_cancel_reaps_heavy_helper_and_ticket(tmp_path, monkeypatch, phase):
+    import signal
+    import time
+    from mimir import repo_test_jobs
+    from mimir.models import AuthContext
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from tests.test_heavy_run_script import _wait
+    from unittest.mock import AsyncMock
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch, command="/bin/sleep 60")
+    if phase == "queued":
+        intent = tmp_path / "heavy.lock.intent"
+        intent.mkdir()
+        (intent / "owner").write_text('{"tier":"large"}')
+        (intent / "heartbeat").write_text("1\n")
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=True))
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(repository, "_state", lambda *args: state)
+    real = repository.RepoProjectTests
+    processes = []
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        process = await asyncio.create_subprocess_exec(
+            *argv, cwd=capability.path, env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        processes.append(process)
+        try:
+            out, err = await process.communicate()
+            return CollectedExecutionResult(process.returncode, out, err, False, False, 0, 0)
+        except asyncio.CancelledError:
+            os.killpg(process.pid, signal.SIGTERM)
+            await asyncio.shield(process.wait())
+            raise
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    queued = await repository.repo_test.coroutine(
+        state.repo, state.pr_number, runtime=SimpleNamespace(context=replace(_untainted_ifc_auth(), channel_id="cancel-repo-test")),
+    )
+    marker = tmp_path / ("heavy.lock.queue" if phase == "queued" else "heavy.lock.lease")
+    await asyncio.to_thread(_wait, lambda: (
+        any(marker.glob("[0-9]*")) if phase == "queued" else (marker / "heartbeat").exists()
+    ))
+    await registry.cancel(queued["job_id"])
+    assert processes and processes[0].returncode is not None
+    assert not list((tmp_path / "heavy.lock.queue").glob("[0-9]*"))
+    assert not (tmp_path / "heavy.lock.lease").exists()
+    assert not (tmp_path / "heavy.lock.lease2").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attested", [False, True])
+async def test_repo_test_async_attestation_integrity_fails_closed(tmp_path, monkeypatch, attested):
+    from mimir import repo_test_jobs, access_control
+    from unittest.mock import AsyncMock
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                        lambda *args: SimpleNamespace(ok=attested))
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=True))
+    queued = await repository._queue_repo_test(
+        registry, SimpleNamespace(context=_untainted_ifc_auth()), state, (), None,
+    )
+    job = registry.jobs[queued["job_id"]]
+    assert job.labels.sources[-1].integrity == ("trusted" if attested else "untrusted")
+    await registry.cancel(job.job_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [None, "unknown worker id", "cleanup unverified"])
+async def test_repo_test_recovery_requires_confirmed_worker_retirement(monkeypatch, reason):
+    from mimir_cultivate.worklink import worker_client
+    from unittest.mock import AsyncMock
+
+    cancel = AsyncMock(side_effect=RuntimeError(reason) if reason else None)
+    monkeypatch.setattr(worker_client, "WorkerClient", lambda _: SimpleNamespace(cancel=cancel))
+    if reason == "cleanup unverified":
+        with pytest.raises(RuntimeError, match="cleanup unverified"):
+            await repository.recover_repo_test_job({"workers": ["identity"]})
+    else:
+        await repository.recover_repo_test_job({"workers": ["identity"]})
+    cancel.assert_awaited_once_with("identity")
+
+
+@pytest.mark.asyncio
+async def test_repo_test_retained_async_refuses_expired_effect_scope(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from mimir import repo_test_jobs
+    from mimir_cultivate.policy import RetainedFactoryScope
+    from mimir_cultivate.worklink import retained_scope
+    from unittest.mock import AsyncMock
+
+    scope = RetainedFactoryScope(
+        issue_id=9, signature="signature", occurrence_id="occurrence", run_id="run",
+        attempt=1, session="session", repository="o/r", branch="worklink/fix",
+        sandbox=str(tmp_path),
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(repository, "RepoGitTools", lambda **kwargs: SimpleNamespace(
+        validated_checkout_root=lambda: tmp_path,
+        _command=lambda args: SimpleNamespace(stdout="a" * 40),
+    ))
+    monkeypatch.setattr(repository, "_configured_command",
+                        lambda *args: (("/usr/bin/true",), {}, "fixture", "unit", True))
+
+    @contextmanager
+    def expired(*args):
+        yield SimpleNamespace(scope=None)
+
+    monkeypatch.setattr(retained_scope, "retained_factory_effect_lease", expired)
+    executor = AsyncMock(return_value=repository.ProjectTestResult(True, "tests_passed", 0))
+    monkeypatch.setattr(repository, "RepoProjectTests",
+                        lambda **kwargs: SimpleNamespace(execute=executor))
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=True))
+    queued = await repository._queue_repo_test(
+        registry, SimpleNamespace(context=_untainted_ifc_auth()), scope, (), None,
+    )
+    job = registry.jobs[queued["job_id"]]
+    await job.task
+    assert job.record["status"] == "failed"
+    executor.assert_not_called()
 
 
 @pytest.mark.asyncio

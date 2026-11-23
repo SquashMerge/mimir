@@ -32,7 +32,7 @@ _HTTP_EVENT_INGRESS = "http_event"
 # channel (it reports back to wherever the spawn was launched from); the
 # bridge-presence check in ``is_interactive_turn`` enforces that.
 INTERACTIVE_TRIGGERS: frozenset[str] = frozenset(
-    {"user_message", "shell_job_complete"}
+    {"user_message", "shell_job_complete", "repo_test_complete"}
 )
 
 

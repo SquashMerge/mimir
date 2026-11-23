@@ -18,7 +18,7 @@ import sys
 import threading
 import traceback
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 import uuid
 
 import pytest
@@ -333,6 +333,106 @@ async def _trusted_turn(case):
     )
     assert auth.retained_factory_scope is not None, auth.retained_factory_scope_refusal
     return event, labels, auth
+
+
+@pytest.mark.asyncio
+async def test_queued_retained_repo_test_publishes_trusted_provenance(
+    remediation_case, monkeypatch,
+):
+    """Queued retained results publish provenance without tainting remediation."""
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain.tools import ToolRuntime
+    from langgraph.runtime import Runtime
+    from mimir import repo_test_jobs
+    from mimir.models import SourceLabel
+    from mimir.tools import budget_gate
+    from mimir_cultivate import repository
+    from mimir_cultivate.worklink import worker_client
+
+    case = remediation_case
+    _event, _labels, auth = await _trusted_turn(case)
+    scope = auth.retained_factory_scope
+    assert scope is not None
+    assert auth.channel_id
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", str(case.home.parent / "heavy.lock"))
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_TIMEOUT", raising=False)
+    monkeypatch.delenv("MIMIR_HEAVY_TIER", raising=False)
+    registry = object()
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+
+    def owner_control(checkout, argv, *, env, timeout, output_limit):
+        assert checkout == case.sandbox
+        return subprocess.run(
+            argv, env={**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
+            capture_output=True, check=False,
+        )
+
+    monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
+    queued = {"status": "queued", "job_id": "rt_retained"}
+    queue = AsyncMock(return_value=dict(queued))
+    monkeypatch.setattr(repository, "_queue_repo_test", queue)
+    selected = load_plugins(enable="cultivate").policy
+    arguments = {"repository": scope.repository, "pull_request": scope.issue_id}
+    tool = selected.tools["repo_test"].factory()
+    request = ToolCallRequest(
+        tool_call={"name": "repo_test", "args": arguments, "id": "queued-retained",
+                   "type": "tool_call"},
+        tool=tool, state=None, runtime=Runtime(context=auth),
+    )
+    runtime = ToolRuntime(
+        state={}, context=auth, config={}, stream_writer=lambda _: None,
+        tool_call_id="queued-retained", store=None,
+    )
+    observed = []
+    classify = budget_gate.classify_protected_result
+
+    def capture_classification(*args, **kwargs):
+        # The middleware uses begin/end_protected_result_capture and supplies
+        # its live retained receipt; observe rather than bypass either boundary.
+        labels = classify(*args, **kwargs)
+        observed.append((kwargs["provenance"], labels))
+        return labels
+
+    monkeypatch.setattr(budget_gate, "classify_protected_result", capture_classification)
+
+    async def handler(_request):
+        result = await repository.repo_test.coroutine(**arguments, runtime=runtime)
+        assert result == {
+            **queued,
+            "provenance": {
+                "kind": "retained_factory_scope", "scope_id": scope.scope_id,
+                "repository": scope.repository, "issue_id": scope.issue_id,
+                "run_id": scope.run_id,
+            },
+        }
+        return ToolMessage(content=json.dumps(result), tool_call_id="queued-retained")
+
+    output = await budget_gate.BudgetGateMiddleware(selected).awrap_tool_call(request, handler)
+    assert output.status != "error", output.content
+    queue.assert_awaited_once_with(registry, runtime, scope, (), None)
+    [(provenance, labels)] = observed
+    principal = f"service:{auth.canonical_principal}"
+    resource = f"{scope.repository}#issue/{scope.issue_id}@retained/{scope.scope_id}"
+    assert provenance is not None
+    assert provenance.sources == (SourceLabel(
+        principal=principal, domain="repository", resource_id=resource,
+        bridge_instance="worklink", sensitivity="internal",
+        authorized_principals=frozenset({principal}), source_kind="protected_tool",
+        integrity="trusted", integrity_effect="active_ingest",
+    ),)
+    assert labels is not None
+    assert len(labels.sources) == 1
+    # Classification already uses a different domain from published provenance.
+    assert labels.sources[0].domain == "worklink_retained_repository"
+    assert labels.sources[0].integrity == "trusted"
+    assert not labels.has_untrusted_active_ingest
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    decision = ac.SinkGate.check_sink_flow(
+        "repo_commit", resource, auth.ifc_state.current(InformationFlowLabels()), auth,
+        enforce=True, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed, decision.reason
 
 
 @pytest.mark.asyncio

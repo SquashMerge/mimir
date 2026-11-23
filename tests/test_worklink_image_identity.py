@@ -294,6 +294,9 @@ async def test_missing_login_image_payload_uses_real_health_and_refuses_before_s
     exec(runpy.run_path(str(PROOF))["MISSING_LOGIN_PROOF"], namespace)
     monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
+    # With Cultivate selected, this refusal runs credential reconciliation.
+    # Its standalone durable logger must not default to the repository checkout.
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     generation = "12345678-1234-4234-8234-123456789abc"

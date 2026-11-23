@@ -26,7 +26,7 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2194-skip-merge-queue-remediation"
+GITHUB_POLLER_RELEASE = "2195-merge-conflict-resolution-neutral-guidance"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.
 IDENTITY_EXCEPTIONS: dict[str, set[str]] = {}
@@ -95,7 +95,9 @@ def test_current_github_poller_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "github-poller"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases[GITHUB_POLLER_RELEASE]["github-poller"]
+    actual = skill_inventory(skill)
+    expected = releases.get(GITHUB_POLLER_RELEASE, {}).get("github-poller")
+    assert actual == expected, "Current github-poller inventory:\n" + json.dumps(actual, indent=2)
 
 
 def test_history_file_defaults_are_released_for_both_pollers():

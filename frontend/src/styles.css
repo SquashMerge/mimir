@@ -2823,7 +2823,8 @@ textarea {
   --turn-trigger-color: var(--mimir-color-trigger-claude-code-spawn, #4f4f92);
 }
 
-.turn-trigger[data-trigger="shell_job_complete"] {
+.turn-trigger[data-trigger="shell_job_complete"],
+.turn-trigger[data-trigger="repo_test_complete"] {
   --turn-trigger-color: var(--mimir-color-trigger-shell-job-complete, #216674);
 }
 
@@ -2835,7 +2836,8 @@ textarea {
 .turn-trigger[data-trigger="synthesis"],
 .turn-trigger[data-trigger="heartbeat"],
 .turn-trigger[data-trigger="claude_code_spawn"],
-.turn-trigger[data-trigger="shell_job_complete"] {
+.turn-trigger[data-trigger="shell_job_complete"],
+.turn-trigger[data-trigger="repo_test_complete"] {
   color: var(--turn-trigger-color);
   background: color-mix(in srgb, var(--turn-trigger-color) 14%, var(--mimir-color-panel-background-muted, #f1f5f2));
   border-color: var(--turn-trigger-color);

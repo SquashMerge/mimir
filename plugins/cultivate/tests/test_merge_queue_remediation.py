@@ -22,7 +22,7 @@ BASE = "b" * 40
 
 def _queue_response(entry):
     return {"data": {"repository": {"pullRequest": {
-        "number": 42, "mergeQueueEntry": entry,
+        "number": 42, "headRefOid": HEAD, "mergeQueueEntry": entry,
     }}}}
 
 
@@ -160,7 +160,7 @@ def test_queued_pr_requested_work_is_unaffected(monkeypatch, poller, activity):
         monkeypatch, poller, _queue_response({"id": "queue-entry"}), author="alice",
     )
     # Establish that this very PR is queued via the real typed read.
-    assert poller._pr_merge_queue_status("o/r", 42, "token") is True
+    assert poller._pr_merge_queue_status("o/r", 42, HEAD, "token") is True
     request.reset_mock()
     if activity == "review_request":
         count, _, _ = poller._check_pr_pushes(
@@ -184,6 +184,25 @@ def test_queued_pr_requested_work_is_unaffected(monkeypatch, poller, activity):
     request.assert_not_called()
 
 
+@pytest.mark.parametrize("mergeable", [True, False])
+@pytest.mark.parametrize("observed_head", [BASE, None, "", 123])
+def test_queue_read_head_mismatch_preserves_retry_state(
+    monkeypatch, poller, mergeable, observed_head,
+):
+    response = _queue_response(None)
+    response["data"]["repository"]["pullRequest"]["headRefOid"] = observed_head
+    _, request = _patch_reads(monkeypatch, poller, response, mergeable=mergeable)
+    prior = {"42": {"head_sha": HEAD, "reason": "conflicting", "attempts": 2}}
+    budget = [1]
+    assert poller._check_own_mergeability(
+        "o/r", "token", "bot", prior, now=NOW, attempt_budget=budget,
+    ) == (0, prior)
+    assert budget == [1]
+    request.assert_called_once()
+    poller._emit.assert_not_called()
+    poller._emit_signal.assert_not_called()
+
+
 @pytest.mark.parametrize("entry,queued", [(None, False), ({"id": "queue-entry"}, True)])
 def test_typed_queue_read_uses_bounded_graphql_request(entry, queued):
     calls = []
@@ -198,11 +217,12 @@ def test_typed_queue_read_uses_bounded_graphql_request(entry, queued):
             )
 
     client = forge.GitHubForgeClient(token="token", timeout=3, session=Session())
-    assert client.is_pull_request_queued("o/r", 42) is queued
+    assert client.is_pull_request_queued("o/r", 42, expected_head=HEAD) is queued
     [(args, kwargs)] = calls
     assert args == ("POST", "https://api.github.com/graphql")
     assert kwargs["json"]["variables"] == {"owner": "o", "name": "r", "number": 42}
     assert "mergeQueueEntry { id }" in kwargs["json"]["query"]
+    assert "headRefOid" in kwargs["json"]["query"]
     assert kwargs["timeout"] == 3
     assert kwargs["stream"] is True
 
