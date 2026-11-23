@@ -1900,6 +1900,38 @@ def _resolve_chainlink_service_cwd() -> tuple[str | None, str | None]:
     )
 
 
+def _record_service_shell_denial(
+    tool_name: str,
+    target: str,
+    auth_context: AuthContext | None,
+    profile: str,
+    binding_rule: str | None,
+    *,
+    boundary: str,
+    policy_outcome: bool,
+) -> None:
+    """Keep policy outcomes distinct from admitted-call binding failures."""
+    refused_argv, argv_truncated = service_shell_argv_for_log(target)
+    reason = "service_shell_policy_denied" if policy_outcome else "service_shell_argv_binding_failed"
+    logger = log.warning if policy_outcome else log.error
+    logger(
+        "%s profile=%s binding_rule=%s", reason, profile, binding_rule,
+    )
+    _emit_hard_boundary_denied(
+        tool=tool_name,
+        boundary=boundary,
+        reason=reason,
+        target=None,
+        auth_context=auth_context,
+        event_fields={
+            "argv": refused_argv,
+            "argv_truncated": argv_truncated,
+            "shell_profile": profile,
+            "binding_rule": binding_rule,
+        },
+    )
+
+
 def _request_for_authorized_execution(
     request: ToolCallRequest,
     tool_name: str,
@@ -1986,7 +2018,6 @@ def _request_for_authorized_execution(
             declared=getattr(service, "declared_shell_commands", ()) or (),
         )
     if argv is None:
-        refused_argv, argv_truncated = service_shell_argv_for_log(target)
         # The authorization adapter already admitted this call. Failing to bind
         # a direct argv here must not fall back to the original ``bash -lc``
         # surface if a config probe races, times out, or otherwise changes.
@@ -1994,26 +2025,13 @@ def _request_for_authorized_execution(
         # Log under a distinct fingerprint so the cause stays greppable for an
         # operator, naming the profile and stable rejecting rule. The command is
         # represented only by the separately redacted argv used by the event.
-        log.error(
-            "service_shell_argv_binding_failed profile=%s binding_rule=%s",
-            policy.destination,
-            binding_rule,
-        )
         # Record it for the audit stream: this boundary fails closed whether or
         # not enforcement is on, so without an event the refusal is invisible to
         # the enablement evidence (#1012).
-        _emit_hard_boundary_denied(
-            tool=tool_name,
+        _record_service_shell_denial(
+            tool_name, target, auth_context, policy.destination, binding_rule,
             boundary="service_shell_argv_binding",
-            reason="service_shell_argv_binding_failed",
-            target=None,
-            auth_context=auth_context,
-            event_fields={
-                "argv": refused_argv,
-                "argv_truncated": argv_truncated,
-                "shell_profile": policy.destination,
-                "binding_rule": binding_rule,
-            },
+            policy_outcome=False,
         )
         # ...and tell the CALLER why, in the tool result. Binding
         # ``/usr/bin/false`` alone made every refusal look identical — it ignores
@@ -2073,6 +2091,14 @@ def _request_for_authorized_execution(
         )
     )
     if confined_argv is None:
+        # Operand policy needs the resolved execution cwd and cannot soundly run
+        # in the shape-only authorizer. Other refusals here are revalidation
+        # failures after admission and retain the ERROR/hard-boundary signal.
+        _record_service_shell_denial(
+            tool_name, target, auth_context, policy.destination, confinement_rule,
+            boundary="service_shell_argv_binding",
+            policy_outcome=confinement_rule is ServiceShellBindingRule.READ_OPERAND_POLICY,
+        )
         args["mimir_shell_refusal"] = _service_shell_refusal_guidance(
             f"{tool_name} was refused before execution: {confinement_refusal} "
             f"binding_rule={confinement_rule.value if confinement_rule is not None else 'unknown'}",
@@ -2777,6 +2803,15 @@ def _authorize_tool_call(
 
     if auth.allowed:
         return auth, None
+    if auth.service_shell_binding_rule is not None:
+        service = auth.service_principal
+        shell_policy = service.sink_policy_for(tool_name)
+        _record_service_shell_denial(
+            tool_name, target_channel, ctx, shell_policy.destination,
+            auth.service_shell_binding_rule,
+            boundary="service_shell_authorization",
+            policy_outcome=True,
+        )
     return auth, _deny_admin_tool(
         tool_name,
         auth.reason or "admin_required",

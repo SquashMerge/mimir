@@ -5,6 +5,7 @@ import asyncio
 import builtins
 import importlib.util
 import json
+import logging
 import sys
 import os
 import shlex
@@ -4734,6 +4735,7 @@ def test_service_shell_binding_refusal_handles_missing_rule(
 
 def test_service_shell_final_binding_refusal_emits_hard_denial(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from mimir.tools import budget_gate
 
@@ -4794,6 +4796,168 @@ def test_service_shell_final_binding_refusal_emits_hard_denial(
         "shell_profile": "maintenance",
         "binding_rule": "profile_allowlist",
     }
+    assert any(
+        record.levelno == logging.ERROR
+        and "service_shell_argv_binding_failed" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize(("case", "expected_rule"), [
+    ("npm-pack", "profile_allowlist"),
+    ("outside-lease", "repository_review_state"),
+    ("missing-state", "profile_allowlist"),
+])
+async def test_service_shell_policy_refused_at_authorization_without_error(
+    case: str, expected_rule: str, enforce: bool, tool_name: str,
+    repo_review_state: RepoReviewState, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    from mimir.tools import budget_gate
+
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    state = None if case == "missing-state" else repo_review_state
+    auth = replace(
+        _service_auth(service, InformationFlowLabels(), repo_review_state=state),
+        enforcement_enabled=enforce,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)) if state is not None else None,
+    )
+    command = "npm pack claude-code-feature-factory@0.14.2" if case == "npm-pack" else "git status"
+    arguments = {"command": command}
+    if case == "outside-lease":
+        arguments["cwd"] = str(tmp_path)
+    events = []
+    monkeypatch.setattr(
+        budget_gate, "_emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    binder_calls = []
+    real_binder = budget_gate._request_for_authorized_execution
+
+    def binder(*args, **kwargs):
+        binder_calls.append(args)
+        return real_binder(*args, **kwargs)
+
+    monkeypatch.setattr(budget_gate, "_request_for_authorized_execution", binder)
+    calls = []
+
+    async def handler(request):
+        calls.append(request)
+        raise AssertionError("policy-refused commands must not execute")
+
+    turn = _turn("turn-shell-policy", "saga-shell-policy", auth)
+    token = set_current_turn(turn)
+    try:
+        result = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(auth, tool_name=tool_name, args=arguments), handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    # Check this first: deleting the up-front veto must restore the ERROR, not
+    # merely fail an internal call-count assertion.
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert binder_calls == []
+    assert calls == []
+    assert result.status == "error"
+    assert f"binding_rule={expected_rule}" in result.content
+    if tool_name == "shell_exec":
+        _assert_service_shell_redirect(result.content)
+    if case == "outside-lease":
+        assert "no matching checkout lease was found" in result.content
+        assert str(tmp_path) not in result.content
+    if case == "npm-pack":
+        assert "hardened local read-only Git inspection" in result.content
+    hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+    argv, truncated = access_control.service_shell_argv_for_log(command)
+    assert hard == {
+        "tool": tool_name,
+        "boundary": "service_shell_authorization",
+        "reason": "service_shell_policy_denied",
+        "target": None,
+        "trigger": "poller",
+        "channel_id": "poller:test",
+        "service_principal": "poller:github-activity",
+        "argv": argv,
+        "argv_truncated": truncated,
+        "shell_profile": "repo_review",
+        "binding_rule": expected_rule,
+    }
+    assert any(
+        record.levelno == logging.WARNING and "service_shell_policy_denied" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("failure", ["lease", "probe"])
+async def test_service_shell_state_changed_after_authorization_still_logs_error(
+    enforce: bool, failure: str, repo_review_state: RepoReviewState,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    from mimir.tools import budget_gate
+
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels(), repo_review_state=repo_review_state),
+        enforcement_enabled=enforce,
+        repo_pr_scope_registry=RepoPRScopeRegistry((repo_review_state,)),
+    )
+    events = []
+    monkeypatch.setattr(
+        budget_gate, "_emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    real_binder = budget_gate._request_for_authorized_execution
+
+    def changed_state(*args, **kwargs):
+        # Middleware has authorized the command by the time binding starts.
+        if failure == "lease":
+            monkeypatch.setattr(repo_review_state.checkout_lease, "is_active", False)
+        else:
+            monkeypatch.setattr(access_control, "_maintenance_git_filter_overrides", lambda *_a, **_kw: None)
+        return real_binder(*args, **kwargs)
+
+    monkeypatch.setattr(budget_gate, "_request_for_authorized_execution", changed_state)
+
+    async def handler(request):
+        raise AssertionError("a failed binding must never fall back to a shell")
+
+    token = set_current_turn(_turn("turn-shell-race", "saga-shell-race", auth))
+    try:
+        result = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(auth, args={"command": "git status", "cwd": repo_review_state.root}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert any(
+        record.levelno == logging.ERROR
+        and "service_shell_argv_binding_failed" in record.message
+        for record in caplog.records
+    )
+    hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+    assert hard["boundary"] == "service_shell_argv_binding"
+    assert hard["reason"] == "service_shell_argv_binding_failed"
+    assert hard["binding_rule"] == (
+        "repository_review_state" if failure == "lease" else "profile_allowlist"
+    )
 
 
 def test_service_shell_denial_argv_redaction_and_truncation() -> None:
@@ -6136,6 +6300,74 @@ def test_repo_nonpublishing_tools_keep_original_decision(
         assert actual == baseline
         if baseline.allowed:
             assert actual.allowed
+
+
+@pytest.mark.parametrize("invalid", [
+    None, "tool", "missing_tool", "owner", "receipt", "grant",
+])
+def test_scoped_abort_exemption_is_not_a_generic_write_bypass(monkeypatch, invalid):
+    """Isolate each host-side exemption guard from downstream grant denials."""
+    tool_name = "repo_commit" if invalid == "tool" else "repo_rebase_abort"
+    tool = SimpleNamespace(
+        owner="other_plugin" if invalid == "owner" else "cultivate", typed_action=object(),
+    )
+    policy = SimpleNamespace(
+        tools={} if invalid == "missing_tool" else {tool_name: tool},
+        scoped_actions={"cultivate": object()},
+    )
+    state = SimpleNamespace(interrupted_operation=None if invalid == "receipt" else object())
+    monkeypatch.setattr(access_control, "_valid_scoped_pr_grant", lambda *a, **kw: invalid != "grant")
+    assert access_control._scoped_pr_abort_allowed(
+        tool_name, object(), object(), state, policy,
+    ) is (invalid is None)
+
+
+@pytest.mark.parametrize("invalid", [
+    None, "author", "missing_author", "lease_path", "recovery_id",
+    "grant", "receipt", "recovered", "missing_lease", "missing_scope",
+])
+def test_interrupted_filesystem_provenance_requires_all_trust_bindings(tmp_path, monkeypatch, invalid):
+    """Test classifier guards independently of the real Git/grant integration."""
+    scope = SimpleNamespace(scope_id="scope", owner="cultivate")
+    attached = SimpleNamespace(path=tmp_path / "lease", recovery_id="recovery")
+    lease = SimpleNamespace(
+        path=tmp_path / ("other" if invalid == "lease_path" else "lease"),
+        recovery_id="other" if invalid == "recovery_id" else "recovery",
+        canonical_repo="owner/repo", pr_number=7, head_sha="a" * 40,
+    )
+    if invalid == "recovered":
+        attached.interrupted_operation = object()
+    state = SimpleNamespace(
+        action_scope=None if invalid == "missing_scope" else scope,
+        checkout_lease=attached,
+        interrupted_operation=None if invalid in {"receipt", "recovered"} else object(),
+    )
+    auth = SimpleNamespace(
+        canonical_principal="poller:github", is_service=False,
+        ifc_state=SimpleNamespace(pr_checkout_author_trust=(
+            {} if invalid == "missing_author" else {"scope": invalid != "author"}
+        )),
+        repo_pr_scope_registry=SimpleNamespace(resolve_checkout_path=lambda _: state),
+    )
+    policy = SimpleNamespace(
+        policy_consumer_hooks=SimpleNamespace(
+            active_checkout=lambda _: None if invalid == "missing_lease" else lease,
+        ),
+        scoped_actions={"cultivate": object()},
+    )
+    monkeypatch.setattr(access_control, "selected_policy_registry", lambda: policy)
+    monkeypatch.setattr(access_control, "pr_checkout_lease_attestation",
+                        lambda *a: access_control.LeaseAttestation(False, "checkout_state_mismatch"))
+    monkeypatch.setattr(access_control, "log_pr_checkout_lease_attestation_refused", lambda *a: None)
+    monkeypatch.setattr(access_control, "_registered_review_action", lambda *a: object())
+    monkeypatch.setattr(access_control, "_valid_scoped_pr_grant", lambda *a, **kw: invalid != "grant")
+    monkeypatch.setattr(access_control, "get_trusted_service_from_auth_context", lambda *a: None)
+    source = protected_result_source(
+        auth, principal="filesystem", domain="filesystem",
+        resource_id=str(attached.path / "tracked.txt"), bridge_instance="filesystem",
+    )
+    assert source.integrity == ("trusted" if invalid is None else "untrusted")
+    assert source.integrity_effect == ("informational" if invalid is None else "active_ingest")
 
 
 @pytest.mark.parametrize("tool_name", ["repo_commit", "repo_push"])
@@ -15391,6 +15623,7 @@ def test_service_shell_execution_binds_relative_read_operand_to_authoritative_cw
 
 def test_service_shell_recursive_preflight_runs_once_and_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from mimir.tools import budget_gate
 
@@ -15427,6 +15660,16 @@ def test_service_shell_recursive_preflight_runs_once_and_is_bounded(
         return original(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(access_control, "_service_shell_read_operand_refusal", counted)
+    events = []
+    monkeypatch.setattr(
+        budget_gate, "_emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    assert ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel="grep -r needle .",
+        arguments={"command": "grep -r needle .", "cwd": str(root)},
+    ).allowed
+    assert calls == 0, "operand policy must wait for the authoritative execution cwd"
 
     bound = budget_gate._request_for_authorized_execution(
         _tool_request(
@@ -15444,6 +15687,15 @@ def test_service_shell_recursive_preflight_runs_once_and_is_bounded(
         in refusal
     )
     assert str(root) in refusal
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert any(
+        record.levelno == logging.WARNING and "service_shell_policy_denied" in record.message
+        for record in caplog.records
+    )
+    hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+    assert hard["binding_rule"] == "read_operand_policy"
+    assert hard["reason"] == "service_shell_policy_denied"
+    assert hard["shell_profile"] == "scheduler_read_only"
 
 
 def test_service_shell_recursive_preflight_names_unreadable_path(
@@ -15994,16 +16246,16 @@ def test_tainted_generic_shell_shadow_is_hard_refused(
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "profile_allowed"),
     [
-        "cat /mimir-home/state/chainlink-1783.json",
-        "git -C /workspace/chainlink-1783 status",
-        "which chainlink",
-        "ls /mimir-home/.chainlink",
+        ("cat /mimir-home/state/chainlink-1783.json", True),
+        ("git -C /workspace/chainlink-1783 status", False),
+        ("which chainlink", False),
+        ("ls /mimir-home/.chainlink", True),
     ],
 )
 def test_tainted_service_diagnostics_do_not_trigger_armed_work_veto(
-    command: str,
+    command: str, profile_allowed: bool,
 ) -> None:
     labels = _chainlink_ifc_labels(tainted=True)
     auth = replace(
@@ -16013,9 +16265,11 @@ def test_tainted_service_diagnostics_do_not_trigger_armed_work_veto(
     decision = ToolRegistry().authorize_tool(
         "shell_exec", auth, enforce=False, target_channel=command,
     )
-    # Actual execution still requires admission by the service's argv profile;
-    # diagnostics mentioning the tracker are not arming actions.
-    assert decision.allowed is True
+    # Profile policy now refuses up front even in shadow mode; diagnostics
+    # mentioning the tracker must still not be classified as arming actions.
+    assert decision.allowed is profile_allowed
+    if not profile_allowed:
+        assert decision.reason == "service_sink_destination_denied"
     assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
 
 

@@ -8956,6 +8956,54 @@ print('{"poller": "x", "prompt": "ok"}')
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lease_set", [False, True])
+async def test_run_poller_mimir_passthrough_is_exactly_the_lease(
+    tmp_path: Path, home: Path, monkeypatch, lease_set: bool,
+):
+    lease = {
+        "MIMIR_HEAVY_LOCK_FILE": "/locks/heavy.lock",
+        "MIMIR_HEAVY_LOCK_TIMEOUT": "14400",
+        "MIMIR_HEAVY_TIER": "medium",
+    } if lease_set else {}
+    denied = {
+        "MIMIR_API_KEY": "secret",
+        "MIMIR_MODEL_SPEC": "private-config",
+        "MIMIR_HEAVY_OTHER": "not-a-lease-setting",
+        "MIMIR_HEAVY_LOCK_FILE_EXTRA": "not-an-exact-name",
+        "MIMIR_HEAVY_LOCK_TIMEOUT_TOKEN": "secret",
+        "MIMIR_HEAVY_TIER_SECRET": "secret",
+        "MIMIR_HOME": "stale-host-home",
+    }
+    monkeypatch.setattr(os, "environ", {
+        "PATH": os.environ.get("PATH", ""), **lease, **denied,
+        # Even explicitly allowlisting these names cannot bypass the deny.
+        "MIMIR_POLLER_ENV_ALLOWLIST": ",".join(denied),
+    })
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+from pathlib import Path
+Path(os.environ["STATE_DIR"], "env.json").write_text(json.dumps({
+    k: v for k, v in os.environ.items() if k.startswith("MIMIR_")
+}))
+""")
+    cfg = PollerConfig(
+        name="lease-env", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    assert await run_poller(cfg, enqueue=_CapturingEnqueue(), home=home) == 0
+    assert json.loads((skill_dir / "env.json").read_text()) == {
+        **lease, "MIMIR_HOME": str(home),
+    }
+    from mimir.pollers import _poller_env_available_at_discovery
+
+    available = _poller_env_available_at_discovery(env_raw={}, pass_env=[])
+    assert {key for key in available if key.startswith("MIMIR_")} == {
+        *lease, "MIMIR_HOME",
+    }
+
+
+@pytest.mark.asyncio
 async def test_run_poller_env_allowlist_override_works(
     tmp_path: Path, home: Path, monkeypatch,
 ):
@@ -9245,6 +9293,54 @@ async def test_shipped_github_poller_forwards_operator_bot_allowlist(
 
     assert probe.read_text() == "dependabot[bot]"
 
+
+
+def test_shipped_github_poller_forwarded_identities_are_redaction_exempt() -> None:
+    """Every login the shipped github-poller forwards is exempt from payload redaction.
+
+    #169 forwarded MIMIR_FACTORY_PUBLISHING_IDENTITY (normally the bot's own login)
+    without exempting it, so every occurrence of the login in poller output,
+    including the PR author, became [REDACTED], and each turn on the bot's own
+    PRs failed lease attestation with pr_author_mismatch.
+    """
+    from mimir.pollers import _NON_SECRET_FORWARDED_ENV_KEYS
+
+    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
+    forwarded = {
+        key for entry in json.loads(manifest.read_text())["pollers"] for key in entry.get("pass_env", ())
+    }
+    identities = {"MIMIR_GITHUB_SELF_LOGIN", "MIMIR_FACTORY_PUBLISHING_IDENTITY",
+                  "MIMIR_GITHUB_TRUSTED_BOT_LOGINS"}
+    assert identities <= forwarded
+    assert identities <= _NON_SECRET_FORWARDED_ENV_KEYS
+
+
+@pytest.mark.asyncio
+async def test_forwarded_publishing_identity_survives_payload_redaction(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login = "mimir-bot-login"
+    keys = ("MIMIR_GITHUB_SELF_LOGIN", "MIMIR_FACTORY_PUBLISHING_IDENTITY")
+    for key in keys:
+        monkeypatch.setenv(key, login)
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+login = os.environ['MIMIR_FACTORY_PUBLISHING_IDENTITY']
+print(json.dumps({"poller": "identity-redaction", "prompt": "comment on PR by @" + login,
+                  "author": login, "pr_author": login}))
+""")
+    cfg = PollerConfig(
+        name="identity-redaction", command=f"{sys.executable} poller.py",
+        cron="* * * * *", skill_dir=skill_dir, env={}, pass_env=keys,
+    )
+    enq = _CapturingEnqueue()
+    assert await run_poller(cfg, enqueue=enq) == 1
+    [event] = enq.events
+    payload = event.content + json.dumps(event.extra)
+    assert "[REDACTED]" not in payload
+    assert "@" + login in event.content
+    assert json.dumps(login) in json.dumps(event.extra)
 
 def test_discover_pollers_parses_pass_env_list(tmp_path: Path) -> None:
     """``pass_env`` field in pollers.json is parsed into PollerConfig.pass_env."""

@@ -22,13 +22,27 @@ from mimir_cultivate.worklink.identities import WorklinkIdentities
 from tests.worklink_daemon_fixtures import FIXTURES, OpenCodeSchema
 
 
+@pytest.fixture
+def events(tmp_path, monkeypatch):
+    from mimir import event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = event_logger.EventLogger(path, "codex-auth-test")
+    monkeypatch.setattr(event_logger, "_logger", logger)
+
+    def read():
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    return read
+
+
 def jwt(exp):
     payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
     return "synthetic." + payload + "." + uuid.uuid4().hex
 
 
 @pytest.fixture
-async def stores(tmp_path, monkeypatch, aiohttp_server):
+async def stores(tmp_path, monkeypatch, aiohttp_server, events):
     root = FIXTURES / "opencode_2_3_0"
     template = json.loads((root / "auth-export.json").read_text())[0]
     schema = OpenCodeSchema()
@@ -341,9 +355,7 @@ async def test_wrong_password_has_no_payload_in_error(stores):
     payload = json.loads(stores.paths.controller_api.read_text())
     payload["password"] = "wrong"
     stores.paths.controller_api.write_text(json.dumps(payload))
-    with pytest.raises(opencode.CodexReconcileError) as failure:
-        await stores.reconcile()
-    assert stores.secret not in str(failure.value)
+    assert await stores.reconcile() == "skipped_daemon_unavailable"
     assert stores.writes == 0
 
 
@@ -440,7 +452,7 @@ async def test_idle_refresh_and_concurrent_401_use_one_family(stores, monkeypatc
             except Exception as exc:
                 raise AssertionError(f"synthetic coordinated API failed: {type(exc).__name__}: {exc}") from exc
         monkeypatch.setattr(provider, "refresh_codex_auth_coordinated", coordinated)
-        assert await s.reconcile() == "agent_newer"
+        assert await s.reconcile() == "refreshed"
         await asyncio.to_thread(s.agent_thread.join, 5)
         assert not s.agent_thread.is_alive()
     assert len(requests) == 1, "concurrent 401 must adopt, never spend the old refresh token"
@@ -507,8 +519,8 @@ async def test_preflight_and_periodic_job_reconcile_on_controller(stores, monkey
     registered = {}
     fake_scheduler = SimpleNamespace(register_callable=lambda **kw: registered.update(kw) or True)
     monkeypatch.setenv("HOME", s.env["HOME"])
-    original = daemon_gate.prepare_daemon_health
-    monkeypatch.setattr(daemon_gate, "prepare_daemon_health", lambda env: original(env, paths=s.paths))
+    original = opencode.reconcile_codex_auth
+    monkeypatch.setattr(opencode, "reconcile_codex_auth", lambda env: original(env, paths=s.paths))
     assert scheduler.add_codex_reconcile_job(fake_scheduler)
     assert registered["default_cron"] == "*/15 * * * *"
     await registered["fn"]()
@@ -555,3 +567,182 @@ async def test_setup_actual_probe_seeds_or_returns_existing_codex_login_guidance
         with pytest.raises(setup.SetupError, match="codex agent login --device-auth"):
             await asyncio.to_thread(setup._verify_opencode_daemon, s.path.parent)
         assert not s.entries and s.writes == 0
+
+
+async def test_reconcile_durable_outcomes(stores, events):
+    s = stores
+    await s.reconcile()
+    await s.reconcile()
+    s.entries = [s.credential(1900000100)]
+    await s.reconcile()
+    s.document["tokens"]["access_token"] = jwt(1900000200)
+    s.save()
+    await s.reconcile()
+    s.path.unlink()
+    with pytest.raises(opencode.CodexReconcileError):
+        await s.reconcile()
+    records = [e for e in events() if e["type"] == "worklink_codex_reconcile"]
+    assert [e["outcome"] for e in records] == [
+        "agent_newer", "unchanged", "daemon_newer", "agent_newer", "skipped_reconcile_error",
+    ]
+    assert records[-1]["error_code"] == "other"
+    serialized = json.dumps(records)
+    for secret in (s.secret, s.document["tokens"]["access_token"], s.password):
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize("state", ["down", "idle", "unhealthy"])
+async def test_job_refreshes_without_daemon(stores, monkeypatch, events, state):
+    """A daemon-health gate around proactive refresh must kill this test."""
+    from datetime import datetime, timezone
+    import langchain_codex_plus as provider
+    from langchain_codex_plus.codex_auth import load_codex_auth
+    from mimir_cultivate import scheduler
+    from mimir_cultivate.worklink import identities
+
+    s = stores
+    now = int(datetime.now(timezone.utc).timestamp())
+    s.document["tokens"]["access_token"] = jwt(now + 60)
+    s.save()
+    s.paths.controller_api.unlink()
+    monkeypatch.setattr(daemon_health, "daemon_health", lambda *a, **kw: {
+        "daemon_enabled": True, "daemon_state": state, "ok": False,
+    })
+    monkeypatch.setattr(identities, "get_identities", lambda: s.ids)
+    monkeypatch.setenv("HOME", s.env["HOME"])
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    original = opencode.reconcile_codex_auth
+    monkeypatch.setattr(opencode, "reconcile_codex_auth", lambda env: original(env, paths=s.paths))
+    calls = []
+
+    def refresh(stale, *, path):
+        assert path == s.path and not s.lock_held()
+        assert stale.refresh_token == s.secret
+        calls.append(stale)
+        updated = copy.deepcopy(s.document)
+        updated["tokens"].update(access_token=jwt(now + 3600), refresh_token="rotated")
+        updated["last_refresh"] = "2026-11-22T16:15:00Z"
+        opencode._atomic_auth_write(path, updated)
+        return load_codex_auth(path)
+
+    monkeypatch.setattr(provider, "refresh_codex_auth_coordinated", refresh)
+    registered = {}
+    scheduler.add_codex_reconcile_job(SimpleNamespace(
+        register_callable=lambda **kw: registered.update(kw) or True,
+    ))
+    await registered["fn"]()
+    assert len(calls) == 1
+    assert json.loads(s.path.read_text())["last_refresh"] == "2026-11-22T16:15:00Z"
+    assert not s.reads and not s.writes
+    record = events()[-1]
+    assert record["outcome"] == "refreshed"
+    assert record["propagation"] == "skipped_daemon_unavailable"
+    await registered["fn"]()
+    assert events()[-1]["outcome"] == "skipped_daemon_unavailable"
+    assert len(calls) == 1
+
+
+async def test_fresh_login_replaces_seed_with_no_refresh_sentinel(stores, events):
+    s = stores
+    await s.reconcile()
+    old = s.entries[0]["id"]
+    s.document["tokens"].update(access_token=jwt(1900000300), refresh_token="fresh-login")
+    s.document["last_refresh"] = "2026-11-22T16:27:00Z"
+    s.save()
+    assert await s.reconcile() == "agent_newer"
+    assert s.entries[0]["id"] != old
+    assert s.entries[0]["value"]["expires"] == 0
+    assert s.entries[0]["value"]["refresh"] == "fresh-login"
+    assert await s.reconcile() == "equal"
+
+
+async def test_unavailable_daemon_does_not_bypass_login_validation(stores, monkeypatch, events):
+    import langchain_codex_plus as provider
+
+    stores.paths.controller_api.unlink()
+    stores.document["auth_mode"] = "apikey"
+    stores.save()
+    calls = []
+    monkeypatch.setattr(provider, "refresh_codex_auth_coordinated", lambda *a, **kw: calls.append(kw))
+    with pytest.raises(opencode.CodexReconcileError):
+        await stores.reconcile()
+    assert not calls and not stores.reads and not stores.writes
+    assert events()[-1]["outcome"] == "skipped_reconcile_error"
+
+
+@pytest.mark.parametrize(("status", "body", "code"), [
+    (401, {}, "http_401"), (400, {}, "other"),
+    (400, {"error": "refresh_token_reused"}, "refresh_token_reused"),
+    (400, {"error": "invalid_grant"}, "invalid_grant"),
+    (503, {}, "other"), (0, {}, "network"),
+])
+async def test_refresh_failure_fixed_codes_and_once_per_login(
+    stores, monkeypatch, events, status, body, code,
+):
+    import httpx
+    import langchain_codex_plus as provider
+    from langchain_codex_plus.codex_auth import (
+        CodexAuthRefreshError, _classify_refresh_error,
+    )
+    from mimir.codex_auth_alerts import notify_codex_refresh_failure
+    from mimir_cultivate import scheduler
+    from mimir_cultivate.worklink import identities
+    import importlib
+    alerts = importlib.import_module("mimir.tools.operator_alert")
+    from datetime import datetime, timezone
+
+    s = stores
+    now = int(datetime.now(timezone.utc).timestamp())
+    s.document["tokens"]["access_token"] = jwt(now + 60)
+    s.save()
+    notices = []
+    loop = asyncio.get_running_loop()
+
+    async def send(channel, text, **kwargs):
+        assert asyncio.get_running_loop() is loop, "delivery must use the server event loop"
+        notices.append((channel, text))
+        return SimpleNamespace(sent=True)
+
+    monkeypatch.setattr(alerts, "_config", SimpleNamespace(operator_alert_channel="discord:operator"))
+    monkeypatch.setattr(alerts, "_channel_registry", SimpleNamespace(send=send))
+    if status:
+        failure = _classify_refresh_error(status, body)
+    else:
+        failure = CodexAuthRefreshError("network details " + s.secret)
+        failure.__cause__ = httpx.ConnectError(s.secret)
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(provider, "refresh_codex_auth_coordinated", fail)
+    monkeypatch.setenv("CODEX_HOME", str(s.path.parent))
+    monkeypatch.setattr(identities, "get_identities", lambda: s.ids)
+    original = opencode.reconcile_codex_auth
+    monkeypatch.setattr(opencode, "reconcile_codex_auth", lambda env: original(env, paths=s.paths))
+    registered = {}
+    scheduler.add_codex_reconcile_job(SimpleNamespace(
+        register_callable=lambda **kw: registered.update(kw) or True,
+    ))
+    for _ in range(2):
+        await registered["fn"]()
+        assert len(notices) == int(status in {400, 401})
+        # Same reactive failure must share the scheduled job's durable dedupe.
+        await notify_codex_refresh_failure(failure, path=s.path)
+    records = events()
+    runs = [e for e in records if e["type"] == "worklink_codex_reconcile"]
+    failures = [e for e in records if e["type"] == "codex_auth_refresh_failed"]
+    assert len(runs) == 2 and all(e["outcome"] == "refresh_failed" for e in runs)
+    assert all(e["error_code"] == code for e in runs)
+    permanent = status in {400, 401}
+    assert len(notices) == len(failures) == int(permanent)
+    if permanent:
+        assert "docker exec -u mimir <container> codex login --device-auth" in notices[0][1]
+        assert failures[0]["error_code"] == code
+        s.document["last_refresh"] = "2026-11-22T16:27:00Z"
+        s.save()
+        # Reactive-only failure on a new login gets its own alert.
+        await notify_codex_refresh_failure(failure, path=s.path)
+        await notify_codex_refresh_failure(failure, path=s.path)
+        assert len(notices) == 2
+    assert s.secret not in json.dumps(events()) + str(notices)
+    assert s.document["tokens"]["access_token"] not in json.dumps(events())

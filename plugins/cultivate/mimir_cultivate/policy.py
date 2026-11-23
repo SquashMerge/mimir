@@ -133,6 +133,7 @@ class RepoReviewState:
     git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)
     full_tested_head: str | None = field(default=None, init=False, repr=False, compare=False)
     conflict_evidence_head: str | None = field(default=None, init=False, repr=False, compare=False)
+    conflict_merge: object = field(default=None, init=False, repr=False, compare=False)
     interrupted_operation: InterruptedPROperation | None = field(
         default=None, init=False, repr=False, compare=False,
     )
@@ -180,6 +181,7 @@ class RepoReviewState:
         object.__setattr__(self, "git_expected_head", self.action_scope.observed_head_sha.lower())
         object.__setattr__(self, "interrupted_operation", None)
         object.__setattr__(self, "_scoped_rebase", None)
+        object.__setattr__(self, "conflict_merge", None)
 
     def record_git_head(self, scope_id: str, head: str) -> None:
         lease = self.checkout_lease
@@ -238,6 +240,7 @@ class RepoReviewState:
             object.__setattr__(self, "conflict_evidence_head", None)
             object.__setattr__(self, "interrupted_operation", None)
             object.__setattr__(self, "_scoped_rebase", None)
+            object.__setattr__(self, "conflict_merge", None)
 
     def defer_checkout_cleanup(self) -> None:
         """Keep the parent's lease live until host turn-end cleanup."""
@@ -706,11 +709,10 @@ def _valid_interrupted_operation(scope, state, tool_name, turn_nonce, *, interru
     allowed = {
         "repo_status", "repo_unmerged", "unsupported_operation",
         "pr_metadata", "pr_comments", "pr_reviews", "pr_comment",
+        "ls", "read_file", "glob", "grep",
     }
     if evidence.kind == "rebase":
         allowed.add("repo_rebase_abort")
-        if scope.event_type == "pr_mergeability_conflicting":
-            allowed.add("repo_rebase")
     elif evidence.kind == "merge":
         # Resolving our own merge does not detach or advance HEAD. Preserve the
         # ordinary scoped writes through commit, but never publish MERGE_HEAD.

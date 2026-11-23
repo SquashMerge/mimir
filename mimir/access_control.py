@@ -1077,6 +1077,12 @@ def _repo_pr_scope_resolution(
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    from .github_identity import own_conflict_pr_author
+
+    own_conflict = (
+        event_type == "pr_mergeability_conflicting"
+        and own_conflict_pr_author(principal, self_login)
+    )
     is_fresh_changes_requested_remediation = (
         event_type == "pr_review"
         and review_state == "CHANGES_REQUESTED"
@@ -1138,7 +1144,7 @@ def _repo_pr_scope_resolution(
             )
         )
     root, origin = binding_resolution.binding
-    if principal != self_login and pr_author_is_trusted is not True:
+    if principal != self_login and not own_conflict and pr_author_is_trusted is not True:
         from .event_logger import log_event_sync
 
         reason = (
@@ -1170,7 +1176,7 @@ def _repo_pr_scope_resolution(
             "pull request withheld: its author is not a repository collaborator; "
             "the item was withheld and logged"
         ))
-    if is_remediation and principal != self_login:
+    if is_remediation and principal != self_login and not own_conflict:
         return RepoPRScopeResolution(
             refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
         )
@@ -7125,6 +7131,18 @@ class SinkGate:
 
         sink_category = sink_category or get_sink_category(tool_name)
         service = get_trusted_service_from_auth_context(auth_context)
+        if _scoped_pr_abort_allowed(
+            tool_name, auth_context, repo_pr_action_scope, repo_review_state,
+            selected_policy_registry(),
+        ):
+            # The forge sink descriptor is shared with publishing tools, but
+            # this exact, grant-validated operation only restores local state.
+            return ToolAuthorization(
+                tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True, reason="scoped_pr_local_recovery",
+                service_principal=service, enforcement_enabled=enforce,
+                repo_pr_action_scope=repo_pr_action_scope,
+            )
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return _scheduled_write_denial(tool_name)
         # Both service and operator routes need a veto before any shadow allow.
@@ -9219,6 +9237,9 @@ class ToolAuthorization:
     # ``service_sink_destination_denied`` alone renders as "requires an admin
     # identity" and misdescribes a command-shape problem as a privilege problem.
     refusal_detail: str | None = None
+    # Always-on shell-profile refusal, evaluated before shadow allowances. Carry
+    # the original diagnostic to middleware without re-probing mutable state.
+    service_shell_binding_rule: str | None = None
     # ``None`` means provenance is unknown; ``()`` authoritatively classifies
     # the call as not reading a protected MCP source.
     protected_source_resources: tuple[str, ...] | None = None
@@ -9279,11 +9300,108 @@ class ScopedPRGrant:
     _issuer: Any = field(repr=False, compare=False)
 
 
+@dataclass(frozen=True)
+class RepoTestGrantBinding:
+    """In-process snapshot of authority actually held when tests were queued."""
+
+    scope: Any
+    actions: frozenset[str]
+    lease_identity: tuple[str, str]
+    tested_head: str
+    observed_head_sha: str
+    starting_turn_id: str | None
+    queue_grants: Any = field(repr=False, compare=False)
+
+
+def bind_repo_test_grant(
+    auth: AuthContext, scope: Any, state: Any, starting_turn_id: str | None,
+    *, tested_head: str,
+) -> RepoTestGrantBinding | None:
+    grants = auth.scoped_pr_grants
+    if not isinstance(grants, ScopedPRGrants):
+        return None
+    protocol = grants._protocols.get(scope.owner)
+    if protocol is None:
+        return None
+    actions = frozenset(
+        action.value for action in protocol.action_type
+        if _valid_scoped_pr_grant(
+            auth, scope.owner, action, protocol, scope, state, tool_name="repo_test",
+        )
+    )
+    lease = state.checkout_lease
+    if protocol.checkout_action.value not in actions or lease is None:
+        return None
+    return RepoTestGrantBinding(
+        scope, actions, (str(lease.path), lease.recovery_id),
+        tested_head, scope.observed_head_sha, starting_turn_id, grants,
+    )
+
+
+def remint_repo_test_grants(event: Any, auth: AuthContext) -> ScopedPRGrants | None:
+    """Renew only a same-channel, evidenced, untainted in-process continuation."""
+    from .models import AuthContext
+    from .repo_test_jobs import RepoTestCompletion
+
+    extra = event.extra if isinstance(event.extra, dict) else {}
+    completion = extra.get("_repo_test_completion")
+    if (
+        event.trigger != "repo_test_complete"
+        or not isinstance(event.continuation_auth_context, AuthContext)
+        or event.continuation_auth_context.channel_id != event.channel_id
+        or HTTP_EVENT_INGRESS_EXTRA_KEY in extra
+        or auth.event_ingress is not None
+        or not isinstance(completion, RepoTestCompletion)
+        or completion.status != "completed"
+        or completion.evidence is not True
+        or auth.ifc_labels.has_untrusted_active_ingest
+    ):
+        return None
+    binding = completion.binding
+    if binding is None:
+        return None
+    scope = binding.scope
+    # Match the validator's state-resolution order: server discovery can
+    # supersede the event registry while a completion waits for its turn.
+    discovered = auth.server_discovered_pr_states
+    registry = auth.repo_pr_scope_registry
+    state = (discovered.resolve(scope.canonical_repo, scope.pr_number)
+             if discovered is not None else None)
+    if state is None and registry is not None:
+        state = registry.resolve(scope.canonical_repo, scope.pr_number)
+    if (
+        state is None or state.action_scope is not scope
+        or completion.repository != scope.canonical_repo
+        or completion.pull_request != scope.pr_number
+        # Forge authority and the tested local commit are separate identities:
+        # a remediation may have merged main or committed without pushing yet.
+        or scope.observed_head_sha != binding.observed_head_sha
+        or completion.head != binding.tested_head
+        or state.git_expected_head != completion.head
+    ):
+        return None
+    lease = state.checkout_lease
+    if lease is None or (str(lease.path), lease.recovery_id) != binding.lease_identity:
+        return None
+    old = event.continuation_auth_context.scoped_pr_grants
+    if old is not binding.queue_grants or old.principal != auth.canonical_principal:
+        return None
+    grants = ScopedPRGrants(
+        auth.canonical_principal, (scope,), protocols=old._protocols,
+        scope_actions={(scope.owner, scope.scope_id): binding.actions},
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    grants.repo_test_continuation = binding
+    return grants
+
+
 class ScopedPRGrants:
     """Turn-local host authority; checkout is consumed before execution."""
 
     def __init__(self, principal: str, scopes: Iterable[Any], *,
-                 protocols: Mapping[str, Any] | None = None, _issuer: Any) -> None:
+                 protocols: Mapping[str, Any] | None = None,
+                 scope_actions: Mapping[tuple[str, str], frozenset[str]] | None = None,
+                 _issuer: Any) -> None:
         if _issuer is not _SCOPED_PR_ISSUER:
             raise ValueError("scoped PR grants require the trusted ingress issuer")
         self.principal = principal
@@ -9301,6 +9419,8 @@ class ScopedPRGrants:
         self.expires_at = time.monotonic() + lifetime
         self._lock = threading.Lock()
         self._protocols = dict(protocols or {})
+        self._scope_actions = dict(scope_actions) if scope_actions is not None else None
+        self.repo_test_continuation: RepoTestGrantBinding | None = None
         self._prelease: dict[tuple[str, str], ScopedPRGrant] = {}
         self._follow: dict[tuple[str, str], dict[str, ScopedPRGrant]] = {}
         self._pending: dict[tuple[str, str], object] = {}
@@ -9315,10 +9435,15 @@ class ScopedPRGrants:
             if protocol is None or protocol.owner != owner:
                 return
             checkout = getattr(protocol.checkout_action, "value", None)
-            if checkout in scope.allowed_operations:
+            if checkout in self._actions(scope):
                 key = (owner, scope.scope_id)
                 if key not in self._prelease and key not in self._pending and key not in self._follow:
                     self._prelease[key] = self._grant(owner, scope, checkout, None)
+
+    def _actions(self, scope: Any) -> frozenset[str]:
+        if self._scope_actions is None:
+            return scope.allowed_operations
+        return scope.allowed_operations & self._scope_actions.get((scope.owner, scope.scope_id), frozenset())
 
     def _grant(self, owner: str, scope: Any, action: str, lease: Any) -> ScopedPRGrant:
         return ScopedPRGrant(
@@ -9369,7 +9494,7 @@ class ScopedPRGrants:
             del self._pending[key]
             self._follow[key] = {
                 action: self._grant(owner, scope, action, lease)
-                for action in scope.allowed_operations
+                for action in self._actions(scope)
                 if action != protocol.checkout_action.value or getattr(protocol, "checkout_tool", None) is not None
             }
             return True
@@ -9523,11 +9648,23 @@ def _recovery_tool_refusal(review_state: Any, tool_name: str | None) -> str | No
         return None
     if tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"}:
         return None
-    scope = getattr(review_state, "action_scope", None)
-    if (tool_name == "repo_rebase" and interrupted.kind == "rebase"
-            and getattr(scope, "event_type", None) == "pr_mergeability_conflicting"):
-        return None
     return f"Interrupted {interrupted.kind} on {interrupted.branch}; call {interrupted.abort_tool} first."
+
+
+def _scoped_pr_abort_allowed(
+    tool_name: str, auth_context: Any, scope: Any, state: Any, policy: Any,
+) -> bool:
+    """Exempt only an exact same-turn local rollback, never publication."""
+    tool = policy.tools.get(tool_name)
+    return (
+        tool_name in {"repo_rebase_abort", "repo_merge_abort"}
+        and tool is not None and tool.owner == "cultivate"
+        and getattr(state, "interrupted_operation", None) is not None
+        and _valid_scoped_pr_grant(
+            auth_context, tool.owner, tool.typed_action,
+            policy.scoped_actions.get(tool.owner), scope, state, tool_name=tool_name,
+        )
+    )
 
 
 def register_server_discovered_review_grant(auth_context: AuthContext, state: Any) -> None:
@@ -10226,9 +10363,29 @@ class ToolRegistry:
         if (plugin_tool is not None and plugin_tool.writes_code_or_state
                 and "worklink_build_tools" not in plugin_tool.memberships
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            return finish(_tainted_write_denial(
-                tool_name, service, auth_context=auth_context, ifc_labels=ifc_labels,
-            ))
+            # Keep the veto before argument/sink handling (including shadow
+            # allowances). Only a fully bound local abort may proceed.
+            recovery_state = None
+            repository = (arguments or {}).get("repository")
+            pull_request = (arguments or {}).get("pull_request")
+            if (tool_name in {"repo_rebase_abort", "repo_merge_abort"}
+                    and isinstance(repository, str)
+                    and type(pull_request) is int and pull_request > 0):
+                for states in (
+                    getattr(auth_context, "server_discovered_pr_states", None),
+                    getattr(auth_context, "repo_pr_scope_registry", None),
+                ):
+                    if states is not None:
+                        recovery_state = states.resolve(repository, pull_request)
+                        if recovery_state is not None:
+                            break
+            if not _scoped_pr_abort_allowed(
+                tool_name, auth_context, getattr(recovery_state, "action_scope", None),
+                recovery_state, policy,
+            ):
+                return finish(_tainted_write_denial(
+                    tool_name, service, auth_context=auth_context, ifc_labels=ifc_labels,
+                ))
         if (plugin_tool is not None and plugin_tool.flow in {"sink", "both"}
                 and plugin_tool.resource_scope != "channel"
                 and tool_name != "issue_comment"):
@@ -10585,7 +10742,7 @@ class ToolRegistry:
                 ifc_labels,
                 auth_context,
                 enforce=enforce,
-                repo_review_state=repo_review_state,
+                repo_review_state=repo_review_state if repo_review_state is not None else state,
                 repo_review_state_refusal=repo_review_state_refusal,
                 repo_pr_action_scope=repo_pr_action_scope,
                 operator_shell_binding=operator_shell_binding,
@@ -10598,6 +10755,41 @@ class ToolRegistry:
                 sink_category=sink_category,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
+            shell_policy = (
+                preliminary_service.sink_policy_for(tool_name)
+                if preliminary_service is not None and tool_name in {"shell_exec", "bash_async"}
+                else None
+            )
+            if (shell_policy is not None and shell_policy.adapter == "shell_profile"
+                    and isinstance(target_channel, str)
+                    and (sink_check.allowed or sink_check.reason == "service_sink_destination_denied")):
+                # Preserve enforced IFC refusals above profile policy. But the
+                # binder's admission rules are always-on, not shadow policy:
+                # execution can never fall back to a shell when they refuse.
+                # Check before shadow allowances to distinguish ordinary policy
+                # outcomes from authorizer/binder disagreements. Revalidation in
+                # the binder still detects changed state, failed probes and races.
+                argv, refusal, rule = parse_service_shell_argv_with_diagnostics(
+                    target_channel, shell_policy.destination,
+                    review_state=repo_review_state,
+                    declared=getattr(preliminary_service, "declared_shell_commands", ()) or (),
+                )
+                if shell_policy.destination == "repo_review" and repo_review_state_refusal is not None:
+                    argv, refusal, rule = (
+                        None, repo_review_state_refusal,
+                        ServiceShellBindingRule.REPOSITORY_REVIEW_STATE,
+                    )
+                if argv is None:
+                    binding_rule = rule.value if rule is not None else "unknown"
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="service_sink_destination_denied",
+                        service_principal=preliminary_service,
+                        required_tier=AccessTier.ADMIN, enforcement_enabled=True,
+                        would_block=True,
+                        refusal_detail=f"{refusal} binding_rule={binding_rule}",
+                        service_shell_binding_rule=binding_rule,
+                    ))
             if (not enforce and sink_category is SinkCategory.SHELL_PROCESS
                     and sink_check.reason == "ifc_declassification_approved"
                     and not preliminary_admin_denied):
@@ -11695,8 +11887,23 @@ def protected_result_source(
         if scope is not None or lease is not None:
             lease_attestation = pr_checkout_lease_attestation(auth_context, scope, lease)
             trusted_lease = lease_attestation.ok
-            # Recovery attests the pre-operation branch, never interrupted files.
-            if getattr(getattr(review_state, "checkout_lease", None), "interrupted_operation", None) is not None:
+            attached = getattr(review_state, "checkout_lease", None)
+            if getattr(review_state, "interrupted_operation", None) is not None:
+                # Normal HEAD attestation cannot observe a detached rebase.
+                # Preserve read provenance only for the exact, trusted lease
+                # whose operation this turn started, rechecking all Git markers.
+                trusted_lease = (
+                    lease is not None and scope is not None
+                    and getattr(auth_context.ifc_state, "pr_checkout_author_trust", {}).get(scope.scope_id) is True
+                    and _valid_scoped_pr_grant(
+                        auth_context, scope.owner, _registered_review_action("inspect", auth_context),
+                        selected_policy_registry().scoped_actions.get(scope.owner),
+                        scope, review_state, tool_name="read_file",
+                    )
+                    and (str(lease.path), lease.recovery_id) == (str(attached.path), attached.recovery_id)
+                )
+            # Earlier-turn recovery attests the pre-operation branch only.
+            elif getattr(attached, "interrupted_operation", None) is not None:
                 trusted_lease = False
             if not trusted_lease:
                 log_pr_checkout_lease_attestation_refused(
@@ -13790,7 +13997,7 @@ def get_trusted_service_from_auth_context(
     service = getattr(auth_context, "service_authority", None)
     if not isinstance(service, ServicePrincipal):
         trigger = getattr(auth_context, "trigger", None)
-        if trigger == "shell_job_complete":
+        if trigger in {"shell_job_complete", "repo_test_complete"}:
             # Service identity is provenance; human-request guards use trigger.
             trigger = getattr(auth_context, "origin_trigger", None)
         if not isinstance(trigger, str):

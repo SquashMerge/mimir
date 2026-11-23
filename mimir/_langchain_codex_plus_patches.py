@@ -58,6 +58,7 @@ _BUFFERED_TURN_TRIGGERS = frozenset({
     "saga_session_end",
     "upgrade",
     "shell_job_complete",
+    "repo_test_complete",
 })
 _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_BASE_DELAY_SECONDS = 0.5

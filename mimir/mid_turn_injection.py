@@ -492,7 +492,7 @@ def render_injected_message(
     a mid-turn attachment (mimir's #593 review). This mirrors that body
     rendering so a folded message carries the same actionable content.
     """
-    if event.trigger == "shell_job_complete":
+    if event.trigger in {"shell_job_complete", "repo_test_complete"}:
         return (
             f"[background job {sanitize_prompt_field(event.extra.get('job_id', '?'))} finished: "
             f"{sanitize_prompt_field(event.extra.get('status', '?'))}, "

@@ -59,6 +59,9 @@ Subprocess gets these env vars injected automatically:
 - ``STATE_DIR`` — the poller's persistent state directory.
 - ``POLLER_NAME`` — the poller's name from pollers.json.
 - ``MIMIR_HOME`` — the authoritative agent home path from ``Config.home``.
+- ``MIMIR_HEAVY_LOCK_FILE``, ``MIMIR_HEAVY_LOCK_TIMEOUT``, ``MIMIR_HEAVY_TIER``
+  — exact-name host passthrough for the shared heavy-run lease. Worklink validates
+  these non-credential settings before constructing worker environments.
 - A scrubbed subset of the host process environment, explicit ``pass_env``
   passthrough keys, plus literal ``env`` overrides from the poller's
   pollers.json entry.
@@ -360,7 +363,13 @@ POLLER_EXIT_GRACE_SECONDS = 5.0
 POLLER_CHANNEL_PREFIX = "poller:"
 
 
-_BUILTIN_POLLER_ENV_ALLOWLIST = frozenset({
+# Exact-name, non-credential exception to the MIMIR_ deny: detached Worklink
+# runs must inherit the operator's lease. Worklink's heavy_lock_environment()
+# validates values before constructing worker/gate/session environments.
+_POLLER_HEAVY_LOCK_ENV_KEYS = frozenset({
+    "MIMIR_HEAVY_LOCK_FILE", "MIMIR_HEAVY_LOCK_TIMEOUT", "MIMIR_HEAVY_TIER",
+})
+_BUILTIN_POLLER_ENV_ALLOWLIST = _POLLER_HEAVY_LOCK_ENV_KEYS | frozenset({
     # Shell + locale
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TZ",
     "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
@@ -399,6 +408,7 @@ _POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"}
 
 _NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
     "MIMIR_GITHUB_SELF_LOGIN",
+    "MIMIR_FACTORY_PUBLISHING_IDENTITY",
     "MIMIR_GITHUB_TRUSTED_BOT_LOGINS",
     "MIMIR_HOME",
     "MIMIR_SOURCE_DIR",
@@ -411,9 +421,10 @@ _NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
 })
 """Forwarded configuration values that poller payload redaction must preserve.
 
-The GitHub login and the operator's trusted-bot logins are identity used by
-authorization and review reconciliation (a masked bot login reads as a PR-author
-mismatch and refuses the review);
+The GitHub login, the factory publishing identity (normally the same login) and
+the operator's trusted-bot logins are identity used by authorization and review
+reconciliation (a masked login reads as a PR-author mismatch and refuses the
+review or remediation);
 the two home/source values are filesystem locations; the repository values are
 public repository selectors; plugin selection; the Jira site host is a public
 tenant selector; and the remaining values are feature flags or a review-skill path. None is a credential. This is deliberately closed: every
@@ -470,7 +481,7 @@ def _allowed_poller_env_key(k: str, *, allowed: set[str] | frozenset[str] | None
         return False
     if any(k.endswith(s) for s in _DENY_ENV_SUFFIXES):
         return False
-    if any(k.startswith(p) for p in _DENY_ENV_PREFIXES):
+    if any(k.startswith(p) for p in _DENY_ENV_PREFIXES) and k not in _POLLER_HEAVY_LOCK_ENV_KEYS:
         return False
     return True
 
