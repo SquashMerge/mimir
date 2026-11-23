@@ -176,9 +176,26 @@ For each repo in `GITHUB_REPOS`:
   rebases onto the declared base, runs tests, and pushes with a lease against the
   observed head. The automatic path is restricted to PRs with no blocking
   `CHANGES_REQUESTED` review, so moving the head cannot silently discharge
-  unaddressed feedback. A conflict emits `pr_mergeability_conflicting`; its
-  scope cannot push and the turn must reproduce the conflict, name all unmerged
-  paths and the base SHA, then abort and escalate. A `null` mergeability result
+  unaddressed feedback. An eligible conflict emits `pr_mergeability_conflicting`:
+  use `repo_merge` to merge the declared base into the PR branch, enumerate every
+  conflicted path with `repo_unmerged`, and preserve both base-side and head-side
+  intent. Resolve, stage, then `repo_commit` listing every staged path (including
+  auto-merged files). Supply one `conflict_evidence` entry per conflicted path,
+  with `path`, `base_property`, `base_verification`, `head_property`, and
+  `head_verification`; the merge commit records these bounded fields.
+  Run `repo_test` without selectors using the configured default suite's full
+  core and `MIMIR_PLUGINS=cultivate` legs after committing. Both must pass at
+  exactly that commit before `repo_push`, which uses a lease against the observed
+  head and permits only fast-forward publication. The resulting tree may differ
+  from the merged base only on paths changed by the PR before the merge.
+  `conflict_resolution_outside_pr_paths` requires escalation, not a workaround.
+  After a successful push, post a PR comment listing each conflicted path and
+  how both sides were resolved and verified, then re-request review.
+  Conflict resolution is restricted to deployment-owned authors (mimir or the
+  configured Worklink publication identity), no blocking `CHANGES_REQUESTED`,
+  and verified absence from the merge queue. Ineligible or unverifiable PRs stay
+  escalation-only; abort and escalate uncertain resolutions. Use merge commits
+  for conflicts, never rebase or force-push history rewrites. A `null` mergeability result
   is asynchronous/unknown and is never acted upon. Attempts use hourly backoff,
   are bounded per PR/head/reason, and end in the named
   `pr_mergeability_rebase_gave_up` signal. At most one such attempt is emitted
@@ -247,8 +264,8 @@ PR-remediation scope. If it merges cleanly, the merge commit already exists;
 next call `repo_push`. On conflicts: `repo_unmerged`, resolve, `repo_stage`,
 then `repo_commit` listing every staged path (the merge stages auto-merged
 files too), then `repo_push`. Use `repo_rebase` only on history-rewrite turns (`heartbeat_pr_maintenance`,
-`pr_changes_requested_stale`, `pr_ci_failure`, `pr_mergeability_rebase`,
-`pr_mergeability_conflicting`) where the poller prompt asks for it; use
+`pr_changes_requested_stale`, `pr_ci_failure`, `pr_mergeability_rebase`)
+where the poller prompt asks for it; use
 `repo_merge` elsewhere.
 
 ## What it doesn't watch (deliberate)
