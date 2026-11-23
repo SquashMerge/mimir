@@ -195,6 +195,24 @@ def test_removed_sha1_only_guard_mutation_fails(tmp_path):
     )
 
 
+@pytest.mark.parametrize("side", ["left", "right", "omitted"])
+def test_removed_pair_inventory_guard_mutation_fails(tmp_path, side):
+    _assert_source_mutation_fails(
+        tmp_path, "disable pair inventory cross-check: " + side,
+        "test_contract_rejects_inconsistent_pair_counts_without_paths[" + side + "]",
+        "inconsistent pair counts accepted",
+    )
+
+
+@pytest.mark.parametrize("status", ["identical", "changed", "only_left", "only_right"])
+def test_removed_requested_status_guard_mutation_fails(tmp_path, status):
+    _assert_source_mutation_fails(
+        tmp_path, "disable requested status cross-check: " + status,
+        "test_contract_rejects_requested_status_exceeding_pair_total[" + status + "]",
+        "requested status overflow accepted",
+    )
+
+
 def test_inventory_hash_is_sorted_path_and_hash_commitment(registry):
     files = {"package/z": b"z", "package/a": b"a"}
     registry[0][:] = [tarball(files), tarball(dict(reversed(list(files.items()))))]
@@ -584,6 +602,47 @@ def test_contract_fails_closed(registry, invalid):
         if invalid == "refusal":
             result["contents"] = "SECRET"
     assert not content_free_result(result, SPECS, None, ["index.js"])
+
+
+@pytest.mark.parametrize("side", ["left", "right", "omitted"])
+def test_contract_rejects_inconsistent_pair_counts_without_paths(registry, side):
+    # No echoed paths: the per-path status guard cannot mask this cross-check.
+    result = module.compare(SPECS)
+    assert result["status"] == "compared"
+    assert result["pairs"][0]["files"] == []
+    assert content_free_result(result, SPECS, None)
+    if side == "left":
+        result["packages"][0]["file_count"] += 1
+    elif side == "right":
+        result["packages"][1]["file_count"] += 1
+    else:
+        result["pairs"][0]["omitted"] += 1
+    assert not content_free_result(result, SPECS, None), "inconsistent pair counts accepted"
+
+
+@pytest.mark.parametrize("status", ["identical", "changed", "only_left", "only_right"])
+def test_contract_rejects_requested_status_exceeding_pair_total(registry, status):
+    # Keep both inventory equations valid; only the echoed-status guard rejects.
+    blobs, _, _ = registry
+    blobs[:] = [tarball({"package/chosen.js": b"left"}),
+                tarball({"package/chosen.js": b"left" if status == "identical" else b"right"})]
+    if status == "only_left":
+        blobs[1] = tarball({"package/other.js": b"right"})
+    elif status == "only_right":
+        blobs[0] = tarball({"package/other.js": b"left"})
+    paths = ["chosen.js"]
+    result = module.compare(SPECS, paths=paths)
+    pair = result["pairs"][0]
+    assert pair["files"][0]["status"] == status
+    assert content_free_result(result, SPECS, None, paths)
+    pair[status] = 0
+    # Recompute package counts to isolate the per-path status cross-check.
+    result["packages"][0]["file_count"] = pair["identical"] + pair["changed"] + pair["only_left"]
+    result["packages"][1]["file_count"] = pair["identical"] + pair["changed"] + pair["only_right"]
+    assert pair["identical"] + pair["changed"] + pair["only_left"] == result["packages"][0]["file_count"]
+    assert pair["identical"] + pair["changed"] + pair["only_right"] == result["packages"][1]["file_count"]
+    assert pair["omitted"] == sum(p["omitted_path_count"] for p in result["packages"])
+    assert not content_free_result(result, SPECS, None, paths), "requested status overflow accepted"
 
 
 @pytest.mark.parametrize("discovered", [False, True])

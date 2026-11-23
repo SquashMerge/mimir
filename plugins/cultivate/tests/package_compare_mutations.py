@@ -84,6 +84,25 @@ for function in tree.body:
                 replace_node(module, f"{function.name}: deny line {node.lineno}", node.test, "False")
         if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant) and node.value.value is False:
             replace_node(module, f"{function.name}: return False line {node.lineno}", node, "return True")
+count_function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "content_free_result")
+for node in ast.walk(count_function):
+    if not isinstance(node, ast.If):
+        continue
+    condition = ast.unparse(node.test)
+    if condition.startswith("pair.identical + pair.changed + pair.only_left !="):
+        for side in ("left", "right", "omitted"):
+            replace_node(module, "disable pair inventory cross-check: " + side,
+                         node.test, "False",
+                         "test_contract_rejects_inconsistent_pair_counts_without_paths and " + side)
+    elif ast.dump(node.test) == ast.dump(ast.parse(
+        "sum(file.status == status for file in pair.files) > getattr(pair, status)",
+        mode="eval",
+    ).body):
+        for status in ("identical", "changed", "only_left", "only_right"):
+            replace_node(module, "disable requested status cross-check: " + status,
+                         node.test, "False",
+                         "test_contract_rejects_requested_status_exceeding_pair_total and " + status)
 add(module, "closed schema permits extra content", 'extra="forbid"', 'extra="ignore"', "contract_rejects_file_bytes")
 add(module, "schema coerces external types", "strict=True", "strict=False", "contract_fails_closed")
 add(module, "path whitelist removed", "PATH.fullmatch(path) is not None", "True", "path_filter")
