@@ -32,10 +32,23 @@ class RepoTestJob:
     auth: AuthContext | None = None
     labels: InformationFlowLabels = field(default_factory=InformationFlowLabels)
     task: asyncio.Task | None = None
+    grant_binding: Any = None
 
     @property
     def job_id(self) -> str:
         return self.record["job_id"]
+
+
+@dataclass(frozen=True)
+class RepoTestCompletion:
+    """Host-owned result metadata; never reconstructed from persisted authority."""
+
+    binding: Any
+    repository: str
+    pull_request: int
+    head: str
+    status: str
+    evidence: bool
 
 
 class RepoTestJobRegistry:
@@ -135,6 +148,7 @@ class RepoTestJobRegistry:
         selectors: tuple[str, ...], channel_id: str, starting_turn_id: str | None,
         auth: AuthContext, labels: InformationFlowLabels,
         run: Callable[[RepoTestJob], Awaitable[dict[str, Any]]],
+        grant_binding: Any = None,
     ) -> dict[str, Any]:
         key = [repository.casefold(), pull_request, head_sha, suite, list(selectors)]
         # No await between lookup, publication and task creation: atomic on the
@@ -148,7 +162,7 @@ class RepoTestJobRegistry:
             "head_sha": head_sha, "suite": suite, "selectors": list(selectors),
             "channel_id": channel_id, "starting_turn_id": starting_turn_id,
             "workers": [], "snapshot": None, "delivered": False,
-        }, auth, labels)
+        }, auth, labels, grant_binding=grant_binding)
         self.save(job)
         self.jobs[job.job_id] = job
         job.task = asyncio.create_task(self._run(job, run), name=job.job_id)
@@ -187,7 +201,13 @@ class RepoTestJobRegistry:
                 "result": record["result"],
             }),
             extra={"job_id": job.job_id, "status": record["status"],
-                   "starting_turn_id": record["starting_turn_id"]},
+                   "starting_turn_id": record["starting_turn_id"],
+                   "_repo_test_completion": RepoTestCompletion(
+                       job.grant_binding, record["repository"], record["pull_request"],
+                       record["head_sha"], record["status"],
+                       record["result"].get("evidence") is True
+                       and not record["result"].get("stale", False),
+                   )},
             ifc_labels=job.labels, continuation_auth_context=job.auth,
         )
         accepted = await self.on_complete(event)

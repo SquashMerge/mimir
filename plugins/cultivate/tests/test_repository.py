@@ -2278,6 +2278,343 @@ async def test_repo_test_completion_followup_push_gate(tmp_path, monkeypatch, ca
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("repository_git_policy")
+@pytest.mark.parametrize("case", [
+    "green", "evidence_false", "head_moved", "no_carrier", "wrong_channel",
+    "http", "inherited_http", "tainted", "unheld_scope", "interrupted",
+    "missing_binding", "stale", "result_repository", "result_pr", "result_head",
+    "superseded_scope", "local_head", "no_queue_grants", "expired_queue",
+    "reduced_actions", "expired_after_queue", "different_carrier", "different_principal",
+    "lease_scope", "lease_identity", "lease_turn", "lease_unattested", "lease_missing",
+    "missing_completion", "tainted_preload", "restart", "shell", "discovered_scope",
+    "wrong_carrier_type", "wrong_completion_type",
+    "lease_metadata", "lease_metadata_symlink",
+])
+async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
+    """Real mint -> queue -> route -> fresh mint -> enforced grant validation."""
+    from mimir import access_control as ac, agent as agent_module, repo_test_jobs
+    from mimir.agent import Agent, _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.models import AgentEvent, InformationFlowLabels, SourceLabel
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from unittest.mock import AsyncMock
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope = state.action_scope
+    lease = state.checkout_lease
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    policy = selected_policy_registry()
+    protocol = policy.scoped_actions["cultivate"]
+    # Production ingress mint, followed by host scope/checkout observations.
+    # No fabricated ScopedPRGrants or patched validator.
+    authority = ac.build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=ac.CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=tuple(policy.authority_profiles["github"]),
+        creation_path="mimir.pollers.run_poller", policy=policy, poller_owner="cultivate",
+    )
+    auth = ac.create_auth_context(
+        AgentEvent(trigger="poller", channel_id="poller:github-activity", source="poller",
+                   service_principal=authority.canonical, service_authority=authority,
+                   extra={"poller_name": "github-activity", "items": []}),
+        enforce=True, ifc_labels=InformationFlowLabels(), policy=policy,
+    )
+    auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((state,)))
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    auth.scoped_pr_grants.issue(scope)
+    token = ac.consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    queue_grants = auth.scoped_pr_grants
+    if case == "unheld_scope":
+        # Same PR/head is insufficient: scope_id must also have been held.
+        queue_grants._follow.clear()
+    elif case == "no_queue_grants":
+        auth = replace(auth, scoped_pr_grants=None)
+    elif case == "expired_queue":
+        queue_grants._follow[("cultivate", scope.scope_id)] = {
+            action: replace(grant, expires_at=0)
+            for action, grant in queue_grants._follow[("cultivate", scope.scope_id)].items()
+        }
+    elif case == "reduced_actions":
+        del queue_grants._follow[("cultivate", scope.scope_id)]["pr.edit"]
+    owner = SimpleNamespace(
+        _shell_jobs=SimpleNamespace(get=lambda _: None),
+        _dispatcher=SimpleNamespace(enqueue=AsyncMock(return_value=True)),
+        _shell_completion_batch_seconds=0,
+    )
+    monkeypatch.setattr(agent_module, "log_event", AsyncMock())
+    from mimir import event_logger
+
+    handoffs = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: handoffs.append((kind, fields)))
+    registry = repo_test_jobs.RepoTestJobRegistry(
+        tmp_path / "jobs", lambda event: Agent._on_repo_test_complete(owner, event),
+    )
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(forge, "_client", lambda _: object())
+    monkeypatch.setattr(forge, "_live_pr_head", lambda *_: scope.observed_head_sha)
+    monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: True)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(ac, "_github_repo_from_remote", lambda _: scope.canonical_repo)
+    monkeypatch.setattr(repository, "_ancestral_verified_pushes", type(repository._ancestral_verified_pushes)())
+    real = repository.RepoProjectTests
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(
+            0, b"1 passed in 0.01s\n",
+            _lease_start(kwargs["identifier"], repository.time.monotonic()),
+            False, False, 0, 0,
+        )
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    draft = lease.path / "tracked.txt"
+    draft.write_text("queueing turn's uncommitted draft\n")
+    queue_turn = _ifc_turn(auth)
+    queue_turn.turn_id = "queue-turn"
+    turn_token = set_current_turn(queue_turn)
+    try:
+        queued = await repository.repo_test.coroutine(
+            scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+        )
+    finally:
+        reset_current_turn(turn_token)
+    job = registry.jobs[queued["job_id"]]
+    await job.task
+    assert job.record["result"]["evidence"] is True
+    event = owner._dispatcher.enqueue.call_args.args[0]
+    if case == "shell":
+        event.trigger = "shell_job_complete"
+        assert ac.remint_repo_test_grants(event, replace(auth, ifc_labels=job.labels)) is None
+        shell_auth = _create_turn_auth_context(
+            event, None, policy_version=None, enforce=True, ifc_labels=job.labels, policy=policy,
+        )
+        assert shell_auth.scoped_pr_grants is queue_grants  # no new shell authority
+        return
+    if case == "restart":
+        registry.save(job, delivered=False)
+        recovered = repo_test_jobs.RepoTestJobRegistry(registry.directory, registry.on_complete)
+        await recovered.recover(AsyncMock())
+        event = owner._dispatcher.enqueue.call_args.args[0]
+        assert event.continuation_auth_context is None
+    completion = event.extra["_repo_test_completion"]
+    if case == "expired_after_queue":
+        # Expiry after queueing is precisely why this completion needs renewal.
+        queue_grants.expires_at = 0
+        queue_grants._follow[("cultivate", scope.scope_id)] = {
+            action: replace(grant, expires_at=0)
+            for action, grant in queue_grants._follow[("cultivate", scope.scope_id)].items()
+        }
+        assert not ac._valid_scoped_pr_grant(
+            auth, "cultivate", protocol.action_type.COMMIT, protocol, scope, state,
+            tool_name="repo_commit",
+        )
+    elif case == "different_carrier":
+        event.continuation_auth_context = replace(
+            event.continuation_auth_context,
+            scoped_pr_grants=ac.ScopedPRGrants(
+                auth.canonical_principal, (), protocols=policy.scoped_actions,
+                _issuer=ac._SCOPED_PR_ISSUER,
+            ),
+        )
+    elif case == "different_principal":
+        event.continuation_auth_context = replace(
+            event.continuation_auth_context, canonical_principal="other",
+        )
+    if case == "evidence_false":
+        completion = replace(completion, evidence=False)
+    elif case == "interrupted":
+        completion = replace(completion, status="interrupted")
+    elif case == "missing_binding":
+        completion = replace(completion, binding=None)
+    elif case == "result_repository":
+        completion = replace(completion, repository="other/repo")
+    elif case == "result_pr":
+        completion = replace(completion, pull_request=99)
+    elif case == "result_head":
+        completion = replace(completion, head="b" * 40)
+    elif case == "head_moved":
+        object.__setattr__(scope, "observed_head_sha", "b" * 40)
+    elif case == "local_head":
+        object.__setattr__(state, "git_expected_head", "b" * 40)
+    elif case in {"superseded_scope", "discovered_scope"}:
+        replacement_state = RepoReviewState(replace(scope, event_type="pr_synchronize"))
+        object.__setattr__(replacement_state, "git_expected_head", scope.observed_head_sha)
+        if case == "superseded_scope":
+            event.continuation_auth_context = replace(
+                event.continuation_auth_context,
+                repo_pr_scope_registry=RepoPRScopeRegistry((replacement_state,)),
+            )
+        else:
+            from mimir_cultivate.policy import ServerDiscoveredPRStates
+
+            discovered = ServerDiscoveredPRStates()
+            discovered.remember(replacement_state)
+            event.continuation_auth_context = replace(
+                event.continuation_auth_context, server_discovered_pr_states=discovered,
+            )
+    elif case == "no_carrier":
+        event.continuation_auth_context = None
+    elif case == "wrong_carrier_type":
+        event.continuation_auth_context = SimpleNamespace(
+            channel_id=event.channel_id, scoped_pr_grants=queue_grants,
+        )
+    elif case == "wrong_channel":
+        event.channel_id = "another-channel"
+    elif case == "http":
+        event.extra[ac.HTTP_EVENT_INGRESS_EXTRA_KEY] = None
+    elif case == "inherited_http":
+        event.continuation_auth_context = replace(event.continuation_auth_context, event_ingress="http")
+    elif case == "tainted":
+        event.ifc_labels = event.ifc_labels.with_source(SourceLabel(
+            principal="outside", domain="web", resource_id="tainted",
+            bridge_instance="web", sensitivity="public",
+            integrity="untrusted", integrity_effect="active_ingest",
+        ))
+    elif case == "stale":
+        registry.save(job, result={**job.record["result"], "stale": True})
+        await registry.deliver(job)
+        event = owner._dispatcher.enqueue.call_args.args[0]
+        completion = event.extra["_repo_test_completion"]
+    event.extra["_repo_test_completion"] = completion
+    if case == "missing_completion":
+        event.extra.pop("_repo_test_completion")
+    elif case == "wrong_completion_type":
+        event.extra["_repo_test_completion"] = SimpleNamespace(**vars(completion))
+    labels = _initialize_ifc_labels(event, policy=policy)
+    if case == "tainted_preload":
+        labels = labels.with_source(SourceLabel(
+            principal="outside", domain="web", resource_id="preloaded-taint",
+            bridge_instance="web", sensitivity="public", integrity="untrusted",
+            integrity_effect="active_ingest",
+        ))
+    followup = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True,
+        ifc_labels=labels, policy=policy,
+    )
+    has_grant = case in {"green", "reduced_actions", "expired_after_queue"} or case.startswith("lease_")
+    if not has_grant:
+        # Isolate mint admission from the independent ingress IFC classifier:
+        # HTTP/channel violations must refuse even with clean supplied labels.
+        from mimir.models import AuthContext
+
+        direct_auth = replace(
+            event.continuation_auth_context
+            if isinstance(event.continuation_auth_context, AuthContext) else auth,
+            ifc_labels=job.labels if case in {"http", "wrong_channel", "wrong_carrier_type"} else labels,
+        )
+        assert ac.remint_repo_test_grants(event, direct_auth) is None, case
+        assert followup.scoped_pr_grants is None, case
+        assert not ac._valid_scoped_pr_grant(
+            followup, "cultivate", protocol.checkout_action, protocol, scope, state,
+            tool_name="repo_checkout",
+        )
+        checkout = ac.get_tool_registry().authorize_tool(
+            "repo_checkout", followup, enforce=True,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+            policy=policy,
+        )
+        assert not checkout.allowed
+        refused = ac.get_tool_registry().authorize_tool(
+            "repo_commit", followup, enforce=True,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                       "paths": ("tracked.txt",), "message": "must refuse"}, policy=policy,
+        )
+        assert not refused.allowed
+        return
+    grants = followup.scoped_pr_grants
+    assert grants is not None
+    assert grants is not queue_grants and grants.nonce != queue_grants.nonce
+    assert grants.expires_at > repository.time.monotonic() + 3500
+    assert set(grants._prelease) == {("cultivate", scope.scope_id)}
+    other_scope = replace(scope, pr_number=99)
+    grants.issue(other_scope)
+    assert grants.get("cultivate", other_scope, "repo.checkout") is None
+    assert ac._valid_scoped_pr_grant(
+        followup, "cultivate", protocol.checkout_action, protocol, scope, state,
+        tool_name="repo_checkout",
+    )
+    checkout = ac.get_tool_registry().authorize_tool(
+        "repo_checkout", followup, enforce=True,
+        arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        policy=policy,
+    )
+    assert checkout.allowed, checkout.as_log_fields()
+    turn = _ifc_turn(followup)
+    turn.turn_id = "completion-turn"
+    turn_token = set_current_turn(turn)
+    try:
+        checkout_token = ac.consume_scoped_pr_checkout(followup, scope, "cultivate")
+        if case.startswith("lease_"):
+            if case == "lease_scope":
+                grants.repo_test_continuation = replace(grants.repo_test_continuation, scope=other_scope)
+            elif case == "lease_identity":
+                grants.repo_test_continuation = replace(grants.repo_test_continuation, lease_identity=("other", "other"))
+            elif case == "lease_turn":
+                object.__setattr__(lease, "last_turn_id", "unrelated-turn")
+            elif case == "lease_missing":
+                state.revoke_checkout_lease(lease)
+            elif case == "lease_metadata":
+                metadata = lease.path / repository._METADATA
+                metadata.write_text(json.dumps({**json.loads(metadata.read_text()), "recovery_id": "other"}))
+            elif case == "lease_metadata_symlink":
+                metadata = lease.path / repository._METADATA
+                target = tmp_path / "not-lease-metadata"
+                target.write_text("must not be overwritten\n")
+                metadata.unlink()
+                metadata.symlink_to(target)
+            else:
+                monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: False)
+            with pytest.raises(repository.ToolPolicyRefusal):
+                repository.repo_checkout.func(
+                    scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=followup),
+                )
+            assert draft.read_text() == "queueing turn's uncommitted draft\n"
+            if case == "lease_metadata_symlink":
+                assert target.read_text() == "must not be overwritten\n"
+            assert not grants._follow
+            return
+        result = repository.repo_checkout.func(
+            scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=followup),
+        )
+        assert result["status"] == "resumed"
+        assert state.checkout_lease is lease
+        assert draft.read_text() == "queueing turn's uncommitted draft\n"
+        assert lease.last_turn_id == "completion-turn"
+        assert ("pr_checkout_lease_completion_handoff", {
+            "scope_id": scope.scope_id, "previous_turn_id": "queue-turn",
+            "last_turn_id": "completion-turn",
+        }) in handoffs
+        assert json.loads((lease.path / repository._METADATA).read_text())["last_turn_id"] == "completion-turn"
+        assert not state.checkout_recovery_notices
+        assert ac.observe_scoped_pr_checkout(
+            followup, scope, state, checkout_token, "cultivate", protocol,
+        )
+        if case == "reduced_actions":
+            assert grants.get("cultivate", scope, "pr.edit", checkout=False) is None
+            assert set(grants._follow[("cultivate", scope.scope_id)]) == scope.allowed_operations - {"pr.edit"}
+        for tool_name, arguments in (
+            ("repo_commit", {"paths": ("tracked.txt",), "message": "complete queued draft"}),
+            ("repo_push", {}),
+        ):
+            allowed = ac.get_tool_registry().authorize_tool(
+                tool_name, followup, enforce=True,
+                arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                           **arguments}, policy=policy,
+            )
+            assert allowed.allowed, allowed.as_log_fields()
+            assert getattr(repository, tool_name).func(
+                scope.canonical_repo, scope.pr_number, **arguments,
+                runtime=SimpleNamespace(context=followup),
+            )["ok"]
+        assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) != job.record["head_sha"]
+    finally:
+        reset_current_turn(turn_token)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("channel,leased", [(False, True), (True, False)])
 async def test_repo_test_synchronous_fallback_unchanged(tmp_path, monkeypatch, channel, leased):
     from mimir.models import AuthContext

@@ -856,6 +856,7 @@ class PRCheckoutLease:
     verified_base_sha: str | None = None
     # Turn-local recovery authority, never reconstructed from lease metadata.
     interrupted_operation: InterruptedGitOperation | None = None
+    last_turn_id: str | None = None
 
     def recovery_checkout_state(self, scope: RepoPRActionScope) -> tuple[str, str] | None:
         return recovery_checkout_state(self, scope)
@@ -1051,6 +1052,7 @@ def _metadata(lease: PRCheckoutLease) -> dict[str, object]:
         "pr_number": lease.pr_number,
         "lineage": lease.lineage,
         "verified_base_sha": lease.verified_base_sha,
+        "last_turn_id": lease.last_turn_id,
     }
 
 
@@ -1361,6 +1363,7 @@ def _recover_pr_checkout_lease_unlocked(
             pr_number=scope.pr_number,
             lineage=_recorded_lineage(raw),
             verified_base_sha=_recorded_verified_base(raw),
+            last_turn_id=raw.get("last_turn_id"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("PR checkout lease recovery metadata is invalid") from exc
@@ -1468,6 +1471,7 @@ def _lease_from_recorded_metadata(path: Path, root: Path) -> PRCheckoutLease:
             pr_number=int(raw.get("pr_number", 0)),
             lineage=_recorded_lineage(raw),
             verified_base_sha=_recorded_verified_base(raw),
+            last_turn_id=raw.get("last_turn_id"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("PR checkout lease reclamation metadata is invalid") from exc
@@ -6150,7 +6154,43 @@ def checkout_scoped_pr(
         if not attestation.ok:
             raise LeaseAttestationRefusal(attestation.reason, existing=True)
 
+    grants = getattr(context, "scoped_pr_grants", None)
+    continuation = getattr(grants, "repo_test_continuation", None)
+
+    def resume_completion() -> dict[str, Any]:
+        # This is the same work, not an abandoned prior-turn draft. Admit it
+        # before ordinary recovery/archive classification, but still attest it.
+        if (continuation.scope is not scope or existing is None
+                or (str(existing.path), existing.recovery_id) != continuation.lease_identity
+                or existing.last_turn_id != continuation.starting_turn_id):
+            raise ToolPolicyRefusal("repository checkout rejected: completion lease handoff mismatch")
+        protocol = grants._protocols[scope.owner]
+        if protocol.live_lease(scope, state) is not existing:
+            raise ToolPolicyRefusal("repository checkout rejected: completion lease is no longer live")
+        attest_resume(existing)
+        from mimir._context import get_current_turn
+
+        turn = get_current_turn()
+        prior_turn_id = existing.last_turn_id
+        object.__setattr__(existing, "last_turn_id", getattr(turn, "turn_id", None))
+        (existing.path / _METADATA).write_text(
+            json.dumps(_metadata(existing), sort_keys=True) + "\n", encoding="utf-8",
+        )
+        from mimir.event_logger import log_event_sync
+
+        log_event_sync(
+            "pr_checkout_lease_completion_handoff", scope_id=scope.scope_id,
+            previous_turn_id=prior_turn_id, last_turn_id=existing.last_turn_id,
+        )
+        _publish_attested_lease_result(runtime, state)
+        return {
+            "status": "resumed", "path": str(existing.path), "scope_id": scope.scope_id,
+            "head_sha": existing.head_sha, "candidate_commits": (),
+        }
+
     try:
+        if continuation is not None:
+            return resume_completion()
         lease, candidates = acquire_pr_checkout_lease(
             state.action_scope, owner=state.action_scope.principal,
             review_state=state,
@@ -6522,12 +6562,22 @@ async def _queue_repo_test(
                     result.update(evidence=False, message="informational: starting checkout lease expired")
         return result
 
+    from mimir.access_control import bind_repo_test_grant
+
+    starting_turn_id = getattr(ctx, "turn_id", None)
+    binding = (None if retained else
+               bind_repo_test_grant(auth, scope, state, starting_turn_id))
+    if binding is not None:
+        object.__setattr__(state.checkout_lease, "last_turn_id", starting_turn_id)
+        (state.checkout_lease.path / _METADATA).write_text(
+            json.dumps(_metadata(state.checkout_lease), sort_keys=True) + "\n", encoding="utf-8",
+        )
     return registry.enqueue(
         repository=repository, pull_request=pull_request,
         head_sha=head, suite=suite_name, selectors=selected,
         channel_id=auth.channel_id,
-        starting_turn_id=getattr(ctx, "turn_id", None),
-        auth=auth, labels=labels, run=run,
+        starting_turn_id=starting_turn_id,
+        auth=auth, labels=labels, run=run, grant_binding=binding,
     )
 
 
