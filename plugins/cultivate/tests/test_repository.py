@@ -2091,6 +2091,177 @@ def _lease_start(identifier, started, stderr=b""):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "acquire", "recover", "rebind", "queue", "checkout"])
+@pytest.mark.parametrize("fresh_scope", [False, True])
+async def test_repo_test_pending_blocks_lease_lifecycle_without_mutation(
+    tmp_path, monkeypatch, operation, fresh_scope,
+):
+    from mimir import repo_test_jobs
+    from mimir_cultivate import forge
+    from unittest.mock import AsyncMock
+
+    _, _, _, state = _repo_scope_and_state(tmp_path)
+    scope, lease = state.action_scope, state.checkout_lease
+    auth = replace(_untainted_ifc_auth(), repo_review_state=state)
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=False))
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    binding = SimpleNamespace(
+        scope=scope, lease_identity=(str(lease.path), lease.recovery_id),
+        queue_grants=object(),
+    )
+    queued = registry.enqueue(
+        repository=scope.canonical_repo, pull_request=scope.pr_number,
+        head_sha=scope.observed_head_sha, suite="unit", selectors=(),
+        channel_id=auth.channel_id, starting_turn_id="queue-turn", auth=auth,
+        labels=auth.ifc_labels, run=AsyncMock(return_value={"ok": True}), grant_binding=binding,
+    )
+    job = registry.jobs[queued["job_id"]]
+    candidate_scope = replace(scope, event_type="pr_synchronize") if fresh_scope else scope
+    candidate_state = RepoReviewState(candidate_scope)
+    preflight = AsyncMock()
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", preflight)
+    before = (lease.path / repository._METADATA).read_bytes()
+    try:
+        with pytest.raises(repository.RepoTestPendingRefusal, match=job.job_id):
+            if operation == "create":
+                repository.create_pr_checkout_lease(
+                    candidate_scope, owner=scope.principal, lease_root=lease.lease_root,
+                )
+            elif operation == "acquire":
+                repository.acquire_pr_checkout_lease(
+                    candidate_scope, owner=scope.principal, lease_root=lease.lease_root,
+                )
+            elif operation == "recover":
+                repository.recover_pr_checkout_lease(
+                    lease.path, candidate_scope, owner=scope.principal, lease_root=lease.lease_root,
+                )
+            elif operation == "rebind":
+                repository._rebind_foreign_candidate(
+                    lease, candidate_scope, head=scope.observed_head_sha, ttl=timedelta(hours=2),
+                    review_state=candidate_state, runner=repository._default_runner,
+                )
+            elif operation == "queue":
+                await repository._queue_repo_test(
+                    registry, SimpleNamespace(context=auth), state, (), None,
+                )
+            else:
+                repository.repo_checkout.func(
+                    scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+                )
+        assert (lease.path / repository._METADATA).read_bytes() == before
+        assert state.checkout_lease is lease and not lease.revoked
+        assert candidate_state.checkout_lease is None
+        preflight.assert_not_called()
+        # Non-lease reads retain their usual behavior during the reservation.
+        monkeypatch.setattr(repository, "_state", lambda *_: state)
+        from mimir.plugins.core import policy_scope
+
+        with policy_scope(load_plugins(enable="cultivate").policy):
+            assert repository.repo_status.func(
+                scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+            )["ok"]
+        with pytest.raises(repository.RepoTestPendingRefusal):
+            repository._assert_pr_checkout_unreserved(
+                scope.canonical_repo, scope.pr_number,
+                continuation=SimpleNamespace(**vars(binding)),
+            )
+    finally:
+        await job.task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "same", "other_grants", "other_turn", "other_selectors", "other_suite", "other_head",
+])
+async def test_repo_test_pending_dedup_requires_same_turn_and_request(tmp_path, monkeypatch, case):
+    from mimir import repo_test_jobs
+    from unittest.mock import AsyncMock
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope, lease = state.action_scope, state.checkout_lease
+    grants = object()
+    auth = replace(_untainted_ifc_auth(), repo_review_state=state, scoped_pr_grants=grants)
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=False))
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    queued = registry.enqueue(
+        repository=scope.canonical_repo, pull_request=scope.pr_number,
+        head_sha="b" * 40 if case == "other_head" else scope.observed_head_sha,
+        suite="other" if case == "other_suite" else "python", selectors=(),
+        channel_id=auth.channel_id, starting_turn_id="queue-turn", auth=auth,
+        labels=auth.ifc_labels, run=AsyncMock(return_value={"ok": True}),
+        grant_binding=SimpleNamespace(
+            queue_grants=grants, lease_identity=(str(lease.path), lease.recovery_id),
+        ),
+    )
+    turn = _ifc_turn(auth)
+    turn.turn_id = "another-turn" if case == "other_turn" else "queue-turn"
+    token = set_current_turn(turn)
+    before = (lease.path / repository._METADATA).read_bytes()
+    try:
+        runtime = SimpleNamespace(context=replace(
+            auth, scoped_pr_grants=object() if case == "other_grants" else grants,
+        ))
+        selectors = ("tests/test_changed.py",) if case == "other_selectors" else ()
+        if case == "same":
+            assert await repository._queue_repo_test(registry, runtime, state, selectors, None) == queued
+        else:
+            with pytest.raises(repository.RepoTestPendingRefusal, match=queued["job_id"]):
+                await repository._queue_repo_test(registry, runtime, state, selectors, None)
+        assert (lease.path / repository._METADATA).read_bytes() == before
+        assert len(registry.jobs) == 1
+    finally:
+        reset_current_turn(token)
+        await registry.jobs[queued["job_id"]].task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reclamation", ["cleanup", "expired"])
+async def test_repo_test_reservation_released_on_checkout_reclamation(tmp_path, monkeypatch, reclamation):
+    from mimir import repo_test_jobs
+    from unittest.mock import AsyncMock
+
+    _, _, _, state = _repo_scope_and_state(tmp_path)
+    scope, lease = state.action_scope, state.checkout_lease
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=False))
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    queued = registry.enqueue(
+        repository=scope.canonical_repo, pull_request=scope.pr_number,
+        head_sha=scope.observed_head_sha, suite="unit", selectors=(),
+        channel_id="jobs", starting_turn_id="queue-turn", auth=_untainted_ifc_auth(),
+        labels=_untainted_ifc_auth().ifc_labels, run=AsyncMock(return_value={"ok": True}),
+        grant_binding=SimpleNamespace(lease_identity=(str(lease.path), lease.recovery_id)),
+    )
+    job = registry.jobs[queued["job_id"]]
+    await job.task
+    assert registry.pending_for_scope(scope.canonical_repo, scope.pr_number) is job
+    # A different PR can acquire while the original reservation is still live.
+    other = replace(scope, pr_number=scope.pr_number + 1)
+    other_lease = repository.create_pr_checkout_lease(
+        other, owner=scope.principal, lease_root=lease.lease_root, ttl=timedelta(hours=4),
+    )
+    assert other_lease.is_active
+    if reclamation == "cleanup":
+        assert repository.cleanup_pr_checkout_lease(lease, review_state=state)
+    else:
+        [result] = repository.reclaim_expired_pr_checkout_leases(
+            lease.lease_root, active_paths=set(), now=lease.expires_at + timedelta(seconds=1),
+            event_logger=lambda *_args, **_kwargs: None,
+        )
+        assert result.reclaimed
+    assert job.grant_binding is None
+    assert registry.pending_for_scope(scope.canonical_repo, scope.pr_number) is None
+    # The reclaimed PR can acquire again after release.
+    assert other_lease.is_active
+    replacement = repository.create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+    )
+    assert replacement.is_active
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retained", [False, True], ids=["pr", "retained"])
 @pytest.mark.parametrize("refusal", [
     "unknown_selector", "invalid_suite", "ambiguous_suite", "missing_configuration",
@@ -2477,6 +2648,7 @@ async def test_repo_test_completion_followup_push_gate(tmp_path, monkeypatch, ca
     "missing_completion", "tainted_preload", "restart", "shell", "discovered_scope",
     "wrong_carrier_type", "wrong_completion_type",
     "lease_metadata", "lease_metadata_symlink",
+    "pending_second_turn", "undelivered_second_turn",
 ])
 async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     """Real mint -> queue -> route -> fresh mint -> enforced grant validation."""
@@ -2536,9 +2708,11 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
 
     handoffs = []
     monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: handoffs.append((kind, fields)))
-    registry = repo_test_jobs.RepoTestJobRegistry(
-        tmp_path / "jobs", lambda event: Agent._on_repo_test_complete(owner, event),
-    )
+    async def complete(event):
+        accepted = await Agent._on_repo_test_complete(owner, event)
+        return False if case == "undelivered_second_turn" else accepted
+
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", complete)
     monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
     monkeypatch.setattr(forge, "_client", lambda _: object())
     monkeypatch.setattr(forge, "_live_pr_head", lambda *_: scope.observed_head_sha)
@@ -2547,8 +2721,12 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     monkeypatch.setattr(ac, "_github_repo_from_remote", lambda _: scope.canonical_repo)
     monkeypatch.setattr(repository, "_ancestral_verified_pushes", type(repository._ancestral_verified_pushes)())
     real = repository.RepoProjectTests
+    started, release = asyncio.Event(), asyncio.Event()
 
     async def runner(*args, **kwargs):
+        started.set()
+        if case == "pending_second_turn":
+            await release.wait()
         return CollectedExecutionResult(
             0, b"1 passed in 0.01s\n",
             _lease_start(kwargs["identifier"], repository.time.monotonic()),
@@ -2570,8 +2748,45 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     finally:
         reset_current_turn(turn_token)
     job = registry.jobs[queued["job_id"]]
+    if case == "pending_second_turn":
+        await started.wait()
+        metadata_before = (lease.path / repository._METADATA).read_bytes()
+        second_state = RepoReviewState(replace(scope, event_type="pr_synchronize"))
+        second_auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((second_state,)))
+        second_turn = _ifc_turn(second_auth)
+        second_turn.turn_id = "second-turn"
+        second_token = set_current_turn(second_turn)
+        try:
+            with pytest.raises(repository.RepoTestPendingRefusal, match=job.job_id) as refused:
+                repository.repo_checkout.func(
+                    scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=second_auth),
+                )
+            assert refused.value.code == "repo_test_pending"
+            assert "completion turn will continue the work" in str(refused.value)
+            stopped = repository.checkout_scoped_pr(
+                scope.canonical_repo, scope.pr_number,
+                SimpleNamespace(context=second_auth, pre_turn_checkout=True),
+            )
+            assert stopped["status"] == "stopped"
+            assert stopped["code"] == "repo_test_pending"
+            assert stopped["job_id"] == job.job_id
+            assert second_state.checkout_lease is None
+            assert state.checkout_lease is lease and not lease.revoked
+            assert lease.last_turn_id == "queue-turn"
+            assert (lease.path / repository._METADATA).read_bytes() == metadata_before
+        finally:
+            reset_current_turn(second_token)
+            release.set()
     await job.task
     assert job.record["result"]["evidence"] is True
+    if case == "undelivered_second_turn":
+        assert registry.pending_for_scope(scope.canonical_repo, scope.pr_number) is job
+        before = (lease.path / repository._METADATA).read_bytes()
+        with pytest.raises(repository.RepoTestPendingRefusal, match=job.job_id):
+            repository.repo_checkout.func(
+                scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+            )
+        assert (lease.path / repository._METADATA).read_bytes() == before
     event = owner._dispatcher.enqueue.call_args.args[0]
     if case == "shell":
         event.trigger = "shell_job_complete"
@@ -2682,7 +2897,10 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         event, None, policy_version=None, enforce=True,
         ifc_labels=labels, policy=policy,
     )
-    has_grant = case in {"green", "reduced_actions", "expired_after_queue"} or case.startswith("lease_")
+    has_grant = case in {
+        "green", "reduced_actions", "expired_after_queue", "pending_second_turn",
+        "undelivered_second_turn",
+    } or case.startswith("lease_")
     if not has_grant:
         # Isolate mint admission from the independent ingress IFC classifier:
         # HTTP/channel violations must refuse even with clean supplied labels.

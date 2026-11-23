@@ -72,6 +72,80 @@ async def test_repo_test_job_deduplication_and_durable_private_result(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "test_failure", "exception", "cancel"])
+async def test_repo_test_reserves_bound_scope_until_delivery(tmp_path, outcome):
+    registry = RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=False))
+    started, release = asyncio.Event(), asyncio.Event()
+    binding = SimpleNamespace(lease_identity=("checkout", "identity"))
+
+    async def run(job):
+        started.set()
+        await release.wait()
+        if outcome == "exception":
+            raise RuntimeError("execution refused")
+        return {"ok": outcome == "success"}
+
+    queued = enqueue(registry, run, grant_binding=binding)
+    job = registry.jobs[queued["job_id"]]
+    await started.wait()
+    assert registry.pending_for_scope("O/R", 9) is job
+    assert registry.pending_for_scope("o/r", 10) is None
+    assert registry.pending_for_scope("other/repo", 9) is None
+    if outcome == "cancel":
+        await registry.cancel(job.job_id)
+    else:
+        release.set()
+        await job.task
+    assert not job.record["delivered"]
+    assert registry.pending_for_scope("o/r", 9) is job
+    assert registry.on_complete.call_args.args[0].extra["_repo_test_completion"].binding is binding
+
+    recovered = RepoTestJobRegistry(registry.directory, AsyncMock(return_value=True))
+    assert recovered.pending_for_scope("o/r", 9) is None
+    await recovered.recover(AsyncMock())
+    assert recovered.on_complete.call_args.args[0].extra["_repo_test_completion"].binding is None
+
+    registry.on_complete = AsyncMock(return_value=True)
+    await registry.deliver(job)
+    assert job.record["delivered"] and job.grant_binding is None
+    assert registry.pending_for_scope("o/r", 9) is None
+
+
+@pytest.mark.asyncio
+async def test_repo_test_shutdown_and_reclamation_release_only_bound_identity(tmp_path):
+    registry = RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=False))
+    started = asyncio.Event()
+
+    async def run(job):
+        started.set()
+        await asyncio.Event().wait()
+
+    binding = SimpleNamespace(lease_identity=("checkout", "identity"))
+    queued = enqueue(registry, run, grant_binding=binding)
+    job = registry.jobs[queued["job_id"]]
+    await started.wait()
+    registry.release_lease(("checkout", "other-identity"))
+    assert registry.pending_for_scope("o/r", 9) is job
+    registry.release_lease(binding.lease_identity)
+    assert registry.pending_for_scope("o/r", 9) is None
+    assert job.grant_binding is None
+    job.grant_binding = binding
+    await registry.close()
+    assert job.record["status"] == "interrupted"
+    assert registry.pending_for_scope("o/r", 9) is None
+    assert job.grant_binding is None
+
+
+@pytest.mark.asyncio
+async def test_repo_test_without_grant_binding_does_not_reserve_scope(tmp_path):
+    registry = RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=False))
+    queued = enqueue(registry, AsyncMock(return_value={"ok": True}))
+    assert registry.pending_for_scope("o/r", 9) is None
+    await registry.jobs[queued["job_id"]].task
+    assert registry.pending_for_scope("o/r", 9) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bad", ["{partial", "[]", '{"job_id":"rt_broken"}', "invalid_types", "invalid_utf8"])
 async def test_repo_test_registry_quarantines_corruption_and_recovers_healthy(tmp_path, monkeypatch, bad):
     from mimir import repo_test_jobs

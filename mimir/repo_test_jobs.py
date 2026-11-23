@@ -172,6 +172,26 @@ class RepoTestJobRegistry:
     def queued(job: RepoTestJob) -> dict[str, Any]:
         return {name: job.record[name] for name in ("status", "job_id", "suite", "head_sha")}
 
+    def pending_for_scope(self, repository: str, pull_request: int) -> RepoTestJob | None:
+        """Find an in-process lease reservation, including undelivered results.
+
+        Repository/PR, not scope_id or head, is the exclusion key: a later
+        poller event can mint a different scope for the very same checkout.
+        Recovered records have no binding and therefore reserve nothing.
+        """
+        return next((
+            job for job in tuple(self.jobs.values())
+            if job.grant_binding is not None and not job.record["delivered"]
+            and job.record["repository"].casefold() == repository.casefold()
+            and job.record["pull_request"] == pull_request
+        ), None)
+
+    def release_lease(self, identity: tuple[str, str]) -> None:
+        """Retire only the binding belonging to a reclaimed checkout identity."""
+        for job in tuple(self.jobs.values()):
+            if job.grant_binding is not None and job.grant_binding.lease_identity == identity:
+                job.grant_binding = None
+
     async def _run(self, job: RepoTestJob, run: Callable) -> None:
         try:
             result = await run(job)
@@ -213,6 +233,7 @@ class RepoTestJobRegistry:
         accepted = await self.on_complete(event)
         if accepted is not False:
             self.save(job, delivered=True)
+            job.grant_binding = None
             self.prune()
 
     async def recover(self, cleanup: Callable[[dict], Awaitable[None]]) -> None:
@@ -264,6 +285,7 @@ class RepoTestJobRegistry:
                     self.save(job, status="interrupted", result={
                         "ok": False, "code": "interrupted", "message": "No result exists after shutdown.",
                     })
+            job.grant_binding = None
 
 
 _REGISTRY: RepoTestJobRegistry | None = None
