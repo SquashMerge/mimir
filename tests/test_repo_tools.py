@@ -353,6 +353,7 @@ def _repo_scope_and_state(
     base_files: dict[str, bytes] | None = None,
     base_modes: dict[str, int] | None = None,
     history_entries: bool = False,
+    advance_base: bool = False,
 ) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
     origin = tmp_path / "origin.git"
     git_env = _fixture_git_env()
@@ -390,6 +391,13 @@ def _repo_scope_and_state(
         _git(source, "commit", "-qam", f"pull request {number}")
     head = _git(source, "rev-parse", "HEAD")
     _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+    if advance_base:
+        _git(source, "checkout", "-q", "main")
+        (source / "main.txt").write_text("new main work\n")
+        _git(source, "add", "main.txt")
+        _git(source, "commit", "-qm", "advance main")
+        base = _git(source, "rev-parse", "HEAD")
+        _git(source, "push", "-q", "origin", "HEAD:main")
     assert _git(origin, "rev-parse", "--verify", "refs/heads/main") == base
     assert _git(origin, "rev-parse", "--verify", "refs/heads/worklink/7") == head
     scope = RepoPRActionScope(

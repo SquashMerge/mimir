@@ -6664,7 +6664,7 @@ async def _queue_repo_test(
 
     starting_turn_id = getattr(ctx, "turn_id", None)
     binding = (None if retained else
-               bind_repo_test_grant(auth, scope, state, starting_turn_id))
+               bind_repo_test_grant(auth, scope, state, starting_turn_id, tested_head=head))
     if binding is not None:
         object.__setattr__(state.checkout_lease, "last_turn_id", starting_turn_id)
         (state.checkout_lease.path / _METADATA).write_text(

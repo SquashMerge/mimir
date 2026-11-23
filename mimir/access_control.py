@@ -9307,12 +9307,15 @@ class RepoTestGrantBinding:
     scope: Any
     actions: frozenset[str]
     lease_identity: tuple[str, str]
+    tested_head: str
+    observed_head_sha: str
     starting_turn_id: str | None
     queue_grants: Any = field(repr=False, compare=False)
 
 
 def bind_repo_test_grant(
     auth: AuthContext, scope: Any, state: Any, starting_turn_id: str | None,
+    *, tested_head: str,
 ) -> RepoTestGrantBinding | None:
     grants = auth.scoped_pr_grants
     if not isinstance(grants, ScopedPRGrants):
@@ -9330,7 +9333,8 @@ def bind_repo_test_grant(
     if protocol.checkout_action.value not in actions or lease is None:
         return None
     return RepoTestGrantBinding(
-        scope, actions, (str(lease.path), lease.recovery_id), starting_turn_id, grants,
+        scope, actions, (str(lease.path), lease.recovery_id),
+        tested_head, scope.observed_head_sha, starting_turn_id, grants,
     )
 
 
@@ -9369,9 +9373,15 @@ def remint_repo_test_grants(event: Any, auth: AuthContext) -> ScopedPRGrants | N
         state is None or state.action_scope is not scope
         or completion.repository != scope.canonical_repo
         or completion.pull_request != scope.pr_number
-        or completion.head != scope.observed_head_sha
+        # Forge authority and the tested local commit are separate identities:
+        # a remediation may have merged main or committed without pushing yet.
+        or scope.observed_head_sha != binding.observed_head_sha
+        or completion.head != binding.tested_head
         or state.git_expected_head != completion.head
     ):
+        return None
+    lease = state.checkout_lease
+    if lease is None or (str(lease.path), lease.recovery_id) != binding.lease_identity:
         return None
     old = event.continuation_auth_context.scoped_pr_grants
     if old is not binding.queue_grants or old.principal != auth.canonical_principal:

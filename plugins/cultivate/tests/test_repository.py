@@ -2063,9 +2063,11 @@ async def test_repo_test_legs_share_timeout_budget(
 
 def _repo_test_lease_fixture(
     tmp_path, monkeypatch, *, command="/usr/bin/true", wrapper=True,
-    event_type="pr_changes_requested_stale",
+    event_type="pr_changes_requested_stale", advance_base=False,
 ):
-    _, _, _, state = _repo_scope_and_state(tmp_path, event_type=event_type)
+    _, _, _, state = _repo_scope_and_state(
+        tmp_path, event_type=event_type, advance_base=advance_base,
+    )
     root = state.checkout_lease.path
     (root / "tests").mkdir()
     (root / "tests/test_changed.py").write_text("def test_changed(): pass\n")
@@ -2522,6 +2524,8 @@ async def test_repo_test_completion_followup_push_gate(tmp_path, monkeypatch, ca
     "missing_completion", "tainted_preload", "restart", "shell", "discovered_scope",
     "wrong_carrier_type", "wrong_completion_type",
     "lease_metadata", "lease_metadata_symlink",
+    "local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge",
+    "changed_lease", "missing_lease_before_mint", "failed",
 ])
 async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     """Real mint -> queue -> route -> fresh mint -> enforced grant validation."""
@@ -2533,7 +2537,8 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     from mimir_cultivate.contained_execution import CollectedExecutionResult
     from unittest.mock import AsyncMock
 
-    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    local_merge = case in {"local_merge", "forge_moved_after_merge", "tested_head_after_merge"}
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch, advance_base=local_merge)
     scope = state.action_scope
     lease = state.checkout_lease
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
@@ -2558,6 +2563,18 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     auth.scoped_pr_grants.issue(scope)
     token = ac.consume_scoped_pr_checkout(auth, scope, "cultivate")
     assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    if local_merge:
+        # The fixture advanced main independently of the PR; merge only locally.
+        repository.RepoGitTools(state, auth_context=auth).execute(repository.GitMerge())
+        assert len(_git(lease.path, "rev-list", "--parents", "-n", "1", "HEAD").split()) == 3
+        assert state.git_expected_head != scope.observed_head_sha
+        assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) == scope.observed_head_sha
+    elif case == "local_commit":
+        (lease.path / "tracked.txt").write_text("local committed work\n")
+        repository.RepoGitTools(state, auth_context=auth).execute(
+            repository.GitCommit(("tracked.txt",), "local fix"),
+        )
+        assert state.git_expected_head != scope.observed_head_sha
     queue_grants = auth.scoped_pr_grants
     if case == "unheld_scope":
         # Same PR/head is insufficient: scope_id must also have been held.
@@ -2633,6 +2650,10 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         event = owner._dispatcher.enqueue.call_args.args[0]
         assert event.continuation_auth_context is None
     completion = event.extra["_repo_test_completion"]
+    if case in {"local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge"}:
+        assert completion.head == state.git_expected_head != scope.observed_head_sha
+        assert completion.binding.tested_head == completion.head
+        assert completion.binding.observed_head_sha == scope.observed_head_sha
     if case == "expired_after_queue":
         # Expiry after queueing is precisely why this completion needs renewal.
         queue_grants.expires_at = 0
@@ -2660,6 +2681,8 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         completion = replace(completion, evidence=False)
     elif case == "interrupted":
         completion = replace(completion, status="interrupted")
+    elif case == "failed":
+        completion = replace(completion, status="failed")
     elif case == "missing_binding":
         completion = replace(completion, binding=None)
     elif case == "result_repository":
@@ -2672,6 +2695,25 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         object.__setattr__(scope, "observed_head_sha", "b" * 40)
     elif case == "local_head":
         object.__setattr__(state, "git_expected_head", "b" * 40)
+    elif case == "forge_moved_after_merge":
+        # The completed job still has evidence; the forge observation advances
+        # while it waits for its continuation turn.
+        moved = _git(
+            lease.path, "-c", "user.name=test", "-c", "user.email=test@example.com",
+            "commit-tree", "HEAD^{tree}", "-p", scope.observed_head_sha, "-m", "someone else pushed",
+        )
+        _git(lease.path, "push", "origin", f"{moved}:{scope.destination_ref}")
+        object.__setattr__(scope, "observed_head_sha", moved)
+    elif case == "tested_head_after_merge":
+        # Changing both the completion and mutable local state must not bypass
+        # the immutable queue-time tested-head binding.
+        completion = replace(completion, head="b" * 40)
+        object.__setattr__(state, "git_expected_head", completion.head)
+    elif case == "changed_lease":
+        object.__setattr__(lease, "recovery_id", "different-lease")
+    elif case == "missing_lease_before_mint":
+        # Isolate the missing-lease guard from the independent local-head guard.
+        object.__setattr__(state, "checkout_lease", None)
     elif case in {"superseded_scope", "discovered_scope"}:
         replacement_state = RepoReviewState(replace(scope, event_type="pr_synchronize"))
         object.__setattr__(replacement_state, "git_expected_head", scope.observed_head_sha)
@@ -2727,7 +2769,9 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         event, None, policy_version=None, enforce=True,
         ifc_labels=labels, policy=policy,
     )
-    has_grant = case in {"green", "reduced_actions", "expired_after_queue"} or case.startswith("lease_")
+    has_grant = case in {
+        "green", "reduced_actions", "expired_after_queue", "local_merge", "local_commit",
+    } or case.startswith("lease_")
     if not has_grant:
         # Isolate mint admission from the independent ingress IFC classifier:
         # HTTP/channel violations must refuse even with clean supplied labels.
