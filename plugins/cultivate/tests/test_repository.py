@@ -227,35 +227,197 @@ def test_prior_turn_draft_artifact_round_trip_and_next_mutation(tmp_path, monkey
     _git(resumed.path, "bundle", "verify", str(artifact / "history.bundle"))
 
 
-@pytest.mark.parametrize("blocker", ["live", "stale_head", "identity", "event_failure"])
-def test_prior_turn_draft_disposition_refuses_before_reset(tmp_path, monkeypatch, blocker):
+@pytest.fixture
+def draft_disposal(tmp_path, monkeypatch):
+    """Real Git/archive control, observed at the destructive boundary itself.
+
+    Calling acquire/recover here would let their later identity checks hide a
+    missing disposal guard. Every negative case shares this successful setup.
+    """
     from mimir_cultivate import scheduler
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setattr(repository, "_lease_turn_id", lambda: "old")
     _, source, scope, state = _repo_scope_and_state(tmp_path)
     lease = state.checkout_lease
-    (lease.path / "tracked.txt").write_text("must survive\n")
-    before = (lease.path / repository._METADATA).read_bytes()
+    (lease.path / "tracked.txt").write_bytes(b"staged\x00draft\n")
+    _git(lease.path, "add", "tracked.txt")
+    (lease.path / "tracked.txt").write_bytes(b"unstaged\x00draft\n")
+    (lease.path / "untracked.txt").write_bytes(b"untracked\x00draft\n")
     monkeypatch.setattr(repository, "_lease_turn_id", lambda: "new")
+    monkeypatch.setattr(scheduler, "active_pr_checkout_lease_paths", lambda: set())
+    events, commands, archives, notices = [], [], [], []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda kind, **kw: events.append(kind))
+    real_archive = repository._archive_prior_turn_draft
+
+    def archive(candidate, runner):
+        artifact = real_archive(candidate, runner)
+        archives.append(artifact)
+        return artifact
+
+    monkeypatch.setattr(repository, "_archive_prior_turn_draft", archive)
+
+    def runner(args):
+        commands.append(tuple(args[3:]))
+        return subprocess.run(args, capture_output=True, text=True, env=_fixture_git_env())
+
+    def snapshot():
+        return (
+            _git(lease.path, "rev-parse", "HEAD"),
+            _git(lease.path, "write-tree"),
+            _git(lease.path, "status", "--porcelain=v1", "--untracked-files=all"),
+            (lease.path / "tracked.txt").read_bytes(),
+            (lease.path / "untracked.txt").read_bytes(),
+            (lease.path / repository._METADATA).read_bytes(),
+        )
+
+    return SimpleNamespace(
+        lease=lease, scope=scope, source=source, runner=runner,
+        archive=archive, archives=archives, events=events,
+        commands=commands, notices=notices, snapshot=snapshot,
+    )
+
+
+def test_prior_turn_draft_disposal_success_control(draft_disposal):
+    case = draft_disposal
+    repository._dispose_prior_turn_draft(case.lease, case.scope, case.runner, case.notices)
+    assert len(case.archives) == 1
+    assert case.events == [
+        "pr_checkout_prior_turn_draft_archived", "pr_checkout_prior_turn_draft_disposed",
+    ]
+    assert ("reset", "--hard", case.scope.observed_head_sha) in case.commands
+    assert ("clean", "-fd") in case.commands
+    assert _git(case.lease.path, "status", "--porcelain=v1") == ""
+    notice, = case.notices
+    assert notice["artifact"] == str(case.archives[0])
+    assert notice["prior_turn_id"] == "old"
+
+
+@pytest.mark.parametrize("blocker", [
+    "live", "canonical_repo", "owner", "source_root", "destination_ref",
+    "canonical_origin", "origin", "branch", "stale_head", "merge", "rebase",
+])
+def test_prior_turn_draft_disposition_refuses_before_reset(draft_disposal, monkeypatch, blocker):
+    from mimir_cultivate import scheduler
+
+    case = draft_disposal
+    lease = case.lease
+    expected_type = RuntimeError
+    expected_message = "^prior-turn draft checkout identity mismatch$"
     if blocker == "live":
         monkeypatch.setattr(scheduler, "active_pr_checkout_lease_paths", lambda: {lease.path})
-    elif blocker == "stale_head":
-        (source / "tracked.txt").write_text("new remote\n")
-        _git(source, "commit", "-am", "remote advanced")
-        _git(source, "push", "origin", "HEAD:worklink/7")
-    elif blocker == "identity":
+        expected_type = repository.DirtyPRCheckoutLeaseRefusal
+    elif blocker in {"canonical_repo", "owner", "source_root", "destination_ref", "canonical_origin"}:
+        replacements = {
+            "canonical_repo": "other/repo", "owner": "other-owner",
+            "source_root": lease.path, "destination_ref": "refs/heads/other",
+            "canonical_origin": str(case.source),
+        }
+        lease = replace(lease, **{blocker: replacements[blocker]})
+    elif blocker == "origin":
+        # A reachable repository containing the scoped branch: without D3 this
+        # must not fail later merely because fetch has no usable remote.
+        _git(lease.path, "remote", "set-url", "origin", str(case.source))
+    elif blocker == "branch":
         _git(lease.path, "checkout", "-b", "unrelated")
+    elif blocker == "stale_head":
+        (case.source / "tracked.txt").write_text("new remote\n")
+        _git(case.source, "commit", "-am", "remote advanced")
+        _git(case.source, "push", "origin", "HEAD:worklink/7")
+        expected_message = "^prior-turn draft scoped head is stale$"
     else:
-        def broken_event(*_a, **_kw):
-            raise RuntimeError("event unavailable")
-        monkeypatch.setattr("mimir.event_logger.log_event_sync", broken_event)
-    with pytest.raises(RuntimeError):
-        repository.acquire_pr_checkout_lease(
-            scope, owner=scope.principal, lease_root=lease.lease_root,
-        )
-    assert (lease.path / "tracked.txt").read_text() == "must survive\n"
-    assert (lease.path / repository._METADATA).read_bytes() == before
+        git_dir = lease.path / ".git"
+        if blocker == "merge":
+            (git_dir / "MERGE_HEAD").write_text(case.scope.observed_base_sha + "\n")
+        else:
+            directory = git_dir / "rebase-merge"
+            directory.mkdir()
+            (directory / "head-name").write_text(f"refs/heads/{case.scope.head_ref}\n")
+            (directory / "orig-head").write_text(case.scope.observed_head_sha + "\n")
+        operation = repository.interrupted_pr_checkout(lease, case.scope, runner=case.runner)
+        assert operation.kind == blocker  # valid, attributable operation, not malformed metadata
+        expected_type = repository.DirtyPRCheckoutLeaseRefusal
+    if expected_type is repository.DirtyPRCheckoutLeaseRefusal:
+        expected_message = "dirty lease from prior turn"
+    before = case.snapshot()
+    with pytest.raises(expected_type, match=expected_message) as caught:
+        repository._dispose_prior_turn_draft(lease, case.scope, case.runner, case.notices)
+    assert type(caught.value) is expected_type
+    assert caught.value.__cause__ is None  # not an archival error masking the missing guard
+    assert case.archives == []
+    assert case.events == []
+    assert case.notices == []
+    assert not any(command[0] in {"reset", "clean"} for command in case.commands)
+    assert case.snapshot() == before
+
+
+@pytest.mark.parametrize("corruption", ["manifest", "lease_path", "prior_turn_id"])
+def test_prior_turn_draft_artifact_identity_checked_before_reset(draft_disposal, monkeypatch, corruption):
+    case = draft_disposal
+
+    def corrupt_archive(lease, runner):
+        artifact = case.archive(lease, runner)
+        if corruption == "manifest":
+            manifest = artifact / "complete.json"
+            names = json.loads(manifest.read_text())
+            manifest.write_text(json.dumps([name for name in names if name != "history.bundle"]))
+        else:
+            metadata = artifact / "metadata.json"
+            values = json.loads(metadata.read_text())
+            values[corruption] = "different-identity"
+            metadata.write_text(json.dumps(values))
+        return artifact
+
+    monkeypatch.setattr(repository, "_archive_prior_turn_draft", corrupt_archive)
+    before = case.snapshot()
+    with pytest.raises(repository.DirtyPRCheckoutLeaseRefusal) as caught:
+        repository._dispose_prior_turn_draft(case.lease, case.scope, case.runner, case.notices)
+    expected = "draft artifact is incomplete" if corruption == "manifest" else "draft artifact identity mismatch"
+    assert type(caught.value.__cause__) is RuntimeError
+    assert str(caught.value.__cause__) == expected
+    assert len(case.archives) == 1
+    assert case.events == []
+    assert case.notices == []
+    assert not any(command[0] in {"reset", "clean"} for command in case.commands)
+    assert case.snapshot() == before
+
+
+def test_prior_turn_draft_disposal_requires_clean_status(draft_disposal):
+    case = draft_disposal
+
+    def ineffective_cleanup(args):
+        if args[3] in {"reset", "clean"}:
+            case.commands.append(tuple(args[3:]))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return case.runner(args)
+
+    before = case.snapshot()
+    with pytest.raises(RuntimeError, match="^archived prior-turn draft lease is not clean$"):
+        repository._dispose_prior_turn_draft(case.lease, case.scope, ineffective_cleanup, case.notices)
+    assert len(case.archives) == 1
+    assert ("reset", "--hard", case.scope.observed_head_sha) in case.commands
+    assert ("clean", "-fd") in case.commands
+    assert case.events == ["pr_checkout_prior_turn_draft_archived"]
+    assert case.notices == []
+    assert case.snapshot() == before
+
+
+def test_prior_turn_draft_archival_event_failure_cannot_reset(draft_disposal, monkeypatch):
+    case = draft_disposal
+
+    def broken_event(kind, **_kw):
+        case.events.append(kind)
+        raise RuntimeError("event unavailable")
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", broken_event)
+    before = case.snapshot()
+    with pytest.raises(RuntimeError, match="^event unavailable$"):
+        repository._dispose_prior_turn_draft(case.lease, case.scope, case.runner, case.notices)
+    assert len(case.archives) == 1
+    assert case.events == ["pr_checkout_prior_turn_draft_archived"]
+    assert case.notices == []
+    assert not any(command[0] in {"reset", "clean"} for command in case.commands)
+    assert case.snapshot() == before
 
 
 @pytest.mark.parametrize("pre_turn", [False, True])
