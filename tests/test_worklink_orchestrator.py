@@ -4884,8 +4884,16 @@ def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -
     assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
 
 
-@pytest.mark.parametrize("timed_out", [False, True])
-def test_gate_timeout_blocks_instead_of_retrying(tmp_path: Path, timed_out: bool) -> None:
+@pytest.mark.parametrize("timeout_kind", ["none", "run", "lease"])
+def test_gate_timeout_blocks_instead_of_retrying(tmp_path: Path, monkeypatch, timeout_kind: str) -> None:
+    timed_out = timeout_kind != "none"
+    if timeout_kind == "lease":
+        from mimir_cultivate.worklink import evidence
+
+        async def lease_expired(*args, **kwargs):
+            return ComputeResult(124, "", "lease wait expired", lease_wait_timed_out=True)
+
+        monkeypatch.setattr(evidence, "_run_gate_with_lease", lease_expired)
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     (tmp_path / "worklink.yaml").write_text(
@@ -4919,8 +4927,9 @@ def test_gate_timeout_blocks_instead_of_retrying(tmp_path: Path, timed_out: bool
     assert ["chainlink", "locks", "release", "441"] in calls
     assert not any(isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls)
     evidence = json.loads(result.evidence_path.read_text(encoding="utf-8"))
-    assert evidence["tests"]["timed_out"] is timed_out
-    reason = "gate_timed_out" if timed_out else "tests_failed"
+    assert evidence["tests"]["timed_out"] is (timeout_kind == "run")
+    assert evidence["tests"]["lease_wait_timed_out"] is (timeout_kind == "lease")
+    reason = {"run": "gate_timed_out", "lease": "gate_lease_wait_timeout", "none": "tests_failed"}[timeout_kind]
     assert any(
         isinstance(call, list) and call[:3] == ["chainlink", "issue", "comment"]
         and reason in call[-1] for call in calls

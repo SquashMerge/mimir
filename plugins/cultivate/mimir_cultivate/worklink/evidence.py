@@ -18,8 +18,9 @@ import shutil
 import signal
 import stat as stat_module
 import subprocess
+import sys
 import tempfile
-from typing import Callable, Iterator, Protocol, Sequence
+from typing import Awaitable, Callable, Iterator, Protocol, Sequence
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -90,6 +91,9 @@ class TestResult:
     stdout_bytes: int = 0
     stderr_bytes: int = 0
     environment_failure: str | None = None
+    lease_wait_timed_out: bool = False
+    lease_wait_s: float = 0.0
+    run_duration_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -223,6 +227,12 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
     elif evidence.tests.skipped_reason is not None:
         # A recorded skip explains the missing gate; it does not pass it.
         tests_ok = False
+    elif evidence.tests.lease_wait_timed_out:
+        reasons.append("gate_lease_wait_timeout")
+        if status == "completed":
+            status = "failed"
+        if not evidence.failure_reason:
+            evidence = replace(evidence, failure_reason="test gate heavy lease wait timed out (infrastructure)")
     elif evidence.tests.timed_out:
         # A gate budget/configuration fault, not a failing assertion to repair.
         reasons.append("gate_timed_out")
@@ -852,22 +862,28 @@ async def _observe_evidence_from_ref(
                         stderr=result.stderr,
                     )
                 else:
-                    observed_command = _command_with_pytest_report(command, report_dir)
                     timeout_s = work_spec.timeout_s if work_spec is not None else 1800
-                    try:
-                        test = await asyncio.to_thread(
-                            runner, observed_command, cwd=checkout, timeout=timeout_s,
-                        )
-                    except subprocess.TimeoutExpired as exc:
-                        timed_out = True
-                        # TimeoutExpired may carry bytes even with text=True.
-                        stdout = exc.stdout or ""
-                        stderr = exc.stderr or ""
-                        test = subprocess.CompletedProcess(
-                            observed_command, 124,
-                            stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout,
-                            stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr,
-                        )
+                    async def run_local(leg: str, budget: float) -> ComputeResult:
+                        observed_command = _command_with_pytest_report(leg, report_dir)
+                        try:
+                            observed = await asyncio.to_thread(
+                                runner, observed_command, cwd=checkout, timeout=budget,
+                            )
+                            return ComputeResult(observed.returncode, observed.stdout, observed.stderr)
+                        except subprocess.TimeoutExpired as exc:
+                            # TimeoutExpired may carry bytes even with text=True.
+                            stdout, stderr = exc.stdout or "", exc.stderr or ""
+                            return ComputeResult(
+                                124,
+                                stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout,
+                                stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr,
+                                timed_out=True,
+                            )
+                    result = await _run_gate_with_lease(command, timeout_s, run_local)
+                    timed_out = result.timed_out
+                    test = subprocess.CompletedProcess(
+                        command, result.exit_code, result.stdout, result.stderr,
+                    )
                 structured = read_pytest_result(command, report_dir)
                 commands.append(CommandResult(redact_text(command), test.returncode, redact_text(_summarize(test))))
                 observation = replace(
@@ -881,6 +897,9 @@ async def _observe_evidence_from_ref(
                     output_truncated=result.output_truncated if result is not None else False,
                     stdout_bytes=result.stdout_bytes if result is not None else 0,
                     stderr_bytes=result.stderr_bytes if result is not None else 0,
+                    lease_wait_timed_out=result.lease_wait_timed_out if result is not None else False,
+                    lease_wait_s=result.lease_wait_s if result is not None else 0.0,
+                    run_duration_s=result.run_duration_s if result is not None else 0.0,
                 )
                 if test.returncode != 0 or timed_out or phase == "rerun":
                     try:
@@ -1028,7 +1047,216 @@ async def _observe_evidence_from_ref(
     return validate_evidence(evidence)
 
 
+def _gate_lease_legs(command: str) -> tuple[str, ...]:
+    """Recognize standalone heavy-run legs, not arbitrary shell programs.
+
+    Only a literal argv AND-list can be moved across the containment boundary:
+    shell expansion, redirections and stateful shell commands must retain their
+    original single-shell semantics and deadline. Quoting is preserved by shlex.
+    """
+    legs: list[list[str]] = [[]]
+    # Keep quotes until AFTER recognizing operators. A quoted '&&' is an
+    # argument, not permission to split a command into independent workers.
+    word = re.compile(r"""[ \t]+|&&|(?:[^\s;&|<>()'"\\$`*?\[#~]+|'[^']*'|"[^"$`\\]*")+""")
+    offset = 0
+    while offset < len(command):
+        match = word.match(command, offset)
+        if match is None:
+            return ()
+        raw = match[0]
+        offset = match.end()
+        if raw.isspace():
+            continue
+        if raw == "&&":
+            legs.append([])
+        else:
+            legs[-1].append(shlex.split(raw)[0])
+    if not all(
+        len(leg) > 2 and leg[0] in {"sh", "/bin/sh"}
+        and leg[1] in {"scripts/heavy_run.sh", "./scripts/heavy_run.sh"}
+        for leg in legs
+    ):
+        return ()
+    return tuple(shlex.join(["env", "MIMIR_HEAVY_LOCK_HELD=1", *leg[2:]]) for leg in legs)
+
+
+# This child is NOT the gate. Only the controller-owned helper can write its
+# stdout; the worker never inherits this pipe or supplies timing telemetry.
+_GATE_LEASE_READY = "import sys; sys.stdout.write('ready\\n'); sys.stdout.flush(); sys.stdin.buffer.read()"
+_GATE_LEASE_TERM_GRACE_S = 10.0
+_GATE_LEASE_KILL_GRACE_S = 5.0
+
+
+class _GateLeaseWaitTimeout(TimeoutError):
+    pass
+
+
+@contextlib.asynccontextmanager
+async def _gate_heavy_lease(
+    environment: dict[str, str],
+    on_launch: Callable[[LaunchHandle], None] | None = None,
+):
+    try:
+        from mimir.heavy_run import helper_path
+
+        helper = helper_path()
+    except (OSError, ModuleNotFoundError):
+        # Fixed, path-free diagnostic; no subprocess or FIFO ticket exists yet.
+        raise ComputeLaunchError("gate lease packaged helper unavailable") from None
+    # Use the unchanged protocol helper directly. Its shell wrapper's timeout
+    # covers queue + run; here the controller owns the two independent budgets.
+    launch = asyncio.create_task(asyncio.create_subprocess_exec(
+        sys.executable, "-I", str(helper), sys.executable, "-I", "-c", _GATE_LEASE_READY,
+        env={"PATH": os.defpath, **environment},
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
+    ))
+    interrupted = False
+    while True:
+        try:
+            process = await asyncio.shield(launch)
+            break
+        except asyncio.CancelledError:
+            interrupted = True
+    try:
+        if interrupted:
+            raise asyncio.CancelledError
+        if on_launch is not None:
+            from .run_state import process_start_ticks
+
+            # Queued helpers must be stoppable through the same durable handle
+            # path as executing gates. The actual worker supersedes this handle
+            # when launched; the next leg publishes its own queued helper.
+            on_launch(LaunchHandle(
+                "local_subprocess", str(process.pid), process_start_ticks(process.pid),
+            ))
+        assert process.stdout is not None
+        try:
+            ready = await asyncio.wait_for(
+                process.stdout.readline(), float(environment.get("MIMIR_HEAVY_LOCK_TIMEOUT", "7200")),
+            )
+        except TimeoutError as exc:
+            raise _GateLeaseWaitTimeout from exc
+        if ready != b"ready\n":
+            # Retirement below owns all waits, including a malformed live helper.
+            raise ComputeLaunchError(f"gate lease helper failed (exit {process.returncode})")
+        yield
+    finally:
+        # Let the private readiness child exit even if its helper cannot forward
+        # signals. TERM normally releases tickets; KILL leaves stale recovery to
+        # the unchanged heavy-run protocol. Neither wait may be unbounded.
+        if process.stdin is not None:
+            process.stdin.close()
+
+        def signal_group(signum: int) -> None:
+            try:
+                os.killpg(process.pid, signum)
+            except ProcessLookupError:
+                pass
+
+        async def retire() -> None:
+            waiter = asyncio.create_task(process.wait())
+            try:
+                if process.returncode is None:
+                    signal_group(signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(asyncio.shield(waiter), _GATE_LEASE_TERM_GRACE_S)
+                    return
+                except TimeoutError:
+                    signal_group(signal.SIGKILL)
+                try:
+                    await asyncio.wait_for(asyncio.shield(waiter), _GATE_LEASE_KILL_GRACE_S)
+                except TimeoutError:
+                    raise ComputeLaunchError("gate lease helper retirement timed out") from None
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+
+        retired = asyncio.create_task(retire())
+        try:
+            while True:
+                try:
+                    await asyncio.shield(retired)
+                    break
+                except asyncio.CancelledError:
+                    # Repeated cancellation cannot reset retirement's deadlines.
+                    interrupted = True
+        finally:
+            if interrupted:
+                raise asyncio.CancelledError
+
+
 async def _run_compute_gate(
+    command: str,
+    *,
+    checkout: Path,
+    work_spec: WorkSpec,
+    compute: ComputeBackend,
+    on_launch: Callable[[LaunchHandle], None] | None = None,
+    report_dir: Path | None = None,
+    diagnostic: bool = False,
+) -> ComputeResult:
+    async def run_command(leg: str, budget: float) -> ComputeResult:
+        return await _run_compute_gate_command(
+            leg, checkout=checkout, work_spec=replace(work_spec, timeout_s=budget),
+            compute=compute, on_launch=on_launch, report_dir=report_dir, diagnostic=diagnostic,
+        )
+
+    if diagnostic:
+        return await run_command(command, work_spec.timeout_s)
+    return await _run_gate_with_lease(command, work_spec.timeout_s, run_command, on_launch=on_launch)
+
+
+async def _run_gate_with_lease(
+    command: str, timeout_s: float,
+    run_command: Callable[[str, float], Awaitable[ComputeResult]],
+    *,
+    on_launch: Callable[[LaunchHandle], None] | None = None,
+) -> ComputeResult:
+    from .compute import _heavy_lock_environment
+
+    environment = _heavy_lock_environment()
+    legs = _gate_lease_legs(command) if environment else ()
+    if not legs:
+        return await run_command(command, timeout_s)
+    loop = asyncio.get_running_loop()
+    queue_s = run_s = 0.0
+    stdout: list[str] = []
+    stderr: list[str] = []
+    stdout_bytes = stderr_bytes = 0
+    truncated = False
+    result = ComputeResult(0, "", "")
+    for leg in legs:
+        queued = loop.time()
+        try:
+            async with _gate_heavy_lease(environment, on_launch=on_launch):
+                queue_s += loop.time() - queued
+                started = loop.time()
+                result = await run_command(leg, max(0.001, timeout_s - run_s))
+                run_s += loop.time() - started
+        except _GateLeaseWaitTimeout:
+            queue_s += loop.time() - queued
+            result = ComputeResult(124, "", "gate heavy lease wait timed out", lease_wait_timed_out=True)
+        stdout.append(result.stdout)
+        stderr.append(result.stderr)
+        stdout_bytes += result.stdout_bytes
+        stderr_bytes += result.stderr_bytes
+        truncated |= result.output_truncated
+        if result.exit_code != 0 or result.timed_out or result.lease_wait_timed_out:
+            break
+        if run_s >= timeout_s:
+            result = replace(result, timed_out=True)
+            break
+    return replace(
+        result, stdout="".join(stdout), stderr="".join(stderr),
+        stdout_bytes=stdout_bytes, stderr_bytes=stderr_bytes, output_truncated=truncated,
+        lease_wait_s=queue_s, run_duration_s=run_s,
+    )
+
+
+async def _run_compute_gate_command(
     command: str,
     *,
     checkout: Path,

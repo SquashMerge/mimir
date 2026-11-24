@@ -21,6 +21,8 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
+import tarfile
 import tomllib
 from pathlib import Path
 from zipfile import ZipFile
@@ -201,6 +203,67 @@ def _force_include() -> dict:
     return (
         cfg["tool"]["hatch"]["build"]["targets"]["wheel"].get("force-include", {})
     )
+
+
+def test_wheel_excludes_preserve_every_shared_build_exclusion() -> None:
+    build = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["hatch"]["build"]
+    assert set(build["exclude"]) <= set(build["targets"]["wheel"]["exclude"])
+
+
+def test_heavy_helper_has_one_packaged_location() -> None:
+    assert _force_include()["scripts/heavy_run.py"] == "mimir/heavy_run/heavy_run.py"
+    assert _sdist_force_include()["scripts/heavy_run.py"] == "scripts/heavy_run.py"
+    build = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["hatch"]["build"]
+    wheel_excludes = build["targets"]["wheel"]["exclude"]
+    assert "mimir/heavy_run/heavy_run.py" in wheel_excludes
+    # The editable/source layout mirrors the force-included bytes. Keep the
+    # protocol unchanged and prevent checkout-only tests from hiding drift.
+    assert (REPO_ROOT / "mimir/heavy_run/heavy_run.py").read_bytes() == (
+        REPO_ROOT / "scripts/heavy_run.py"
+    ).read_bytes()
+
+
+def test_heavy_helper_resolves_and_runs_from_wheel_built_from_sdist(tmp_path: Path) -> None:
+    dist = tmp_path / "dist"
+    result = subprocess.run(
+        ["uv", "build", "--package", "mimir-agent", "--out-dir", str(dist)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        env=isolated_uv_env(tmp_path), timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    sdist, = dist.glob("*.tar.gz")
+    with tarfile.open(sdist) as archive:
+        member, = (name for name in archive.getnames() if name.endswith("/scripts/heavy_run.py"))
+        assert archive.extractfile(member).read() == (REPO_ROOT / "scripts/heavy_run.py").read_bytes()
+    wheel, = dist.glob("*.whl")
+    installed = tmp_path / "site-packages"
+    with ZipFile(wheel) as archive:
+        assert archive.namelist().count("mimir/heavy_run/heavy_run.py") == 1
+        assert archive.read("mimir/heavy_run/heavy_run.py") == (REPO_ROOT / "scripts/heavy_run.py").read_bytes()
+        archive.extractall(installed)
+    probe = """
+import pathlib, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+from mimir.heavy_run import helper_path
+helper = helper_path()
+assert helper == pathlib.Path(sys.argv[1]) / 'mimir/heavy_run/heavy_run.py'
+result = subprocess.run(
+    [sys.executable, '-I', str(helper), sys.executable, '-I', '-c',
+     "import os; assert os.environ['MIMIR_HEAVY_LOCK_HELD'] == '1'; print('installed')"],
+    env={'MIMIR_HEAVY_LOCK_FILE': sys.argv[2], 'MIMIR_HEAVY_LOCK_TIMEOUT': '5'},
+    capture_output=True, text=True, timeout=10,
+)
+assert result.returncode == 0, result.stderr
+assert result.stdout == 'installed\\n', result.stdout
+assert not pathlib.Path(sys.argv[2] + '.lease').exists()
+assert not pathlib.Path(sys.argv[2] + '.lease2').exists()
+assert not list(pathlib.Path(sys.argv[2] + '.queue').iterdir())
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", probe, str(installed), str(tmp_path / "heavy")],
+        cwd=tmp_path, capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_docs_force_included_into_wheel() -> None:
