@@ -1128,7 +1128,8 @@ async def test_late_background_output_is_discarded_between_calls(tmp_path: Path)
             " while not pathlib.Path('release').exists(): time.sleep(.01)\n"
             " print('late',flush=True)\n"
             " discarded = os.fstat(1).st_rdev == os.stat(os.devnull).st_rdev\n"
-            " pathlib.Path('emitted').write_text(str(discarded))\n"
+            " pathlib.Path('emitted.tmp').write_text(str(discarded))\n"
+            " os.replace('emitted.tmp', 'emitted')\n"
             "threading.Thread(target=late,daemon=True).start()",
         )
         assert first["stdout"] == ""
@@ -1136,7 +1137,7 @@ async def test_late_background_output_is_discarded_between_calls(tmp_path: Path)
         while not (tmp_path / "emitted").exists():
             await asyncio.sleep(0)
         # Readiness follows the actual write, while no execution owns stdout.
-        while not (destination := (tmp_path / "emitted").read_text()):
+        while (destination := (tmp_path / "emitted").read_text()) not in {"True", "False"}:
             await asyncio.sleep(0)
         assert destination == "True"
         second = await manager.execute("one", tmp_path, "print('current')")
