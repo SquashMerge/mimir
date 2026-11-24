@@ -26,7 +26,7 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2189-2193-npm-provenance-archival-integration"
+GITHUB_POLLER_RELEASE = "2213-remediation-clean-turn-guidance"
 CI_WATCH_RELEASE = "2189-2193-npm-provenance-archival-integration"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.

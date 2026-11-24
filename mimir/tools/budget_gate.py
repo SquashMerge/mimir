@@ -2577,7 +2577,7 @@ def _admin_denial_message(
     # argv-binding path, which is the same refusal seen at a different gate.
     if reason == "write_blocked_by_untrusted_ingest":
         from ..access_control import _TAINTED_WRITE_REFUSAL
-        return _TAINTED_WRITE_REFUSAL
+        return detail or _TAINTED_WRITE_REFUSAL
     reason_text = f" ({reason})" if reason else ""
     if detail:
         return f"{tool_name} was refused before execution{reason_text}: {detail}"
