@@ -465,6 +465,214 @@ def test_conflicted_operation_inspect_abort_same_trusted_turn(tmp_path, monkeypa
     assert invoke("repo_status").status == "success"
 
 
+_MERGE_INSPECTION_TOOLS = ("repo_diff", "pr_files", "pr_file_content", "repo_fetch")
+
+
+def _merge_inspection_args(tool):
+    return {"path": "tracked.txt"} if tool == "pr_file_content" else {}
+
+
+@pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
+@pytest.mark.parametrize("enforce", [False, True], ids=["shadow", "enforced"])
+@pytest.mark.parametrize("tool,extra", [
+    ("repo_diff", {"mode": "working"}),
+    ("repo_diff", {"mode": "staged"}),
+    ("repo_diff", {"mode": "base"}),
+    ("pr_files", {}),
+    ("pr_file_content", {"path": "tracked.txt"}),
+    ("repo_fetch", {}),
+])
+def test_interrupted_merge_inspection_preserves_conflict_and_provenance(
+    tmp_path, monkeypatch, discovered, enforce, tool, extra,
+):
+    from mimir_cultivate import forge
+
+    _, scope, state, auth, invoke = _remediation_turn(
+        tmp_path, monkeypatch, conflicting=True, discovered=discovered, enforce=enforce,
+        pull_request_author="mimir-bot",
+    )
+    lease = state.checkout_lease
+    calls = []
+
+    def list_files(bound):
+        assert bound is scope
+        calls.append("files")
+        patch = _git(lease.path, "diff", f"{bound.observed_base_sha}...{bound.observed_head_sha}",
+                     "--", "tracked.txt")
+        return (forge.FileProjection("tracked.txt", "modified", 1, 1, 2, patch),)
+
+    def file_content(bound, path):
+        assert bound is scope and path == "tracked.txt"
+        calls.append("content")
+        return _git(lease.path, "show", f"{bound.observed_head_sha}:{path}") + "\n"
+
+    client = SimpleNamespace(
+        get_pull_request_identity=lambda *_: NormalizedPullRequestSnapshot(
+            repo=scope.canonical_repo, number=scope.pr_number, state="open",
+            author=scope.pull_request_author, head_repo=scope.head_repo,
+            head_remote=scope.head_remote, head_ref=scope.head_ref,
+            head_sha=scope.observed_head_sha, base_ref=scope.base_ref,
+            base_sha=scope.observed_base_sha,
+        ),
+        list_files=list_files, get_file_content=file_content,
+    )
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
+    monkeypatch.setattr(forge, "_github_origin_matches", lambda _: True)
+    conflict = invoke("repo_merge")
+    assert conflict.status == "error" and "tracked.txt" in conflict.content
+    assert state.interrupted_operation.kind == "merge"
+
+    def conflict_state():
+        return (
+            _git(lease.path, "symbolic-ref", "HEAD"),
+            _git(lease.path, "rev-parse", "HEAD"),
+            (lease.path / ".git/MERGE_HEAD").read_bytes(),
+            (lease.path / ".git/ORIG_HEAD").read_bytes(),
+            (lease.path / ".git/index").read_bytes(),
+            (lease.path / "tracked.txt").read_bytes(),
+            _git(lease.path, "ls-files", "--unmerged"),
+        )
+
+    before = conflict_state()
+    assert before[-1] and b"<<<<<<<" in before[-2]
+    decision = _decision(auth, scope, tool, **extra)
+    assert decision.allowed and not decision.would_block, decision
+    result = invoke(tool, **extra)
+    assert result.status == "success", result.content
+    payload = json.loads(result.content)
+    if tool == "repo_diff":
+        assert payload["ok"]
+        assert "tracked.txt" in payload["stdout"]
+        if extra["mode"] == "working":
+            assert "<<<<<<<" in payload["stdout"] and "base property" in payload["stdout"]
+        elif extra["mode"] == "staged":
+            assert "Unmerged path" in payload["stdout"]
+        else:
+            assert "+pull request" in payload["stdout"]
+    elif tool == "pr_files":
+        assert calls == ["files"]
+        assert payload[0]["path"] == "tracked.txt"
+        assert "+pull request" in payload[0]["patch"]
+    elif tool == "pr_file_content":
+        assert calls == ["content"]
+        assert payload == "pull request\n"  # Immutable PR side, not local conflict markers.
+    else:
+        assert payload["ok"]
+        assert _git(lease.path, "rev-parse", "FETCH_HEAD") == lease.base_sha
+    assert conflict_state() == before
+    assert any(
+        source.domain == "repository"
+        and source.resource_id == f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}"
+        and source.integrity == "trusted" and source.integrity_effect == "active_ingest"
+        for source in auth.ifc_state.labels.sources
+    )
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    assert invoke("repo_merge_abort").status == "success"
+
+
+@pytest.mark.parametrize("tool", _MERGE_INSPECTION_TOOLS)
+def test_interrupted_merge_inspection_keeps_ordinary_action_grant(tmp_path, monkeypatch, tool):
+    from mimir_cultivate.policy import _valid_interrupted_operation
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_merge").status == "error"
+    action = RepoPRAction.CHECKOUT if tool == "repo_fetch" else RepoPRAction.INSPECT
+    object.__setattr__(scope, "allowed_operations", scope.allowed_operations - {action.value})
+    assert _valid_interrupted_operation(scope, state, tool, auth.scoped_pr_grants.nonce)
+    assert not _decision(auth, scope, tool).allowed
+    refused = invoke(tool, **_merge_inspection_args(tool))
+    assert refused.status == "error" and "refused before execution" in refused.content
+
+
+@pytest.mark.parametrize("tool", _MERGE_INSPECTION_TOOLS)
+@pytest.mark.parametrize("invalid", [
+    "no_evidence", "scope_id", "lease_identity", "turn_nonce", "merge_head", "orig_head", "head",
+])
+def test_interrupted_merge_inspection_requires_own_operation(tmp_path, monkeypatch, tool, invalid):
+    from mimir_cultivate.policy import _valid_interrupted_operation
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_merge").status == "error"
+    lease = state.checkout_lease
+    evidence = state.interrupted_operation
+    if invalid == "no_evidence":
+        object.__setattr__(state, "interrupted_operation", None)
+    elif invalid in {"scope_id", "lease_identity", "turn_nonce"}:
+        value = (str(lease.path), "other") if invalid == "lease_identity" else "other"
+        object.__setattr__(state, "interrupted_operation", replace(evidence, **{invalid: value}))
+    elif invalid in {"merge_head", "orig_head"}:
+        marker = "MERGE_HEAD" if invalid == "merge_head" else "ORIG_HEAD"
+        target = scope.observed_head_sha if invalid == "merge_head" else scope.observed_base_sha
+        (lease.path / ".git" / marker).write_text(target + "\n")
+    else:
+        _git(lease.path, "update-ref", scope.destination_ref, scope.observed_base_sha)
+    assert not _valid_interrupted_operation(scope, state, tool, auth.scoped_pr_grants.nonce)
+    assert not _decision(auth, scope, tool).allowed
+    refused = invoke(tool, **_merge_inspection_args(tool))
+    assert refused.status == "error" and "refused before execution" in refused.content
+
+
+@pytest.mark.parametrize("tool", _MERGE_INSPECTION_TOOLS)
+def test_interrupted_rebase_new_merge_inspection_deliberately_excluded(tmp_path, monkeypatch, tool):
+    from mimir_cultivate.policy import _valid_interrupted_operation
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_rebase").status == "error"
+    assert not _valid_interrupted_operation(scope, state, tool, auth.scoped_pr_grants.nonce)
+    assert not _decision(auth, scope, tool).allowed
+    refused = invoke(tool, **_merge_inspection_args(tool))
+    assert refused.status == "error" and "refused before execution" in refused.content
+    assert invoke("repo_rebase_abort").status == "success"
+
+
+def test_interrupted_merge_unlisted_tool_still_refused(tmp_path, monkeypatch):
+    from mimir_cultivate.policy import _valid_interrupted_operation
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_merge").status == "error"
+    assert not _valid_interrupted_operation(scope, state, "repo_push", auth.scoped_pr_grants.nonce)
+    assert not _decision(auth, scope, "repo_push").allowed
+    refused = invoke("repo_push")
+    assert refused.status == "error" and "refused before execution" in refused.content
+    assert invoke("repo_merge_abort").status == "success"
+
+
+@pytest.mark.parametrize("tool", ["repo_diff", "repo_fetch"])
+def test_interrupted_merge_inspection_does_not_launder_checkout_trust(tmp_path, monkeypatch, tool):
+    _, scope, _, auth, invoke = _remediation_turn(tmp_path, monkeypatch, conflicting=True)
+    assert invoke("repo_merge").status == "error"
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    result = invoke(tool)
+    assert result.status == "success", result.content
+    assert auth.ifc_state.has_untrusted_active_ingest()
+    assert not _decision(auth, scope, "repo_commit").allowed
+
+
+@pytest.mark.parametrize("tool", ["pr_files", "pr_file_content"])
+def test_interrupted_merge_inspection_does_not_bypass_forge_identity(tmp_path, monkeypatch, tool):
+    from mimir_cultivate import forge
+
+    _, scope, _, auth, invoke = _remediation_turn(
+        tmp_path, monkeypatch, conflicting=True, pull_request_author="mimir-bot",
+    )
+    assert invoke("repo_merge").status == "error"
+    calls = []
+    client = SimpleNamespace(
+        get_pull_request_identity=lambda *_: SimpleNamespace(
+            number=scope.pr_number, head_sha="f" * 40, author=scope.pull_request_author,
+        ),
+        list_files=lambda *_: calls.append("files"),
+        get_file_content=lambda *_: calls.append("content"),
+    )
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _: client)
+    monkeypatch.setattr(forge, "_github_origin_matches", lambda _: True)
+    result = invoke(tool, **_merge_inspection_args(tool))
+    assert result.status == "error" and "pr_head_sha_mismatch" in result.content
+    assert not calls
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    assert invoke("repo_merge_abort").status == "success"
+
+
 @pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
 @pytest.mark.parametrize("enforce", [False, True], ids=["shadow", "enforced"])
 @pytest.mark.parametrize("revision", ["base", "head", "ancestor"])
