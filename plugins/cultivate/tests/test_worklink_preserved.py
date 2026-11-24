@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -249,3 +250,225 @@ def test_retained_epic_attempt_preserves_its_factory_sandbox(rig, tmp_path: Path
     assert preserved is not None and preserved.error is None
     assert "factory_work.py" in preserved.files
     assert "factory_work.py" in _git(operator, "show", "--stat", "refs/worklink/9/2")
+
+
+def _periodic_rig(rig, monkeypatch):
+    from mimir_cultivate.worklink import autonomy
+
+    home, operator, _, checkout, _ = rig
+    events, comments = [], []
+    monkeypatch.setattr(autonomy, "_log_best_effort", lambda event, **kw: events.append((event, kw)))
+
+    def run(args):
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, '{"status":"closed"}', "")
+        if args[1:3] == ["issue", "comment"]:
+            comments.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return _run(args)
+
+    def cycle(*, closed=False):
+        autonomy._preserve_before_prune(
+            home, operator, checkout.parent, (), run=run,
+            defaults=SimpleNamespace(base_branch="main", preserved_attempts_keep=3),
+        )
+        if closed:
+            autonomy._prune_preserved_for_closed_issues(home, operator, run=run)
+
+    return cycle, events, comments
+
+
+def _lifecycle(home, attempt=1):
+    return json.loads((home / "state/worklink/preservation-state/7" / f"{attempt}.json").read_text())
+
+
+@pytest.mark.parametrize("object_type", ["commit", "tree"])
+def test_corrupt_retained_attempt_is_terminal_across_periodic_cycles(rig, monkeypatch, object_type):
+    home, _, _, checkout, _ = rig
+    _change_everything(checkout)
+    oid = _git(checkout, "rev-parse", f"HEAD^{{{object_type}}}")
+    (checkout / ".git/objects" / oid[:2] / oid[2:]).unlink()
+    cycle, events, comments = _periodic_rig(rig, monkeypatch)
+    capture = preserved_mod.ControllerGitPublication.capture
+    captures = []
+
+    def counted_capture(*args, **kwargs):
+        captures.append(1)
+        return capture(*args, **kwargs)
+
+    monkeypatch.setattr(preserved_mod.ControllerGitPublication, "capture", counted_capture)
+    cycle()
+    saved = _lifecycle(home)
+    assert saved["status"] == "unpreservable" and saved["failures"] == 1
+    assert saved["error"] and saved["ref"] is None
+    for _ in range(10):
+        cycle()
+    assert len(captures) == 1  # proves Git wasn't retried, not just reporting suppressed
+    assert _lifecycle(home) == saved
+    assert [event for event, _ in events] == ["worklink_attempt_preserved"]
+    assert len(comments) == 1 and 'status="unpreservable"' in comments[0]
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_closed_issue_pruning_is_durable_and_second_cycle_is_noop(rig, monkeypatch, corrupt):
+    home, operator, _, checkout, _ = rig
+    _change_everything(checkout)
+    if corrupt:
+        oid = _git(checkout, "rev-parse", "HEAD")
+        (checkout / ".git/objects" / oid[:2] / oid[2:]).unlink()
+    cycle, events, comments = _periodic_rig(rig, monkeypatch)
+    cycle(closed=True)
+    assert _lifecycle(home)["status"] == "pruned"
+    assert not list_preserved(home, 7)
+    assert not (home / "state/worklink/preserved/7/1.patch").exists()
+    assert not (home / "state/worklink/preserved/7/1.json").exists()
+    assert _git(operator, "for-each-ref", "refs/worklink") == ""
+    assert checkout.exists()  # no unsafe deletion of worker-owned checkouts
+    assert [event for event, _ in events] == ["worklink_attempt_preserved", "worklink_preserved_pruned"]
+    assert len(comments) == 2
+    before = list(events), list(comments)
+    for _ in range(10):
+        cycle(closed=True)
+    assert (events, comments) == before
+
+
+@pytest.mark.parametrize("error", [
+    subprocess.TimeoutExpired(["git"], 120),
+    preserved_mod.SafeGitError("could not initialize private Git index: index.lock: File exists"),
+    RuntimeError("temporarily unavailable"),
+], ids=["timeout", "lock", "unknown"])
+def test_transient_failure_retries_with_backoff_and_a_hard_bound(rig, monkeypatch, error):
+    home, _, _, _, _ = rig
+    clock = [1000.0]
+    monkeypatch.setattr(preserved_mod, "time", SimpleNamespace(time=lambda: clock[0]))
+    calls = []
+
+    def failing_checkout(*args, **kwargs):
+        calls.append(1)
+        raise error
+
+    monkeypatch.setattr(preserved_mod, "_checkout_git", failing_checkout)
+    cycle, events, comments = _periodic_rig(rig, monkeypatch)
+    cycle()
+    assert _lifecycle(home)["status"] == "retry_pending"
+    for retry in range(1, preserved_mod.MAX_PRESERVATION_ATTEMPTS):
+        due = clock[0] + preserved_mod.RETRY_BACKOFF_S * 2 ** (retry - 1)
+        assert _lifecycle(home)["retry_after"] == due
+        clock[0] = due - 1
+        cycle()
+        assert len(calls) == retry
+        clock[0] = due
+        cycle()
+        assert len(calls) == retry + 1
+    assert _lifecycle(home)["status"] == "unpreservable"
+    assert _lifecycle(home)["failures"] == preserved_mod.MAX_PRESERVATION_ATTEMPTS
+    assert len(comments) == 2  # pending -> exhausted, not one per retry
+    assert len(events) == 2
+    clock[0] += 10**9
+    for _ in range(10):
+        cycle()
+    assert len(calls) == preserved_mod.MAX_PRESERVATION_ATTEMPTS
+    assert len(comments) == len(events) == 2
+
+
+def test_transient_failure_can_recover_and_comments_only_on_change(rig, monkeypatch):
+    home, operator, _, checkout, _ = rig
+    _change_everything(checkout)
+    clock = [1000.0]
+    monkeypatch.setattr(preserved_mod, "time", SimpleNamespace(time=lambda: clock[0]))
+    capture = preserved_mod._checkout_git
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(["git"], 120)
+
+    monkeypatch.setattr(preserved_mod, "_checkout_git", timeout)
+    cycle, events, comments = _periodic_rig(rig, monkeypatch)
+    cycle()
+    assert prune_preserved(home, operator, 7, keep=3, runner=_run) == []
+    monkeypatch.setattr(preserved_mod, "_checkout_git", capture)
+    cycle()
+    assert len(comments) == 1
+    clock[0] += preserved_mod.RETRY_BACKOFF_S
+    cycle()
+    assert _lifecycle(home)["status"] == "preserved"
+    assert len(comments) == len(events) == 2
+    cycle()
+    assert len(comments) == len(events) == 2
+
+
+def test_factory_preservation_of_missing_checkout_reports_once(rig, monkeypatch):
+    from mimir_cultivate.worklink import orchestrator
+
+    home, operator, _, checkout, _ = rig
+    events, comments = [], []
+    monkeypatch.setattr(orchestrator, "_log_event", lambda event, **kw: events.append(event))
+    record = SimpleNamespace(sandbox=str(checkout / "gone"), branch="epic/7", issue_id=7, attempt=1)
+    claims = SimpleNamespace(_run=lambda *args: comments.append(args))
+    runner = lambda args, **_: _run(args)
+    worklink = orchestrator.WorklinkRunner(home=home, repo=operator, runner=runner)
+    for _ in range(10):
+        worklink._preserve_factory_attempt(claims, record, "failed", runner)
+    assert _lifecycle(home)["status"] == "unpreservable"
+    assert len(comments) == 1
+    assert events == ["worklink_attempt_preserved"]
+
+
+def test_legacy_failed_record_migrates_to_terminal_state(rig, monkeypatch):
+    home, _, _, checkout, _ = rig
+    directory = home / "state/worklink/preserved/7"
+    directory.mkdir(parents=True)
+    (directory / "1.json").write_text(json.dumps({"issue": 7, "attempt": 1, "error": "old failure"}))
+    oid = _git(checkout, "rev-parse", "HEAD")
+    (checkout / ".git/objects" / oid[:2] / oid[2:]).unlink()
+    cycle, events, comments = _periodic_rig(rig, monkeypatch)
+    cycle()
+    cycle()
+    assert _lifecycle(home)["status"] == "unpreservable"
+    assert len(events) == len(comments) == 1
+
+
+def test_prune_failure_does_not_claim_a_state_change(rig):
+    home, operator, _, checkout, _ = rig
+    _change_everything(checkout)
+    _preserve(home, operator, checkout)
+
+    def failing_run(args):
+        return subprocess.CompletedProcess(args, 1, "", "cannot lock ref")
+
+    with pytest.raises(RuntimeError, match="cannot lock ref"):
+        prune_preserved(home, operator, 7, keep=0, runner=failing_run)
+    assert _lifecycle(home)["status"] == "preserved"
+    assert len(list_preserved(home, 7)) == 1
+    assert prune_preserved(home, operator, 7, keep=0, runner=_run) == [1]
+    assert prune_preserved(home, operator, 7, keep=0, runner=_run) == []
+
+
+@pytest.mark.parametrize("payload", ["not json", "[]"])
+def test_unreadable_lifecycle_never_authorizes_another_snapshot(rig, monkeypatch, payload):
+    home, _, _, _, _ = rig
+    directory = home / "state/worklink/preservation-state/7"
+    directory.mkdir(parents=True)
+    (directory / "1.json").write_text(payload)
+    calls = []
+    monkeypatch.setattr(preserved_mod, "_checkout_git", lambda *a, **kw: calls.append(1))
+    cycle, events, comments = _periodic_rig(rig, monkeypatch)
+    cycle()
+    assert not calls and not events and not comments
+
+
+def test_dispatch_sweep_does_not_reselect_retention_pruned_attempt(rig, monkeypatch):
+    from mimir_cultivate.worklink import checkout as checkout_mod, orchestrator
+
+    home, operator, _, checkout, _ = rig
+    _change_everything(checkout)
+    monkeypatch.setattr(checkout_mod, "_attempt_roots", lambda *a: [(checkout.parent.parent, True)])
+    events, comments = [], []
+    monkeypatch.setattr(orchestrator, "_log_event", lambda event, **kw: events.append(event))
+    runner = lambda args, **_: _run(args)
+    comment = lambda *args: comments.append(args)
+    orchestrator._sweep_retained_attempts(home, operator, 7, 2, runner=runner, comment=comment)
+    assert len(comments) == 1
+    assert prune_preserved(home, operator, 7, keep=0, runner=_run) == [1]
+    for _ in range(10):
+        orchestrator._sweep_retained_attempts(home, operator, 7, 2, runner=runner, comment=comment)
+    assert len(comments) == 1 and events == ["worklink_attempt_preserved"]

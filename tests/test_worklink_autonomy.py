@@ -1471,9 +1471,20 @@ def test_prune_bad_observation_falls_back_to_checkout_mtime(
     )
 
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
-    assert events == [("worklink_attempt_retention_clock_fallback", {
+    assert events[:1] == [("worklink_attempt_retention_clock_fallback", {
         "issue_id": 841, "run_id": "chainlink-841",
     })]
+    # This fixture has no Git checkout. Missing checkouts now have a durable
+    # terminal preservation outcome rather than being silently skipped (#2214).
+    assert [name for name, _ in events] == [
+        "worklink_attempt_retention_clock_fallback", "worklink_attempt_preserved",
+    ]
+    assert events[1][1]["status"] == "unpreservable"
+    assert events[1][1]["failures"] == 1
+    assert events[1][1]["error"]
+    before = list(events)
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert events == before
 
 
 @pytest.mark.usefixtures("factory_process_ticks")

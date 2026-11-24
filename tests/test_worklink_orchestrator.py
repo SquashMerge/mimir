@@ -14723,22 +14723,27 @@ def test_crashed_attempt_is_swept_into_the_next_dispatch_prompt(
     assert any(text.startswith("WORKLINK_PRESERVED issue=441 attempt=1 ") for text in comments)
 
 
+@pytest.mark.parametrize("outcome", [
+    {"ref": "refs/worklink/441/1", "error": None},  # legacy successful record
+    {"ref": None, "error": "earlier", "status": "unpreservable"},
+], ids=["legacy-success", "terminal-failure"])
 def test_dispatch_sweep_never_re_preserves_a_recorded_attempt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome,
 ) -> None:
     import mimir_cultivate.worklink.preserved as preserved_mod
 
     repo, crashed, calls, runner = _crashed_attempt_rig(tmp_path, monkeypatch)
     record = tmp_path / "state" / "worklink" / "preserved" / "441" / "1.json"
     record.parent.mkdir(parents=True)
-    record.write_text(json.dumps({"issue": 441, "attempt": 1, "ref": None, "error": "earlier"}))
+    payload = {"issue": 441, "attempt": 1, **outcome}
+    record.write_text(json.dumps(payload))
     preserved_calls = []
-    real = preserved_mod.preserve_attempt
-    monkeypatch.setattr(preserved_mod, "preserve_attempt",
-                        lambda **kw: preserved_calls.append(kw["attempt"]) or real(**kw))
+    real = preserved_mod._checkout_git
+    monkeypatch.setattr(preserved_mod, "_checkout_git",
+                        lambda checkout, *a, **kw: preserved_calls.append(checkout) or real(checkout, *a, **kw))
     _dispatch_attempt_two(tmp_path, repo, runner)
-    assert 1 not in preserved_calls
-    assert json.loads(record.read_text())["error"] == "earlier"
+    assert crashed not in preserved_calls  # no Git work, regardless of the calling wrapper
+    assert json.loads(record.read_text()) == payload
 
 
 def test_dispatch_sweep_failure_never_blocks_dispatch(
