@@ -106,6 +106,62 @@ def test_each_trusted_feedback_routes_to_remediation(
                    for item in events)
 
 
+def _assert_clean_turn_guidance(prompt):
+    # Assert the contract, not equality with the production guidance constant:
+    # deleting either the emitted rule or the continuation skill must fail.
+    text = " ".join(prompt.replace("`", "").split())
+    assert "Start with repo_checkout(repository, pull_request) for the bound PR" in text
+    assert "Use typed PR and repository tools for state" in text
+    for tool in ("pr_metadata", "pr_reviews", "pr_comments", "pr_checks",
+                 "repo_status", "repo_test"):
+        assert tool in text
+    assert "do not list, grep or read /mimir-home, turn logs" in text
+    assert "turns.jsonl" in text and "events.jsonl" in text
+    assert "or call mimir_get_turn" in text
+    assert "mark the turn untrusted and block checkout, commit, comment, and push" in text
+    assert "supplied event or completion result and the typed tools instead" in text
+
+
+@pytest.mark.parametrize("kind", ["issue_comment", "pr_review_comment", "pr_review"])
+def test_emitted_remediation_prompt_has_clean_turn_guidance(
+    monkeypatch, tmp_path, capsys, kind,
+):
+    [event] = [item for item in _drive(
+        monkeypatch, tmp_path, capsys, [_feedback(kind)],
+    ) if "prompt" in item]
+    _assert_clean_turn_guidance(event["prompt"])
+
+
+@pytest.mark.parametrize("trigger", ["poller", "repo_test_complete"])
+def test_rendered_remediation_and_completion_prompt_has_clean_turn_guidance(
+    monkeypatch, tmp_path, capsys, trigger,
+):
+    from pathlib import Path
+
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+    from mimir.skill_resolver import find_skill_for_channel
+
+    [payload] = [item for item in _drive(
+        monkeypatch, tmp_path, capsys, [_feedback("issue_comment")],
+    ) if "prompt" in item]
+    # Test completions retain the poller channel, not the original event prose.
+    # The same resolver used by Agent supplies the skill for either trigger.
+    event = AgentEvent(
+        trigger=trigger, channel_id=f"poller:{payload['poller']}",
+        content=(payload["prompt"] if trigger == "poller" else
+                 '{"job_id":"rt_test","status":"completed","result":{"ok":true}}'),
+        extra={"job_id": "rt_test", "exit_code": 0},
+    )
+    skill = find_skill_for_channel(
+        event.channel_id, [Path(__file__).resolve().parents[2]],
+    )
+    assert skill is not None
+    prompt = build_turn_prompt(event, auto_skill_block=skill)
+    _assert_clean_turn_guidance(prompt)
+    assert "repo_test_complete" in prompt
+
+
 def test_two_comments_share_one_turn_and_cursor_survives_restart(monkeypatch, tmp_path, capsys):
     items = [_feedback("issue_comment", id=101), _feedback("issue_comment", id=102),
              _feedback("pr_review_comment", id=201), _feedback("pr_review", id=301)]

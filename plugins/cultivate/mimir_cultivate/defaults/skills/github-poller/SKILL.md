@@ -24,6 +24,18 @@ env:
 
 # Cultivate GitHub Poller — watch GitHub repos for activity
 
+## Start PR remediation and test continuations
+
+For remediation events and their `repo_test_complete` continuations:
+
+1. Start with `repo_checkout(repository, pull_request)` for the bound PR.
+2. Use typed PR and repository tools for state: `pr_metadata`, `pr_reviews`,
+   `pr_comments`, `pr_checks`, `repo_status`, and `repo_test`.
+3. Keep the turn clean: do not list, grep or read `/mimir-home`, turn logs
+   (`turns.jsonl`, `events.jsonl`), or call `mimir_get_turn`. These reads can
+   mark the turn untrusted and block checkout, commit, comment, and push.
+   Use the supplied event or completion result and the typed tools instead.
+
 Use the repository named in the PR URL or triggering event; for configured
 watches, use the matching entry in `GITHUB_REPOS`. Replace `<owner>/<repo>`
 with that repository (`owner/repo` in examples).

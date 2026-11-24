@@ -884,6 +884,17 @@ _REVIEW_SUBMISSION_RULE = (
     "fires."
 )
 
+_PR_STATE_GUIDANCE = (
+    "Start with `repo_checkout(repository, pull_request)` for the bound PR. "
+    "Use typed PR and repository tools for state: `pr_metadata`, `pr_reviews`, "
+    "`pr_comments`, `pr_checks`, `repo_status`, and `repo_test`. "
+    "For this remediation and its `repo_test_complete` continuations, keep the "
+    "turn clean: do not list, grep or read `/mimir-home`, turn logs "
+    "(`turns.jsonl`, `events.jsonl`), or call `mimir_get_turn`. "
+    "These reads can mark the turn untrusted and block checkout, commit, comment, "
+    "and push. Use the supplied event or completion result and the typed tools instead."
+)
+
 # Scratch cleanup is NOT instructed here. A same-turn `rm -rf` of the event's
 # scratch clone is behaviorally unreachable: the agent's action boundary makes
 # every delete under /mimir-home escalate-first, and a poller event is not
@@ -1012,6 +1023,9 @@ def _emit(prompt: str, **extras: object) -> None:
     ``poller_review_missed_submission`` algedonically.
     """
     event_type = extras.get("event_type")
+    if (extras.get("repo") and extras.get("number")
+            and event_type not in REVIEW_NEEDED_EVENT_TYPES):
+        prompt = _PR_STATE_GUIDANCE + "\n\n" + prompt
     if isinstance(event_type, str) and event_type.startswith("pr_"):
         extras.setdefault("subject_type", "pull_request")
         prompt += (

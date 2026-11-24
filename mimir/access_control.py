@@ -6286,6 +6286,10 @@ _TAINTED_WRITE_REFUSAL = (
     "or live state. Use scratch/ and a proposal PR via open_proposal/submit_proposal "
     "or memory_propose; the operator merges it. Describe the change with "
     "pr_comment/send_message, or ask for a fresh clean turn."
+    "\nFor PR remediation in a fresh turn, start with repo_checkout(repository, "
+    "pull_request) for the bound PR and use typed PR and repository tools for "
+    "state; avoid listing, grepping or reading /mimir-home, turn logs, or "
+    "calling mimir_get_turn."
 )
 
 

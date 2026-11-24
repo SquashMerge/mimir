@@ -5938,6 +5938,55 @@ def _tainted_admin_operator_write_auth() -> AuthContext:
     return replace(auth, ifc_labels=auth.ifc_labels.with_source(untrusted))
 
 
+@pytest.mark.parametrize("tool_name", ["repo_checkout", "repo_commit", "repo_push", "pr_comment"])
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_home_untrusted_ingest_write_refusal_explains_fresh_turn(
+    tool_name, enforce,
+):
+    from mimir.tools.budget_gate import _deny_admin_tool
+
+    clean = _trusted_operator_write_auth(admin=True)
+    home = replace(
+        _tainted_admin_operator_write_auth().ifc_labels.sources[-1],
+        principal="filesystem", domain="filesystem", resource_id="/mimir-home",
+        bridge_instance="filesystem",
+    )
+    # The home read occurred after the initial labels were captured.
+    live = clean.ifc_labels.with_source(home)
+    auth = replace(
+        clean, ifc_state=InformationFlowState(live), enforcement_enabled=enforce,
+    )
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=enforce,
+        arguments={"repository": "owner/repo", "pull_request": 7},
+    )
+    assert not decision.allowed
+    assert decision.would_block and decision.enforcement_enabled
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert (
+        "For PR remediation in a fresh turn, start with repo_checkout(repository, pull_request) "
+        "for the bound PR" in decision.refusal_detail
+    )
+    assert "typed PR and repository tools for state" in decision.refusal_detail
+    assert "avoid listing, grepping or reading /mimir-home, turn logs" in decision.refusal_detail
+    assert "mimir_get_turn" in decision.refusal_detail
+
+    # The model-visible renderer uses the shared refusal text, so authorization
+    # detail alone is insufficient evidence that the hint actually reaches it.
+    refusal = _deny_admin_tool(
+        tool_name, decision.reason, ctx=auth,
+        enforcement_enabled=enforce, detail=decision.refusal_detail,
+    )
+    assert "filesystem: /mimir-home" in refusal
+    assert (
+        "For PR remediation in a fresh turn, start with repo_checkout(repository, "
+        "pull_request) for the bound PR" in refusal
+    )
+    assert "avoid listing, grepping or reading /mimir-home, turn logs" in refusal
+    assert "mimir_get_turn" in refusal
+
+
 _POST_INGEST_SHELL_TOOLS = frozenset({
     "Bash", "aexecute", "bash", "bash_async", "bash_exec", "execute",
     "hands_python", "hands_shell", "shell", "shell_exec",
