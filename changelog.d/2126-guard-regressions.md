@@ -1,1 +1,0 @@
-- Add mutation-sensitive Claude factory regressions for launch environment allowlisting, missing/blank OAuth refusal before worker start, and descendant-retirement recovery refusal for ordinary and inconsistent daemon-shaped records, with admitted positive controls.

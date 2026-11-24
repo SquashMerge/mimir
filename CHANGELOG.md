@@ -8,6 +8,177 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [1.0.0rc7] — 2026-11-24
+
+- Add mutation-sensitive Claude factory regressions for launch environment allowlisting, missing/blank OAuth refusal before worker start, and descendant-retirement recovery refusal for ordinary and inconsistent daemon-shaped records, with admitted positive controls.
+
+- Run Worklink startup reconciliation outside the server event loop; verify Claude factory status and ownership around operator stop, preserve concurrent/terminal records and recorded retirement proof, and document the shared-uid credential exposure.
+
+- Add an OAuth-only Claude subscription setup route with pinned official CLI and vendored factory tooling, contained Worklink backends, private credentials, route-specific image resources and Saga defaults. Preserve legacy deployment output and require a fresh deployment when changing routes. Keep native-uid executor integration tests independent of the test runner's supplementary groups and capability state while retaining real supervisor retirement checks.
+
+- Keep parent-turn PR checkout leases and grants live when delegated reviewers request cleanup; defer their cleanup until the parent turn ends.
+
+- Worklink refuses base repositories writable by leaf workers before claiming work, reports bounded path examples and an operator remediation, and explicitly sets umask 022 in controller service startup and executor entry points while preserving worker umask 002 for group-based controller cleanup.
+- Base-permission remediation uses portable, relative-explicit chmod paths on macOS and Linux, preserving executable bits and skipping symlink targets.
+- macOS CI installs and probes GNU timeout before running the directory-lease tests instead of depending on an ambient coreutils installation.
+- The base-permission check also covers the repository root, every directory holding a tracked file, and each directory above the repository: a writable directory lets a worker rename or replace what it holds. A sticky directory above the repository (such as `/tmp`) passes unless the worker owns it. The remediation command now also repairs the root and tracked directories; a writable directory above the repository is named by absolute path and must be fixed by hand. The OpenCode daemon's s6 service now sets umask 022 like the other controller services.
+
+- Allow Worklink test scratch to use an operator-provisioned tmpfs via `MIMIR_WORKLINK_GATE_TMPDIR`, validating worker ownership and mode 0700 while preserving evidence and retention locations.
+
+- Keep failed or refused PR checkouts bound to the selected repository and PR from tainting the turn, while preserving untrusted content labels and success-path lease checks.
+
+- Distinguish checkout refusals caused by the agent's own unpushed PR commits from foreign-scope conflicts, and guide reviews to push or discard and re-scope without web fallbacks.
+
+- Pin the Worklink OpenCode daemon to exactly 2.3.0, rejecting older daemons at the health gate. Capture its credential-free API contract and re-verify credential import, no-refresh credentials and factory 0.14.1 compatibility without changing permission policy.
+
+- Forward validated heavy-run timeouts to all Worklink workers; Cultivate setup now defaults shared leases to a 14400-second queue-and-run budget, configurable with `--heavy-lock-timeout`.
+
+- Fix a flaky ACP SSH timeout propagation test by keeping its fake SSH peer alive until routing closes the connection.
+
+- Start Worklink epic drivers at the attempt's operator checkout and let the driver initialize its factory run, preserving confined credentials and recovery.
+
+- Worklink removes completed leaf checkouts through the worker executor, including worker-owned caches, without following symlinks or touching sibling attempts.
+
+- Keep archived factory attempts safely prunable, contain unreadable legacy archive records to the affected runtime attempts, and log runtime-prune refusals only when an attempt's refusal reason changes.
+
+- Reconcile stale Worklink-owned Chainlink locks on dispatcher ticks without releasing foreign, retained, or live-controller claims; verify bounded end-of-run contention retries.
+
+- Explain expected own-PR review refusals and direct review findings to PR conversation comments without capability escalations.
+
+- Allow reading completed failing CI job logs while their workflow run is still queued or in progress.
+
+- Preserve scoped PR authorization after a typed rebase onto the observed base, without changing the original force-with-lease head; record fixed refusal codes for scoped-grant failures.
+
+- Worklink denies interactive questions in all daemon sessions and their native subagents, and reports pending question forms anywhere below an observed session instead of silently waiting for a deadline. Forms are never auto-answered.
+
+- Keep daemon factory runs alive while their driver or descendant specialist sessions are active, without extending the run budget or treating pending question forms as progress. Only descendant specialists' running shells count as activity; the driver's long-lived lock-refresh shell does not suppress idle parking.
+
+- Stop epic specialists' background shells across their durable session tree and worktree locations before verifying park, cancellation, or recovery cleanup; retain and report incomplete cleanup, including the failure cause alongside retained shell and process identities and distinguishing missing Python pidfd APIs from bounded OS errno names; fall back to same-uid, start-time-checked signalling when pidfd opening is unavailable or refused.
+
+- Widen test-only child Python hang guards for loaded hosts without changing identity, environment, or provider-isolation assertions.
+
+- Admit interrupted same-PR rebase and merge checkout leases in a restricted recovery state, allowing explicit aborts without crashing later turns.
+
+- Keep attested PR rebase/merge failure diagnostics trusted, preserve same-turn conflict resolution writes through a matching merge commit, and share interrupted-checkout identity validation with next-turn recovery. Rebase recovery stays narrow and publication remains blocked until the interrupted operation concludes.
+
+- Worklink session operations now wait for the per-attempt controller lock with a bounded deadline; lock timeouts are missed observations rather than fatal factory host failures.
+
+- Worklink replaces ended, quiescent retained epic drivers without restarting the daemon, and adds guarded `release-session` and `resume-session` operator recovery commands.
+
+- Fix Worklink reservation counting for list-shaped lock tables, preserving anonymous reservations and failing closed when scoped locks omit issue identity.
+
+- Add a nightly Hypothesis property suite (`property_tests/`, `.github/workflows/nightly-property.yml`) covering authorization, information-flow control, SAGA restricted reads and Worklink lock coordination, including regressions for #2174 and #2175. It runs on a schedule only, not on PRs (#2176).
+
+- Tell OpenCode leaf builders their effective shell allowlist and how to recover from a single rejected command instead of blocking.
+
+- Harden ingest acknowledgement identity to cover every owner-attestation field; older acknowledgement hashes require fresh review.
+
+- Keep unfinished-work GitHub validation alias-scoped when references are not found, without logging expected unknown references as errors (#2180).
+
+- Fix Worklink epic observation failing when an active child session is re-listed across daemon pagination pages, retaining its latest state without weakening parent or tree validation, with cumulative page, occurrence, and response-byte bounds on pagination.
+
+- Use the sanitized worker environment for factory completion gates, tolerate unreadable inherited PATH entries in test isolation, and report mass setup errors as environment failures with bounded, truncated JUnit evidence.
+
+- Keep repo_test snapshot creation and cleanup off the event loop, and finish checkout cleanup before propagating cancellation.
+
+- Explain `repo_test` suite selection and list configured suite names in the model-visible tool; selection refusals no longer imply a failed test run or instruct holding publication.
+
+- Recover Claude Code Worklink leaves after executor restarts using recorded instance and process identities, and add `mimir worklink clear-leaf-state ISSUE --worker-id UUID` for verified-dead retained leaves.
+
+- Run configured `repo_test` legs through the shared heavy-run lease at medium tier, with separate queue and test-run budgets.
+
+- Keep bound PR escalation, inspection and reporting usable during a same-turn interrupted merge or rebase without tainting remediation writes.
+
+- Add PR-bound `package_compare` for content-free npm provenance: integrity-verified tarball/inventory hashes, pair counts and caller-selected path hashes without package-chosen strings or `fetch_url` taint; refuse SHA-1-only integrity.
+
+- Refuse routine service-shell profile and checkout-state policy violations during authorization, without ERROR logs; retain ERROR diagnostics for failures after authorization.
+
+- Preserve trusted file-read provenance during bound, same-turn PR rebases and merges, and allow validated aborts to recover the checkout after unrelated untrusted ingest.
+
+- Classify PR CI failures against the published diff before remediation, report unrelated failures, and automatically archive prior-turn drafts privately under state before resetting retained PR leases, with recoverable staged/worktree binary patches, untracked paths, history and structured notices.
+
+- Skip automatic rebase/conflict remediation for PRs already in GitHub's merge queue, without suppressing requested reviews or operator asks.
+
+- Resolve eligible own-PR conflicts by merging the base, with per-path two-sided evidence, exact-commit core and Cultivate test gates, leased fast-forward publication, and protection against reverting non-PR paths.
+
+- Preserve the operator's three heavy-run lease settings across poller environment scrubbing so ready-queue Worklink gates and builders join the shared lease, while retaining the deny for every other implicitly inherited `MIMIR_*` setting.
+
+- Enforce the shared medium-tier heavy-run lease for Worklink builder pytest runs, including venv/uv entry points and `python -m pytest`, with executor-owned launchers outside the checkout.
+
+- Run leased repository tests in durable background jobs and resume the originating channel with head-bound results, rather than consuming its agent turn while waiting for the heavy-run lease. Verify that completion authority carries full-suite evidence through the follow-up push gate; quarantine corrupt job records with durable warnings and retain delivered terminal history for at most seven days or 1,000 records.
+
+- Refresh the controller's Codex login even when the Worklink daemon is unavailable, record every reconciliation outcome, and alert once per login on permanent refresh failures with re-login guidance.
+
+- Re-mint narrowly bound PR grants for evidenced in-process repository-test completions, preserving the queueing turn's checkout and uncommitted drafts through an attested lease handoff.
+
+- Exclude heavy-lease queue waits from Worklink gates' shared execution budget, report lease wait timeouts as infrastructure failures, and bound helper retirement with TERM/KILL escalation while preserving cancellation.
+
+- Return async repository test admission refusals as recoverable tool errors, with the same guidance as synchronous tests, instead of aborting the agent turn.
+
+- Reserve PR checkout leases for pending repository test completions so a second remediation turn cannot steal the lease before tested work is published.
+
+- Allow evidenced repository-test completion turns to resume the same PR lease after local commits or merges, while binding the tested commit and unchanged PR head separately.
+
+- Allow scoped history reads from the bound PR head/base ancestry while resolving the turn's own merge conflicts; interrupted rebases remain excluded.
+
+- Refuse background `repo_test` during an uncommitted merge or rebase, with guidance to finish the merge or abort the rebase before queuing tests so completion turns do not stall.
+
+- Keep PR checkout leases live through queued repository tests and completion handoffs, excluding heavy-run lock waits from the checkout TTL.
+
+- Allow scoped conflict inspection with `repo_diff`, `pr_files` and `pr_file_content`, and fixed-ref `repo_fetch`, during a turn's own merge without extending interrupted-rebase authority.
+
+- Inline the shipped memory skill in session-end synthesis prompts, including operator overrides, and suppress its catalog read hint without granting file-read access.
+
+- Allow fixed-content escalation from autonomous PR turns and repository-test continuations under enforcement, without granting write authority or relaxing destination bounds.
+
+- Steer PR remediation and test-completion turns to checkout and typed state tools instead of home logs, and explain how to recover in a fresh turn after home reads block writes.
+
+- Stop repeatedly preserving corrupt retained Worklink attempts: persist terminal failures and pruning tombstones, bound transient retries, and comment only on preservation state changes.
+
+- Queued (background) `repo_test` publishes the same lease-attested repository provenance as the synchronous run, so queueing tests no longer taints the remediation turn and blocks its commit, push and comments.
+
+- Update claude-agent-sdk from 0.2.180 to 0.2.183. This is the patch half of Dependabot #99; the agent-client-protocol 1.0 upgrade needs an adapter migration and is tracked separately.
+
+- Dependabot skips `agent-client-protocol` 0.12.x patches and exactly 1.0.0, but later 1.x releases (1.0.1, 1.1, ...) open review-only PRs so ACP spec/SDK changes stay visible while the 1.0 migration is on the backlog (chainlink #2171).
+
+- Hold `agent-client-protocol` at 0.12.0 in Dependabot until mimir's ACP 1.0 support is redesigned (chainlink #2170); a version bump cannot migrate the adapter.
+
+- Worklink pins feature-factory and its OpenCode 2 adapter at 0.14.1. In 0.14.0 the adapter's agents had their own permission rules but no "allow everything" baseline, so on OpenCode 2.2.7 every tool those rules don't name (the driver's `feature` skill, the specialists' read, glob and grep, MCP calls) asked for approval, and a daemon session never answers. The first factory epic on the daemon (#2126) hung on its first call until the startup watchdog stopped it. 0.14.1 starts every agent's rules from the host's allow baseline; the factory's own denies still win.
+
+- Pin Worklink's feature-factory and OpenCode 2 adapter to exactly 0.14.2 across container installs, daemon plugin configuration and admission checks, and the Claude Code route's `claude-code-feature-factory` (and its vendored factory) to 0.14.2 as well. Slice builders now run targeted tests, with shared full verification in the factory's observe step instead of duplicate runs per attempt.
+
+- `scripts/heavy_run.sh`'s shared lease starts waiting commands in best-effort arrival order, so later medium commands cannot starve a large one. Each waiter takes a heartbeated ticket in `<lock>.queue/`, and only the oldest live ticket may take a slot; a large command at the head holds whichever slot frees first while it waits for the other. This replaces the intent marker from the first two-tier helper, which is still honoured while older helpers drain, and a crashed waiter's ticket goes stale like a lease. Only the head of the queue may hold a reserved slot, and it stands aside while a pre-queue helper's intent is live, so a late ticket or a mixed-version transition can reorder the queue but not deadlock it.
+
+- `scripts/heavy_run.sh`'s shared lease has two slots. `MIMIR_HEAVY_TIER=medium` holds one, so two medium commands (tests, verifies, builds) can share the host; `large`, the default and the old behaviour, holds both and runs alone, and a waiting large command blocks new medium ones so measurements aren't starved. A holder from an older helper, which records no tier, counts as large, but an older helper that is still waiting sees only the first slot and can start beside a medium command, so enable medium only once every participant on the lease is upgraded. Worklink forwards a valid tier to builder sessions, gates and `repo_test` legs alongside the lease path and timeout, and fails closed on any other value.
+
+- Keep the heavy-run lease helper working under Python 3.9 (the macOS system `python3` that ssh sessions get): a 3.10-only `Path.stat` call made it fail while releasing, leaving the lease held until stale-breaking cleared it.
+
+- Worklink no longer treats an OpenCode 2 leaf session as finished while one of its own background shells is still running. OpenCode 2 ends a turn (`idle`) while a shell the agent started in the background keeps running, and resumes the session with a `synthetic` message when that shell completes. On 2026-11-16 #2149 and #2151 went idle while their full test suites ran in background shells. Worklink stopped them, the sessions resumed underneath the stop, and both were retained as "quiescence unverified", while the orphaned suites kept running. Quiescence now also requires that no running shell is tagged with the session's ID (`GET /api/shell`), and cancellation deletes the session's own running shells before verifying.
+
+- A Worklink leaf no longer fails with "invalid session inbox" when its background shell finishes. OpenCode 2.2.7's session inbox holds four item types, per its own schema: `user`, `synthetic`, `compaction` and `move`. A finished background shell queues a `synthetic` resume there before the daemon admits it. Worklink accepted only `user` items, so a leaf whose inbox was read in that window failed as "daemon session quiescence unverified". The session kept working with no controller, as #2151 did on 2026-11-17. Now:
+  - Every documented item is validated against its schema shape.
+  - Only `user` counts as Worklink's own input.
+  - A pending daemon-queued item means the session is not quiescent yet.
+  - Cancelling removes the resumes the session's own shells queued.
+
+- Worklink reads an OpenCode 2 daemon session's outcome from its message history. OpenCode 2.2.7's session log endpoint returns only a sequence watermark, never the `session.execution.*` events Worklink waited for, so every daemon build and epic stayed "pending" until its deadline and then failed as "daemon session quiescence unverified", even when the work had finished (the #2149 and #2150 sessions ended `idle succeeded`). The admitted input's `user` message now marks the run started, and the `idle` message after it gives the outcome (succeeded, failed with its error, or interrupted); stopping a session is confirmed the same way. The log endpoint is still read for its watermark. A recording of a real 2.2.7 session lifecycle backs the tests.
+
+- The Worklink OpenCode 2 daemon now runs feature-factory specialists on the deployment's configured model. Its generated config named no model, and the factory adapter ignores an agent's `model: sonnet` tier, so every specialist fell back to the daemon's default. OpenCode 2.2.7 chose `github-copilot/gpt-6.1-terra` from the publishing token in its environment, and Copilot rejects a personal access token. The #2126 factory run parked at its story gate when story-reader failed with "Personal Access Tokens are not supported for this endpoint". The daemon config now sets the adapter's `profile` model and OpenCode's default `model` from `MIMIR_MODEL_SPEC` (or the agent home's spec), resolved exactly as an epic launch does. Each agent keeps its own declared effort.
+
+- Worklink reads a long OpenCode 2 session's history in narrower pages when a page exceeds the daemon client's 1 MiB response bound. Real builds produce large tool output: on 2026-11-16 a 98-message, 1.46 MB history failed every 100-message read, so observation and the stop's quiescence check both failed and the leaf was retained as "daemon session quiescence unverified" while the session kept working. A single message over the bound still fails closed.
+
+- Worklink can finish a leaf whose OpenCode 2 daemon session ended in a container restart. The daemon's state directory is not persistent, so a restart removes every session controller record and the daemon's own sessions. A run retained across it had nothing to recover, so every observe, cancel and release failed closed indefinitely, as happened to #2149–#2152 on 2026-11-16. When the record and any retirement witness are both absent, the current daemon's launch generation differs from the run's, and the daemon answers 404 for the session, the executor now reports the session interrupted with cancellation verified and lets release finish. Every other case fails closed as before.
+
+- Worklink no longer loses OpenCode 2 daemon leaves to session-helper timeouts on a loaded host. Each observe, cancel and release runs a fresh executor helper process with a 32-second backstop, and the wait loop observed every 100 ms. With the host at load average ~30 on 2026-11-16, helpers missed that backstop: #2151–#2154 were retained as "daemon session quiescence unverified", although their sessions had succeeded and a manual release took 0.6 s. The wait loop now backs off from 100 ms to a 2-second interval, and the helper backstop is 120 seconds. Each helper operation stays bounded internally, by the session deadline for reads and the 25-second verification window for cancellation.
+
+- The `otel` extra (and the dev tracing dependencies) require `opentelemetry-*>=1.45.1,<1.46` instead of exact `==1.45.1` pins, so lockstep OpenTelemetry patch releases update `uv.lock` instead of failing Dependabot resolution.
+
+- The github-poller's forwarded `MIMIR_FACTORY_PUBLISHING_IDENTITY` (the bot login) is no longer redacted from poller output, so remediation turns on the bot's own PRs stop failing lease attestation with `pr_author_mismatch`.
+
+- A `repo_test_complete` turn now inherits the queueing turn's integrity instead of always marking its channel untrusted, so a clean remediation turn can act on its own test results (check out, comment, push).
+
+- Worklink session-operation failures now say why. The executor's session helper reported every failure as a bare exit 1, and the controller turned the executor's error into a generic "session executor operation failed". So each daemon quiescence failure on 2026-11-16 surfaced only as "quiescence unverified", with no cause. The helper now reports its exception class, plus the fixed code-literal reason and HTTP status for daemon-client errors (never remote bodies or exception messages). The executor includes that label in its error, and the controller keeps the bounded, redacted error in its exception and logs it as a warning.
+
 ## [1.0.0rc6] — 2026-11-15
 
 - Cultivate setup's `--heavy-lock-dir` mounts a host directory shared with other agents, and Worklink passes `MIMIR_HEAVY_LOCK_FILE` to builder sessions, gates and `repo_test` legs so their heavy commands join the `scripts/heavy_run.sh` lease instead of running unserialized.

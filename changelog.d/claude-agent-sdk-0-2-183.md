@@ -1,1 +1,0 @@
-- Update claude-agent-sdk from 0.2.180 to 0.2.183. This is the patch half of Dependabot #99; the agent-client-protocol 1.0 upgrade needs an adapter migration and is tracked separately.
