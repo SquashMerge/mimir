@@ -102,11 +102,12 @@ def test_current_github_poller_release_inventory_is_complete():
     assert actual == expected, "Current github-poller inventory:\n" + json.dumps(actual, indent=2)
 
 
-def test_history_file_defaults_are_released_for_both_pollers():
+@pytest.mark.parametrize("name", ["github-poller", "github-ci-watch"])
+def test_history_file_defaults_are_released_for_both_pollers(name):
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     skills = skills_for_candidates(enabled_plugins(enable="cultivate"))
     for skill in skills:
-        if skill.name not in {"github-poller", "github-ci-watch"}:
+        if skill.name != name:
             continue
         # Keep historical release evidence intact; each poller can advance
         # independently after the shared history-file release.
@@ -114,7 +115,10 @@ def test_history_file_defaults_are_released_for_both_pollers():
             "github-poller": GITHUB_POLLER_RELEASE,
             "github-ci-watch": CI_WATCH_RELEASE,
         }[skill.name]
-        assert skill_inventory(skill) == releases[release][skill.name]
+        actual = skill_inventory(skill)
+        assert actual == releases[release][skill.name], (
+            f"Current {skill.name} inventory:\n" + json.dumps(actual, indent=2)
+        )
         capabilities = json.loads((SKILLS / skill.name / "pollers.json").read_text())["pollers"][0]["authority"]["capabilities"]
         assert {"repo_restore_file", "repo_file_at_revision"} <= set(capabilities)
 

@@ -213,6 +213,30 @@ def test_removed_requested_status_guard_mutation_fails(tmp_path, status):
     )
 
 
+@pytest.mark.parametrize("package_index", [0, 1])
+def test_contract_rejects_unpaired_package_omitted_count_overflow(registry, package_index):
+    # Explicitly request no pairs: only the per-package guard can reject this.
+    result = module.compare(SPECS, pairs=[])
+    assert result["status"] == "compared"
+    assert result["pairs"] == []
+    assert content_free_result(result, SPECS, [])
+    package = result["packages"][package_index]
+    package["omitted_path_count"] = package["file_count"]
+    assert content_free_result(result, SPECS, [])
+    package["omitted_path_count"] += 1
+    assert package["omitted_path_count"] <= 10000
+    assert not content_free_result(result, SPECS, []), "package omitted-count overflow accepted"
+
+
+@pytest.mark.parametrize("package_index", [0, 1])
+def test_removed_package_omitted_count_guard_mutation_fails(tmp_path, package_index):
+    _assert_source_mutation_fails(
+        tmp_path, "disable package omitted-count guard: " + str(package_index),
+        "test_contract_rejects_unpaired_package_omitted_count_overflow[" + str(package_index) + "]",
+        "package omitted-count overflow accepted",
+    )
+
+
 def test_inventory_hash_is_sorted_path_and_hash_commitment(registry):
     files = {"package/z": b"z", "package/a": b"a"}
     registry[0][:] = [tarball(files), tarball(dict(reversed(list(files.items()))))]

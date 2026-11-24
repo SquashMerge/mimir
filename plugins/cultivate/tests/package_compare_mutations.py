@@ -90,7 +90,14 @@ for node in ast.walk(count_function):
     if not isinstance(node, ast.If):
         continue
     condition = ast.unparse(node.test)
-    if condition.startswith("pair.identical + pair.changed + pair.only_left !="):
+    if ast.dump(node.test) == ast.dump(ast.parse(
+        "package.omitted_path_count > package.file_count", mode="eval",
+    ).body):
+        for package_index in (0, 1):
+            replace_node(module, "disable package omitted-count guard: " + str(package_index),
+                         node, "pass",
+                         "test_contract_rejects_unpaired_package_omitted_count_overflow and " + str(package_index))
+    elif condition.startswith("pair.identical + pair.changed + pair.only_left !="):
         for side in ("left", "right", "omitted"):
             replace_node(module, "disable pair inventory cross-check: " + side,
                          node.test, "False",
