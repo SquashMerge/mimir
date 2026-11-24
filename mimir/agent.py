@@ -2756,6 +2756,7 @@ class Agent:
                             "repository": scope.canonical_repo,
                             "pull_request": scope.pr_number,
                             "reason": reason.value,
+                            **({"details": result["details"]} if result.get("details") else {}),
                         })
                         continue
                     if result.get("status") == "stopped":

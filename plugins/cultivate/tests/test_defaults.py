@@ -26,7 +26,8 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2195-merge-conflict-resolution-neutral-guidance"
+GITHUB_POLLER_RELEASE = "2193-private-draft-archival-completion-integration"
+CI_WATCH_RELEASE = "2193-private-draft-archival"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.
 IDENTITY_EXCEPTIONS: dict[str, set[str]] = {}
@@ -57,6 +58,7 @@ def test_current_repository_skill_release_hash(name):
         "github-poller": GITHUB_POLLER_RELEASE,
         "review": "2126-claude-subscription-main-integration",
         "tracker-poller": "2066-pr-publication",
+        "github-ci-watch": CI_WATCH_RELEASE,
     }.get(name, "0.9.10-2025")
     expected = releases[version][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
@@ -110,11 +112,26 @@ def test_history_file_defaults_are_released_for_both_pollers():
         # independently after the shared history-file release.
         release = {
             "github-poller": GITHUB_POLLER_RELEASE,
-            "github-ci-watch": "2072-history-files",
+            "github-ci-watch": CI_WATCH_RELEASE,
         }[skill.name]
         assert skill_inventory(skill) == releases[release][skill.name]
         capabilities = json.loads((SKILLS / skill.name / "pollers.json").read_text())["pollers"][0]["authority"]["capabilities"]
         assert {"repo_restore_file", "repo_file_at_revision"} <= set(capabilities)
+
+
+def test_ci_remediation_guidance_reports_unrelated_failures():
+    from mimir_cultivate.repository import repo_checkout, repo_diff
+
+    for text in (
+        (SKILLS / "github-ci-watch/SKILL.md").read_text(),
+        (SKILLS / "github-poller/SKILL.md").read_text(),
+        repo_diff.description,
+    ):
+        text = " ".join(text.split())
+        assert "failing test or an imported module is in the" in text
+        assert "report the unrelated" in text
+        assert "leave the PR unchanged" in text
+    assert "report unrelated failures" in repo_checkout.description
 
 
 def test_current_tracker_poller_release_inventory_is_complete():

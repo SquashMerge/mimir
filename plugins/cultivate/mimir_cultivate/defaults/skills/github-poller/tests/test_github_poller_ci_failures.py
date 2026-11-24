@@ -12,6 +12,23 @@ SINCE = "2026-08-16T10:00:00Z"
 HEAD = "a" * 40
 
 
+def test_ci_remediation_dispatch_classifies_before_editing(monkeypatch, tmp_path):
+    prompts = []
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "_emit", lambda prompt, **_: prompts.append(prompt))
+    monkeypatch.setattr(poller, "_remediation_logs", lambda *_: "")
+    poller._deliver_pr_ci(
+        "o/r", _pr(), "token", "mimir-bot", [_check()], {},
+        datetime(2026, 8, 16, 10, 2, tzinfo=timezone.utc),
+        datetime(2026, 8, 16, 10, 0, tzinfo=timezone.utc),
+    )
+    prompt, = prompts
+    assert "repo_diff(mode='base', failing_test=" in prompt
+    assert "Remediate when the failing test or an imported module is in the PR's changed paths" in prompt
+    assert "report the unrelated failure with pr_comment or operator escalation" in prompt
+    assert "leave the PR unchanged" in prompt
+
+
 @pytest.fixture
 def captured_emits(monkeypatch: pytest.MonkeyPatch, tmp_path) -> list[dict]:
     events: list[dict] = []
