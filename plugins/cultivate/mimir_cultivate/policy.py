@@ -721,6 +721,10 @@ def _valid_interrupted_operation(scope, state, tool_name, turn_nonce, *, interru
         allowed.update({
             "repo_merge_abort", "edit_file", "write_file", "repo_stage",
             "repo_file_at_revision", "repo_restore_file", "repo_test", "repo_commit",
+            "repo_diff", "pr_files", "pr_file_content",
+            # Typed fetch only fills objects/FETCH_HEAD for the bound refs; it
+            # cannot update our branch, detach HEAD or replace MERGE_HEAD.
+            "repo_fetch",
         })
     else:
         return False
