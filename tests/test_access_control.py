@@ -5940,22 +5940,25 @@ def _tainted_admin_operator_write_auth() -> AuthContext:
 
 @pytest.mark.parametrize("tool_name", ["repo_checkout", "repo_commit", "repo_push", "pr_comment"])
 @pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("trigger", ["poller", "repo_test_complete"])
+@pytest.mark.parametrize("resource", ["/mimir-home", "/mimir-home/state/turns.jsonl"])
 @pytest.mark.usefixtures("selected_repository_policy")
 def test_home_untrusted_ingest_write_refusal_explains_fresh_turn(
-    tool_name, enforce,
+    tool_name, enforce, trigger, resource,
 ):
     from mimir.tools.budget_gate import _deny_admin_tool
 
     clean = _trusted_operator_write_auth(admin=True)
     home = replace(
         _tainted_admin_operator_write_auth().ifc_labels.sources[-1],
-        principal="filesystem", domain="filesystem", resource_id="/mimir-home",
+        principal="filesystem", domain="filesystem", resource_id=resource,
         bridge_instance="filesystem",
     )
     # The home read occurred after the initial labels were captured.
     live = clean.ifc_labels.with_source(home)
     auth = replace(
-        clean, ifc_state=InformationFlowState(live), enforcement_enabled=enforce,
+        clean, trigger=trigger, ifc_state=InformationFlowState(live),
+        enforcement_enabled=enforce,
     )
     decision = ToolRegistry().authorize_tool(
         tool_name, auth, enforce=enforce,
@@ -5985,6 +5988,59 @@ def test_home_untrusted_ingest_write_refusal_explains_fresh_turn(
     )
     assert "avoid listing, grepping or reading /mimir-home, turn logs" in refusal
     assert "mimir_get_turn" in refusal
+
+
+@pytest.mark.parametrize("tool_name", ["repo_checkout", "repo_commit", "repo_push", "pr_comment"])
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("trigger,domain,resource,integrity,effect", [
+    ("poller", "url", "https://example.test/page", "untrusted", "active_ingest"),
+    ("repo_test_complete", "url", "https://example.test/page", "untrusted", "active_ingest"),
+    ("poller", "filesystem", "/mimir-home-other/state", "untrusted", "active_ingest"),
+    ("poller", "filesystem", "/mimir-home/../workspace/file", "untrusted", "active_ingest"),
+    ("poller", "url", "/mimir-home/state", "untrusted", "active_ingest"),
+    ("user_message", "filesystem", "/mimir-home/state", "untrusted", "active_ingest"),
+    ("scheduled_tick", "filesystem", "/mimir-home/state", "untrusted", "active_ingest"),
+    ("poller", "filesystem", "/mimir-home/state", "trusted", "active_ingest"),
+    ("poller", "filesystem", "/mimir-home/state", "untrusted", "informational"),
+])
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_non_home_or_non_remediation_refusal_has_no_pr_hint(
+    tool_name, enforce, trigger, domain, resource, integrity, effect,
+):
+    from mimir.tools.budget_gate import _deny_admin_tool
+
+    clean = _trusted_operator_write_auth(admin=True)
+    outside = replace(
+        _tainted_admin_operator_write_auth().ifc_labels.sources[-1],
+        principal="fetch_url", domain="url", resource_id="https://example.test/page",
+    )
+    candidate = replace(
+        outside, domain=domain, resource_id=resource,
+        integrity=integrity, integrity_effect=effect,
+    )
+    # Keep an independent URL taint so even trusted/informational home sources
+    # reach the refusal, rather than passing vacuously at an earlier gate.
+    live = clean.ifc_labels.with_source(outside).with_source(candidate)
+    auth = replace(
+        clean, trigger=trigger, ifc_state=InformationFlowState(live),
+        enforcement_enabled=enforce,
+    )
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=enforce,
+        arguments={"repository": "owner/repo", "pull_request": 7},
+    )
+    assert not decision.allowed
+    assert decision.would_block and decision.enforcement_enabled
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+    refusal = _deny_admin_tool(
+        tool_name, decision.reason, ctx=auth,
+        enforcement_enabled=enforce, detail=decision.refusal_detail,
+    )
+    for text in (decision.refusal_detail, refusal):
+        assert "For PR remediation" not in text
+        assert "repo_checkout(repository" not in text
+        assert "mimir_get_turn" not in text
 
 
 _POST_INGEST_SHELL_TOOLS = frozenset({

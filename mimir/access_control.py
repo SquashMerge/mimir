@@ -6286,6 +6286,8 @@ _TAINTED_WRITE_REFUSAL = (
     "or live state. Use scratch/ and a proposal PR via open_proposal/submit_proposal "
     "or memory_propose; the operator merges it. Describe the change with "
     "pr_comment/send_message, or ask for a fresh clean turn."
+)
+_PR_HOME_INGEST_RECOVERY_HINT = (
     "\nFor PR remediation in a fresh turn, start with repo_checkout(repository, "
     "pull_request) for the bound PR and use typed PR and repository tools for "
     "state; avoid listing, grepping or reading /mimir-home, turn logs, or "
@@ -6358,6 +6360,31 @@ def _tainted_write_sources(auth_context: Any, ifc_labels: Any) -> dict[str, Any]
     return {"sources": sources, "remaining_sources": remaining}
 
 
+def _tainted_write_refusal_detail(auth_context: Any, ifc_labels: Any) -> str:
+    """Select recovery advice from live provenance, without changing admission."""
+    if getattr(auth_context, "trigger", None) not in {"poller", "repo_test_complete"}:
+        return _TAINTED_WRITE_REFUSAL
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    for source in getattr(labels, "sources", ()):
+        if (getattr(source, "domain", None) != "filesystem"
+                or not getattr(source, "has_untrusted_active_ingest", False)):
+            continue
+        resource = getattr(source, "resource_id", None)
+        if not isinstance(resource, str) or not resource.startswith("/"):
+            continue
+        # Source identifiers are recorded paths, not an invitation to read or
+        # resolve the filesystem while constructing a refusal.
+        path = os.path.normpath(resource)
+        if path == "/mimir-home" or path.startswith("/mimir-home/"):
+            return _TAINTED_WRITE_REFUSAL + _PR_HOME_INGEST_RECOVERY_HINT
+    return _TAINTED_WRITE_REFUSAL
+
+
 def _tainted_write_denial(
     tool_name: str, service: Any = None, *, auth_context: Any = None,
     ifc_labels: Any = None,
@@ -6375,7 +6402,7 @@ def _tainted_write_denial(
         allowed=False, reason="write_blocked_by_untrusted_ingest",
         service_principal=service, required_tier=AccessTier.ADMIN,
         enforcement_enabled=True, would_block=True,
-        refusal_detail=_TAINTED_WRITE_REFUSAL,
+        refusal_detail=_tainted_write_refusal_detail(auth_context, ifc_labels),
     )
 
 
