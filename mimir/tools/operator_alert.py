@@ -104,6 +104,10 @@ async def operator_alert(text: str) -> str:
     turn = get_current_turn()
     if turn is None:
         raise ToolException("operator_alert refused: no active turn context")
+    from ..access_control import bounded_escalation_turn, BOUNDED_OPERATOR_NOTICE
+
+    if bounded_escalation_turn(turn.auth_context):
+        text = BOUNDED_OPERATOR_NOTICE
     count = getattr(turn, "operator_alert_count", 0) or 0
     if count >= OPERATOR_ALERT_MAX_PER_TURN:
         raise ToolException(

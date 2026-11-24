@@ -3859,9 +3859,10 @@ async def test_invalid_stored_scope_refuses_reads_and_gates_typed_escalation(
         return ToolMessage(content=json.dumps(result), tool_call_id="escalate")
 
     result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
-    if invalid in {"fetch-denied", "accept-denied"}:
+    if invalid == "fetch-denied":
         assert result.status == "error"
-        assert ("channel_target_required" if invalid == "fetch-denied" else "cross_channel_scope") in str(result.content)
+        # A fresh turn has no retained host scope after the store was invalidated.
+        assert "escalation_scope_denied" in str(result.content)
         assert events == []
     else:
         assert result.status != "error", result.content
@@ -3869,6 +3870,9 @@ async def test_invalid_stored_scope_refuses_reads_and_gates_typed_escalation(
         assert events[0]["scope_id"] == old.scope_id
         assert events[0]["repository"] == "owner/repo"
         assert events[0]["pull_request"] == 1291
+        if invalid == "accept-denied":
+            assert events[0]["description"] == access_control.BOUNDED_UNSUPPORTED_NOTICE
+            assert events[0]["attempted_operations"] == []
     with selection():
         with pytest.raises(ToolException, match=reason):
             pr_metadata.func(repository="owner/repo", pull_request=1291, runtime=runtime)
@@ -5467,16 +5471,15 @@ def test_unsupported_operation_is_durable_and_deduped(
     assert second["escalated"] is False
     assert set(first) == {"status", "escalated", "repository", "pull_request"}
     from mimir_cultivate.forge import _operation_key
-    operation = _operation_key("Resolve an inline review thread")
-    assert operation.startswith("resolve_an_inline_review_thread:")
+    operation = _operation_key(access_control.BOUNDED_UNSUPPORTED_NOTICE)
     records = [json.loads(line) for line in events.read_text().splitlines()]
     assert len(records) == 1
     assert records[0] | {
         "repository": "owner/repo",
         "pull_request": 17,
         "operation": operation,
-        "description": "Resolve an inline review thread",
-        "attempted_operations": ["pr_comments", "pr_inline_review_comment"],
+        "description": access_control.BOUNDED_UNSUPPORTED_NOTICE,
+        "attempted_operations": [],
         "operator_visible": True,
     } == records[0]
 
@@ -5489,12 +5492,18 @@ def test_malformed_escalation_is_normalized_bounded_and_non_fatal(
     events = home / "events.jsonl"
     init_logger(events, "test")
 
+    # Human-request prose still exercises normalization; autonomous prose is
+    # withheld entirely by the separately tested fixed-content path.
+    runtime = _runtime(_scope(RepoPRAction.INSPECT))
+    runtime = replace(runtime, context=replace(
+        runtime.context, trigger="user_message", roles=("admin",),
+    ))
     result = unsupported_operation.func(
         repository="owner/repo",
         pull_request=17,
         description=None,
         attempted_operations={"bad\nfield": "ghp_abcdefghijklmnopqrstuvwxyz"},
-        runtime=_runtime(_scope(RepoPRAction.INSPECT)),
+        runtime=runtime,
     )
 
     assert result["escalated"] is True
@@ -5514,6 +5523,9 @@ def test_distinct_escalations_with_same_slug_words_are_not_deduplicated(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     init_logger(home / "events.jsonl", "test")
     runtime = _runtime(_scope(RepoPRAction.INSPECT))
+    runtime = replace(runtime, context=replace(
+        runtime.context, trigger="user_message", roles=("admin",),
+    ))
 
     first = unsupported_operation.func(
         repository="owner/repo", pull_request=17,
@@ -5887,8 +5899,11 @@ def test_repeated_poller_escalation_suppressed_by_reason_and_head(tmp_path, monk
     # A new poller invocation can carry a different scope_id for the same PR head.
     from mimir_cultivate import forge
     same_head = replace(scope, event_type="pr_poller_tick")
-    again = forge._emit_unsupported(same_head, forge._operation_key("Need thread resolution"), "Need thread resolution", [])
-    assert again is False
+    again = unsupported_operation.func(
+        "owner/repo", 17, "Different caller prose", runtime=_runtime(same_head),
+    )
+    assert first["escalated"] is True
+    assert again["escalated"] is False
     changed_reason = forge._emit_unsupported(same_head, "different-reason", "Different", [])
     assert changed_reason is True
     changed_head = replace(same_head, observed_head_sha="b" * 40)

@@ -414,6 +414,14 @@ def test_original_core_policy_matches_frozen_oracle(
 
     observed = without_retired(json.loads(_canonical(_snapshot(home, monkeypatch), home)))
     projected = without_retired(expected)
+    # #2212 intentionally hard-denies autonomous alerts without the configured
+    # destination, even in shadow mode. Keep the historical oracle immutable.
+    for case in projected["authorization"]["operator_alert"]:
+        if case.startswith(("research_", "github_", "heartbeat_")):
+            projected["authorization"]["operator_alert"][case] = [
+                "admin_required", False, True, "MIMIR_OPERATOR_ALERT_CHANNEL_unconfigured",
+                "user", "sink", case.endswith(":shadow"),
+            ]
     projected["tables"]["profile_capability_companions"] = {
         profile: companions for profile, companions in
         projected["tables"]["profile_capability_companions"].items() if companions
@@ -507,6 +515,12 @@ def test_pre_extraction_coding_policy_is_frozen(
             elif name == "unsupported_operation" and current[3] == "channel_target_required":
                 assert tool.resource_scope == "channel" and original[3] == "repo_pr_scope_denied"
                 expected = [*original[:3], "channel_target_required", "admin", *original[5:]]
+            elif (name == "unsupported_operation"
+                  and case.startswith(("research_", "github_", "heartbeat_"))):
+                # #2212: these autonomous oracle contexts have no host-bound PR
+                # scope. Escalation fails closed independently of write grants.
+                expected = ["resource_scoped", False, True, "escalation_scope_denied",
+                            "user", "sink", not enforced]
             elif (tool.writes_code_or_state and "worklink_build_tools" not in tool.memberships
                   and tainted and current[3] == "write_blocked_by_untrusted_ingest"):
                 assert original[3] in {

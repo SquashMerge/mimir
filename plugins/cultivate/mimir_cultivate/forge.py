@@ -3276,6 +3276,11 @@ def unsupported_operation(
     ):
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope if state is not None else _scope(runtime, repository, pull_request)
+    from mimir.access_control import bounded_escalation_turn, BOUNDED_UNSUPPORTED_NOTICE
+
+    if bounded_escalation_turn(context):
+        description = BOUNDED_UNSUPPORTED_NOTICE
+        attempted_operations = None
     safe_description = _bounded_escalation_text(
         description,
         fallback="The caller did not provide a description of the unsupported operation.",

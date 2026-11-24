@@ -15,6 +15,7 @@ from langgraph.runtime import Runtime
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import (
+    BOUNDED_OPERATOR_NOTICE,
     CapabilityTier,
     ToolRegistry,
     build_trigger_service_principal,
@@ -401,7 +402,7 @@ async def test_tainted_service_alert_uses_configured_destination_and_other_sinks
         reset_current_turn(token)
 
     assert alert.status != "error"
-    assert channels.calls == [("discord-operator", "review this finding", False)]
+    assert channels.calls == [("discord-operator", BOUNDED_OPERATOR_NOTICE, False)]
     assert cross_channel.status == "error"
     assert write.status == "error"
     assert denied_calls == 0
@@ -499,7 +500,7 @@ async def test_shipped_worklink_principal_can_use_real_operator_alert_sink(
         reset_current_turn(token)
 
     assert result.status != "error"
-    assert channels.calls == [("discord-operator", "factory recovery unsafe", False)]
+    assert channels.calls == [("discord-operator", BOUNDED_OPERATOR_NOTICE, False)]
 
 
 @pytest.mark.asyncio
@@ -609,7 +610,7 @@ async def test_failed_alert_refunds_only_its_parallel_reservation(tmp_path, fail
         release[2].set()
         await tasks[2]
         assert turn.operator_alert_count == 3
-        assert calls == ["0", "1", "2", "retry"]
+        assert calls == [BOUNDED_OPERATOR_NOTICE] * 4
     finally:
         for event in release:
             event.set()

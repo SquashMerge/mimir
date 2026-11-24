@@ -713,6 +713,8 @@ def _shell_continuation_auth_context(event: AgentEvent) -> AuthContext | None:
         event.trigger in {"shell_job_complete", "repo_test_complete"}
         and isinstance(inherited, AuthContext)
         and inherited.channel_id == event.channel_id
+        and inherited.event_ingress is None
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in (event.extra or {})
     ):
         return inherited
     return None
