@@ -2443,6 +2443,101 @@ def test_agent_wires_resolved_provider_into_budget_arbiter(
     assert agent._arbiter.active_quota_providers == ("openai",)
 
 
+@pytest.mark.parametrize("ending", ["no_grant", "evidence_false", "stale", "failed", "refused", "crashed", "cancelled"])
+async def test_repo_test_completion_turn_end_releases_only_its_reservation(tmp_path, monkeypatch, ending):
+    from mimir import repo_test_jobs
+    from mimir.repo_test_jobs import RepoTestCompletion
+    from unittest.mock import AsyncMock
+
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="done")]))
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=True))
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    auth = AuthContext(principal="operator", canonical_principal="operator", roles=("admin",),
+                       event_ingress=None, trigger="scheduled_tick", channel_id="scheduler:briefing",
+                       interactivity=TurnInteractivity.NON_INTERACTIVE)
+    binding, other_binding = object(), object()
+    async def queue(head, owner):
+        queued = registry.enqueue(
+            repository="o/r", pull_request=9, head_sha=head, suite="python", selectors=(),
+            channel_id=auth.channel_id, starting_turn_id="queue-turn", auth=auth,
+            labels=InformationFlowLabels(), run=AsyncMock(return_value={"ok": True}),
+            grant_binding=owner,
+        )
+        job = registry.jobs[queued["job_id"]]
+        await job.task
+        return job
+    job = await queue("a" * 40, binding)
+    other = await queue("b" * 40, other_binding)
+    event = AgentEvent(
+        trigger="repo_test_complete", channel_id=auth.channel_id, content="result",
+        extra={"job_id": job.job_id, "_repo_test_completion": RepoTestCompletion(
+            binding, "o/r", 9, "a" * 40,
+            "failed" if ending == "failed" else "completed", ending not in {"evidence_false", "stale"},
+        )},
+    )
+    if ending == "refused":
+        async def refuse(*args, **kwargs):
+            raise PermissionError("preflight refused")
+        monkeypatch.setattr("mimir.commitment_proposals.handle_reply", refuse)
+    elif ending in {"crashed", "cancelled"}:
+        async def crash(*args, **kwargs):
+            if ending == "cancelled":
+                raise asyncio.CancelledError()
+            raise RuntimeError("prompt crashed")
+        monkeypatch.setattr(agent, "_build_turn_prompt", crash)
+    if ending in {"refused", "crashed", "cancelled"}:
+        expected = {"refused": PermissionError, "crashed": RuntimeError, "cancelled": asyncio.CancelledError}[ending]
+        with pytest.raises(expected):
+            await agent.run_turn(event)
+    else:
+        await agent.run_turn(event)
+    assert job.grant_binding is None
+    assert other.grant_binding is other_binding
+
+
+@pytest.mark.parametrize("consume", [False, True])
+async def test_repo_test_folded_completion_releases_only_when_consumed(tmp_path, monkeypatch, consume):
+    from mimir import repo_test_jobs
+    from mimir._context import get_current_turn
+    from unittest.mock import AsyncMock
+
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=True))
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    binding = object()
+    captured = []
+    class CompletionGraph(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            ctx = get_current_turn()
+            queued = registry.enqueue(
+                repository="o/r", pull_request=9, head_sha="a" * 40, suite="python", selectors=(),
+                channel_id=ctx.channel_id, starting_turn_id=ctx.turn_id, auth=ctx.auth_context,
+                labels=InformationFlowLabels(), run=AsyncMock(return_value={"ok": True}),
+                grant_binding=binding,
+            )
+            job = registry.jobs[queued["job_id"]]
+            await job.task
+            captured.append(job)
+            if consume:
+                assert _mti.MidTurnInjectionMiddleware().before_model({}, None) is not None
+            assert job.grant_binding is binding
+            async for chunk in super().astream(state, config=config, stream_mode=stream_mode):
+                yield chunk
+    agent = _build_agent(tmp_path, fake_agent=CompletionGraph([AIMessage(content="done")]))
+    # _build_agent initializes the logger used by the real follow-up enqueue.
+    agent._shell_completion_batch_seconds = 0
+    agent._dispatcher = SimpleNamespace(enqueue=AsyncMock(return_value=True))
+    registry.on_complete = agent._on_repo_test_complete
+    monkeypatch.setattr(_mti, "get_config", lambda: {"configurable": {"channel_id": "scheduler:briefing"}})
+    record = await agent.run_turn(AgentEvent(
+        trigger="scheduled_tick", channel_id="scheduler:briefing", content="briefing",
+    ))
+    assert record.error is None
+    [job] = captured
+    assert job.record["delivered"]
+    assert job.grant_binding is (None if consume else binding)
+    assert agent._dispatcher.enqueue.await_count == (0 if consume else 1)
+
+
 async def test_run_turn_writes_record_with_extracted_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

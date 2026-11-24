@@ -2859,7 +2859,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.__init__", "ServerChannelAudienceProvider"): 1,
         ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.authenticate", "create_auth_context"): 1,
         ("context_boundary", "mimir/agent.py", "Agent.__init__", "ServerChannelAudienceProvider"): 1,
-        ("context_boundary", "mimir/agent.py", "Agent.run_turn", "create_auth_context"): 1,
+        ("context_boundary", "mimir/agent.py", "Agent._run_turn_impl", "create_auth_context"): 1,
         ("context_boundary", "mimir/agent.py", "_create_turn_auth_context", "create_auth_context"): 1,
         ("context_rescope", "mimir/acp/agent.py", "MimirAcpAgent._auth_context_for", "replace"): 1,
         ("context_factory", "mimir/access_control.py", "create_auth_context", "AuthContext"): 1,

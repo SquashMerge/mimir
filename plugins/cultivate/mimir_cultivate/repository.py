@@ -726,6 +726,7 @@ import uuid
 
 from mimir._rmtree import rmtree_missing_ok
 from mimir.models import NormalizedPullRequestSnapshot
+from mimir.tools.refusals import ToolPolicyRefusal
 from .policy import RepoPRAction, RepoPRActionScope, RepoReviewState
 from .worklink.checkout import (
     _assert_self_contained_checkout,
@@ -1330,6 +1331,38 @@ def hold_pr_checkout_lease(lease: PRCheckoutLease) -> Iterator[PRCheckoutLease]:
         os.close(directory_fd)
 
 
+class RepoTestPendingRefusal(ToolPolicyRefusal):
+    """A pending host job, not a checkout error or fresh authority."""
+
+    code = "repo_test_pending"
+
+    def __init__(self, job_id: str) -> None:
+        self.job_id = job_id
+        super().__init__(
+            f"repository checkout rejected ({self.code}): job {job_id} reserves this PR's "
+            "checkout lease; the completion turn will continue the work."
+        )
+
+
+def _assert_pr_checkout_unreserved(
+    repository: str, pull_request: int, *, continuation: Any = None,
+) -> None:
+    from mimir.repo_test_jobs import get_registry
+
+    registry = get_registry()
+    pending = registry.pending_for_scope(repository, pull_request) if registry is not None else None
+    if pending is not None and pending.grant_binding is not continuation:
+        raise RepoTestPendingRefusal(pending.job_id)
+
+
+def _release_repo_test_reservation(lease: PRCheckoutLease) -> None:
+    from mimir.repo_test_jobs import get_registry
+
+    registry = get_registry()
+    if registry is not None:
+        registry.release_lease((str(lease.path), lease.recovery_id))
+
+
 def create_pr_checkout_lease(
     scope: RepoPRActionScope,
     *,
@@ -1340,6 +1373,7 @@ def create_pr_checkout_lease(
     runner: Runner = _default_runner,
 ) -> PRCheckoutLease:
     """Publish a self-contained checkout only after exact scope verification."""
+    _assert_pr_checkout_unreserved(scope.canonical_repo, scope.pr_number)
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
         raise RuntimeError("scope does not grant PR checkout")
     if owner != scope.principal:
@@ -1511,6 +1545,7 @@ def _recover_pr_checkout_lease_unlocked(
     attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> PRCheckoutLease:
     """Recover exact-scope work after revalidating its original remote PR head."""
+    _assert_pr_checkout_unreserved(scope.canonical_repo, scope.pr_number)
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
         raise RuntimeError("scope does not grant PR checkout")
     if owner != scope.principal:
@@ -1965,6 +2000,7 @@ def _reclaim_tombstone(lease: PRCheckoutLease, active_paths: Callable[[], set[Pa
         raise _LeaseBecameActive
     tombstone = lease.lease_root / f"{_TOMBSTONE_PREFIX}{lease.path.name}-{uuid.uuid4().hex}"
     os.rename(lease.path, tombstone)
+    _release_repo_test_reservation(lease)
     on_step("delete")
     rmtree_missing_ok(tombstone)
 
@@ -2402,6 +2438,7 @@ def _rebind_foreign_candidate(
     attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> PRCheckoutLease:
     """Move a proven same-PR lease onto the current immutable turn scope."""
+    _assert_pr_checkout_unreserved(scope.canonical_repo, scope.pr_number)
     _dispose_prior_turn_draft(
         lease, scope, runner,
         review_state.checkout_recovery_notices if review_state else None,
@@ -2701,6 +2738,7 @@ def acquire_pr_checkout_lease(
     attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> tuple[PRCheckoutLease, tuple[str, ...]]:
     """Resume an ancestral lease or replace divergent work after recovery."""
+    _assert_pr_checkout_unreserved(scope.canonical_repo, scope.pr_number)
     if RepoPRAction.CHECKOUT.value not in scope.allowed_operations:
         raise RuntimeError("scope does not grant PR checkout")
     if owner != scope.principal:
@@ -3032,6 +3070,7 @@ def _cleanup_pr_checkout_lease_unlocked(
 ) -> bool:
     """Remove an exact lease, preserving any work not proven published."""
     if not lease.path.exists() and not lease.path.is_symlink():
+        _release_repo_test_reservation(lease)
         if review_state is not None:
             review_state.revoke_checkout_lease(lease)
         lease.revoke()
@@ -3135,6 +3174,7 @@ def _cleanup_pr_checkout_lease_unlocked(
         rmtree_missing_ok(lease.path)
     else:
         deleter(lease)
+    _release_repo_test_reservation(lease)
     if review_state is not None:
         review_state.revoke_checkout_lease(lease)
     lease.revoke()
@@ -6020,7 +6060,6 @@ from .policy import RepoReviewState, RetainedFactoryScope
 
 
 
-from mimir.tools.refusals import ToolPolicyRefusal
 
 
 log = logging.getLogger(__name__)
@@ -6421,6 +6460,20 @@ def checkout_scoped_pr(
     from .forge import _client, pr_trust_verdict, remediation_checkout_preflight
 
     context = getattr(runtime, "context", None) if runtime is not None else None
+    grants = getattr(context, "scoped_pr_grants", None)
+    continuation = getattr(grants, "repo_test_continuation", None)
+    # Refuse before preflight, framework reuse or attestation can mutate any
+    # shared state. Only the identical host binding may enter completion resume;
+    # it still faces all of the identity/liveness/attestation checks below.
+    try:
+        _assert_pr_checkout_unreserved(repository, pull_request, continuation=continuation)
+    except RepoTestPendingRefusal as exc:
+        if getattr(runtime, "pre_turn_checkout", False):
+            # The existing host no-work path keeps the turn and non-lease tools
+            # available without classifying this as an attestation failure (which
+            # would revoke a shared lease).
+            return {"status": "stopped", "code": exc.code, "job_id": exc.job_id, "message": str(exc)}
+        raise
     if is_delegated_execution() and context is not None:
         # Check every shared carrier before preflight can remint a scope or
         # acquisition can replace/revoke an existing lease. First acquisition
@@ -6510,9 +6563,6 @@ def checkout_scoped_pr(
         if not attestation.ok:
             raise LeaseAttestationRefusal(attestation.reason, existing=True)
 
-    grants = getattr(context, "scoped_pr_grants", None)
-    continuation = getattr(grants, "repo_test_continuation", None)
-
     def resume_completion() -> dict[str, Any]:
         # This is the same work, not an abandoned prior-turn draft. Admit it
         # before ordinary recovery/archive classification, but still attest it.
@@ -6536,6 +6586,11 @@ def checkout_scoped_pr(
             previous_turn_id=prior_turn_id, last_turn_id=existing.last_turn_id,
         )
         _publish_attested_lease_result(runtime, state)
+        from mimir.repo_test_jobs import get_registry
+
+        registry = get_registry()
+        if registry is not None:
+            registry.release_binding(continuation)
         return {
             "status": "resumed", "path": str(existing.path), "scope_id": scope.scope_id,
             "head_sha": existing.head_sha, "candidate_commits": (),
@@ -6845,6 +6900,16 @@ async def _queue_repo_test(
 
     retained = isinstance(state, RetainedFactoryScope)
     scope = state if retained else state.action_scope
+    pending = None
+    if not retained:
+        # Do not rewrite last_turn_id (even on a deduplicated enqueue) while
+        # another turn's completion owns the lease.
+        pending = registry.pending_for_scope(scope.canonical_repo, scope.pr_number)
+        if pending is not None:
+            ctx = get_current_turn()
+            if (pending.grant_binding.queue_grants is not runtime.context.scoped_pr_grants
+                    or pending.record["starting_turn_id"] != getattr(ctx, "turn_id", None)):
+                raise RepoTestPendingRefusal(pending.job_id)
     checkout_lease = None if retained else state.checkout_lease
     git_tools = (RepoGitTools(retained_scope=scope, runner=retained_factory_git_runner)
                  if retained else RepoGitTools(state))
@@ -6865,11 +6930,16 @@ async def _queue_repo_test(
         repository, selectors, suite, root,
     )
     selected = _validated_selectors(root, selectors, suite=suite_name)
+    head = git_tools._command(("rev-parse", "--verify", "HEAD")).stdout.strip()
+    if pending is not None:
+        if (pending.record["suite"] == suite_name and pending.record["selectors"] == list(selected)
+                and pending.record["head_sha"] == head):
+            return registry.queued(pending)
+        raise RepoTestPendingRefusal(pending.job_id)
     auth = runtime.context
     ctx = get_current_turn()
     if is_same_turn_auth_carrier(ctx, auth):
         auth = ctx.auth_with_plugin_state()
-    head = git_tools._command(("rev-parse", "--verify", "HEAD")).stdout.strip()
     observed_head = None if retained else scope.observed_head_sha
     # Publish the same attested repository provenance as the synchronous tool.
     # Inherited labels are monotonic; the result source is joined below rather
