@@ -763,7 +763,7 @@ class TestTriggerPseudoChannels:
         assert bridge.send_calls == [{"cid": destination, "text": "Needs attention"}]
 
     @pytest.mark.asyncio
-    async def test_hint_omits_ifc_denied_alert(self, alert_turn):
+    async def test_hint_includes_only_ifc_safe_alert(self, alert_turn):
         auth = alert_turn.auth_context
         labels = auth.ifc_labels.with_source(SourceLabel(
             principal="other", domain="channel", resource_id="discord-private",
@@ -774,7 +774,9 @@ class TestTriggerPseudoChannels:
         alert_turn.auth_context = replace(auth, ifc_labels=labels, ifc_state=state)
         before = state.current()
         out = await react.ainvoke({"emoji": ":+1:", "channel_id": alert_turn.channel_id})
-        assert "operator_alert(text=...)" not in out
+        # Poller alerts withhold prose, so even private/tainted sources can use
+        # that bounded path. Scheduled turns retain their existing IFC policy.
+        assert ("operator_alert(text=...)" in out) is (auth.trigger == "poller")
         assert "send_message(channel_id='discord-operator', text=...)" in out
         assert state.current() == before
 

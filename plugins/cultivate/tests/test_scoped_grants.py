@@ -28,7 +28,7 @@ from mimir.access_control import (
 from mimir.config import DEFAULT_TURN_TIMEOUT_SECONDS
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
-    NormalizedPullRequestSnapshot, SourceLabel, TurnInteractivity,
+    NormalizedPullRequestSnapshot, SourceLabel, TurnContext, TurnInteractivity,
 )
 from mimir.plugins.registry import PolicyRegistry
 from mimir_cultivate.repository import active_pr_checkout_lease_for_path, create_pr_checkout_lease
@@ -431,7 +431,13 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
         with policy_scope(policy):
             from mimir._context import reset_current_turn, set_current_turn
 
-            token = set_current_turn(SimpleNamespace(turn_id="remediation", auth_context=auth))
+            # Exercise the real turn contract, including live IFC labels used
+            # by escalation tools, rather than a partial namespace double.
+            token = set_current_turn(TurnContext(
+                turn_id="remediation", session_id=auth.channel_id,
+                trigger=auth.trigger, channel_id=auth.channel_id, started_at=0.0,
+                auth_context=auth, ifc_labels=auth.ifc_state.labels,
+            ))
             try:
                 return gate.wrap_tool_call(request, handler)
             finally:
@@ -1996,7 +2002,7 @@ def test_interrupted_escalation_and_reporting_require_same_turn_binding(
         scope, state, tool, auth.scoped_pr_grants.nonce,
     ) is (invalid is None)
     decision = _decision(auth, scope, tool)
-    assert decision.allowed is (invalid is None), (tool, invalid, decision)
+    assert decision.allowed is (invalid is None or tool == "unsupported_operation"), (tool, invalid, decision)
 
 
 @pytest.mark.parametrize("discovered", [False, True], ids=["registry", "discovered"])
@@ -2016,16 +2022,14 @@ def test_unsupported_operation_allows_remediation_writes(tmp_path, monkeypatch, 
         )
     assert escalation_auth.allowed and not escalation_auth.would_block
     assert escalation_auth.repo_pr_action_scope is scope
-    # The former channel route shadows this PR destination in a poller turn.
-    # It can execute outside enforcement, but its would_block decision must not
-    # exempt a result from the protected-source classifier.
+    # Out-of-scope decisions must not exempt results from source classification.
     with policy_scope(auth._plugin_slot_policy):
         shadow = ToolRegistry().authorize_tool(
             "unsupported_operation", replace(auth, scoped_pr_grants=None),
-            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number + 1},
             enforce=False, policy=auth._plugin_slot_policy,
         )
-    assert shadow.allowed and shadow.would_block and shadow.reason == "cross_channel_scope"
+    assert not shadow.allowed and shadow.would_block and shadow.reason == "escalation_scope_denied"
     status = {"status": "unsupported_operation", "escalated": True,
               "repository": scope.canonical_repo, "pull_request": scope.pr_number}
     with policy_scope(auth._plugin_slot_policy):

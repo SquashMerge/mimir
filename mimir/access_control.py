@@ -5532,6 +5532,150 @@ def _target_matches_operator_alert(target: str, destination: str) -> bool:
     return bool(configured) and target == configured
 
 
+def _autonomous_escalation_turn(auth_context: Any) -> bool:
+    return (
+        auth_context is not None
+        and auth_context.event_ingress is None
+        and auth_context.trigger in {"poller", "repo_test_complete"}
+    )
+
+
+def bounded_escalation_turn(auth_context: Any, ifc_labels: Any = None) -> bool:
+    """Only autonomous turns with live untrusted ingest must withhold prose."""
+    return _autonomous_escalation_turn(auth_context) and _turn_has_untrusted_active_ingest(
+        auth_context, ifc_labels,
+    )
+
+
+def escalation_diagnostics(auth_context: Any, scope: Any = None) -> dict[str, Any]:
+    """Bounded host metadata only; never tool arguments or exception bodies."""
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    if turn is not None and turn.auth_context is not auth_context:
+        turn = None
+    fields = {
+        "turn_id": getattr(turn, "turn_id", None),
+        "trigger": getattr(auth_context, "trigger", None),
+    }
+    job_id = getattr(turn, "escalation_job_id", None)
+    if isinstance(job_id, str) and re.fullmatch(r"rt_[a-f0-9]{32}", job_id):
+        fields["job_id"] = job_id
+    if scope is not None:
+        fields.update(repository=scope.canonical_repo, pull_request=scope.pr_number,
+                      head=scope.observed_head_sha)
+    # These records are host-owned. Discard free-form refusal prose: only a
+    # machine-shaped code and a registered tool name may leave the turn.
+    for denial in reversed(getattr(turn, "hard_boundary_denials", ())):
+        tool, reason = denial.get("tool"), denial.get("reason")
+        if tool == "unsupported_operation":
+            continue  # An escalation is not the blocker it is reporting.
+        if (tool in selected_policy_registry().tools and isinstance(reason, str)
+                and re.fullmatch(r"[a-z][a-z0-9_]*(?::[a-z][a-z0-9_]*)?", reason)
+                and len(reason) <= 120):
+            fields.update(tool=tool, reason=reason)
+            break
+    return fields
+
+
+def bounded_escalation_notice(notice: str, facts: dict[str, Any]) -> str:
+    return notice + " " + json.dumps(facts, sort_keys=True, separators=(",", ":"))
+
+
+BOUNDED_OPERATOR_NOTICE = (
+    "An autonomous turn requires operator assistance. Caller text is withheld; "
+    "inspect the turn trace for the refusal and bound repository/PR."
+)
+BOUNDED_UNSUPPORTED_NOTICE = (
+    "The bound PR turn requires an unsupported operation. Caller text is withheld."
+)
+
+
+def _escalation_scopes(auth_context: Any, policy: Any) -> tuple[Any, ...]:
+    """Host-issued scope is escalation authority, not a live write grant."""
+    protocol = policy.scoped_actions.get("cultivate")
+    constructors = getattr(protocol, "trusted_scope", None)
+    if constructors is None:
+        return ()
+    states = []
+    for carrier in (
+        getattr(auth_context, "repo_pr_scope_registry", None),
+        getattr(auth_context, "server_discovered_pr_states", None),
+    ):
+        if carrier is not None:
+            states.extend(carrier.review_states)
+            states.extend(getattr(carrier, "escalation_states", ()))
+    return tuple(
+        state.action_scope for state in states
+        if type(state) is constructors.review
+        and type(state.action_scope) is constructors.scope_type
+    )
+
+
+def _authorize_bounded_escalation(
+    tool_name: str, auth_context: Any, arguments: dict[str, Any],
+    target: str | None, policy: Any, enforce: bool, ifc_labels: Any = None,
+) -> ToolAuthorization | None:
+    if tool_name not in {"operator_alert", "unsupported_operation"}:
+        return None
+    if not _autonomous_escalation_turn(auth_context):
+        return None
+    scopes = _escalation_scopes(auth_context, policy)
+    service = get_trusted_service_from_auth_context(auth_context, policy=policy)
+    scope = None
+    refusal = "escalation_scope_denied"
+    if tool_name == "operator_alert":
+        destination = resolve_deliver_channel(
+            OPERATOR_CHANNEL_SENTINEL, os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
+        )
+        allowed = (
+            bool(destination)
+            and (target is None or target == destination)
+            and (bool(scopes) or service_can_invoke_operation(service, tool_name, policy=policy))
+        )
+        if not destination:
+            refusal = "MIMIR_OPERATOR_ALERT_CHANNEL_unconfigured"
+        decision = OperationDecision.ADMIN_REQUIRED
+    else:
+        registered = policy.tools.get(tool_name)
+        repository, number = arguments.get("repository"), arguments.get("pull_request")
+        scope = next((
+            candidate for candidate in scopes
+            if isinstance(repository, str) and type(number) is int
+            and repository.lower() == candidate.canonical_repo.lower()
+            and number == candidate.pr_number
+            and (target is None or target == (
+                f"{candidate.canonical_repo}#pull/{candidate.pr_number}"
+                f"@{candidate.observed_head_sha}:{candidate.scope_id}"
+            ))
+        ), None)
+        allowed = (
+            registered is not None and registered.owner == "cultivate"
+            and scope is not None
+        )
+        decision = OperationDecision.RESOURCE_SCOPED
+    if allowed and not bounded_escalation_turn(auth_context, ifc_labels):
+        # The new capability does not release trusted-but-confidential data.
+        # Only the tainted route is content-free and may bypass the IFC sink.
+        sink = SinkGate.check_sink_flow(
+            tool_name, destination if tool_name == "operator_alert" else target or (
+                f"{scope.canonical_repo}#pull/{scope.pr_number}"
+                f"@{scope.observed_head_sha}:{scope.scope_id}"
+            ), ifc_labels if ifc_labels is not None else auth_context.ifc_labels,
+            auth_context, enforce=enforce, repo_pr_action_scope=scope,
+        )
+        if sink.would_block:
+            return sink
+    return ToolAuthorization(
+        tool_name=tool_name, decision=decision, allowed=allowed,
+        reason=None if allowed else refusal,
+        enforcement_enabled=enforce, would_block=not allowed,
+        is_shadow_decision=not enforce,
+        service_principal=service, repo_pr_action_scope=scope,
+        flow_direction=ToolFlowDirection.SINK,
+    )
+
+
 def _target_matches_approved_url(target: str, destination: str) -> bool:
     """Match an exact or explicitly scoped operator-configured URL."""
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
@@ -10319,6 +10463,11 @@ class ToolRegistry:
         policy = policy if policy is not None else selected_policy_registry()
         if not policy.frozen:
             raise ValueError("authorization requires a frozen policy")
+        escalation = _authorize_bounded_escalation(
+            tool_name, auth_context, arguments or {}, target_channel, policy, enforce, ifc_labels,
+        )
+        if escalation is not None:
+            return finish(escalation)
         tool_policy = policy.tools.get(tool_name)
         if (not enforce and tool_name in _WORKLINK_BUILD_TOOLS
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):

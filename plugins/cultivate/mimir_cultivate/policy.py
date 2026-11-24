@@ -386,6 +386,12 @@ class ServerDiscoveredPRStates:
         with self._lock:
             self._escalation_states[(scope.canonical_repo, scope.pr_number)] = RepoReviewState(scope)
 
+    @property
+    def escalation_states(self) -> tuple[RepoReviewState, ...]:
+        """Host-bound scopes retained after discovery/write authority refuses."""
+        with self._lock:
+            return tuple(self._escalation_states.values())
+
     def resolve_for_tool(self, tool_name: str, repository: str, pull_request: int) -> RepoReviewState | None:
         state = self.resolve(repository, pull_request)
         if state is None and tool_name == "unsupported_operation":

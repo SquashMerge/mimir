@@ -714,6 +714,8 @@ def _shell_continuation_auth_context(event: AgentEvent) -> AuthContext | None:
         event.trigger in {"shell_job_complete", "repo_test_complete"}
         and isinstance(inherited, AuthContext)
         and inherited.channel_id == event.channel_id
+        and inherited.event_ingress is None
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in (event.extra or {})
     ):
         return inherited
     return None
@@ -2664,6 +2666,11 @@ class Agent:
                 started_at=t_total_start,
                 agent_id=self._config.agent_id,
                 saga_session_id=saga_session_id,
+                escalation_job_id=(
+                    event.extra.get("job_id")
+                    if event.trigger == "repo_test_complete"
+                    and _shell_continuation_auth_context(event) is not None else None
+                ),
                 # Per-turn send-loop circuit breaker (SPEC §7.2.4). Attached
                 # to the TurnContext so send_message can reach it via
                 # ``_context.get_current_turn()`` without a separate
