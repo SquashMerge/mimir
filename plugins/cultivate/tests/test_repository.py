@@ -3031,9 +3031,21 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
 
     local_merge = case in {"local_merge", "forge_moved_after_merge", "tested_head_after_merge"}
     conflicting = case in {"uncommitted_merge", "uncommitted_rebase", "resolved_merge"}
-    state = _repo_test_lease_fixture(
-        tmp_path, monkeypatch, advance_base=local_merge, conflicting=conflicting,
-    )
+    # These cases call public checkout after adding fixture-owned untracked
+    # test/wrapper files. Create them in the queueing turn, not as an abandoned
+    # prior-turn draft: ordinary recovery must not archive/reset this setup.
+    fixture_turn_token = None
+    if conflicting:
+        fixture_turn = _ifc_turn(_untainted_ifc_auth())
+        fixture_turn.turn_id = "queue-turn"
+        fixture_turn_token = set_current_turn(fixture_turn)
+    try:
+        state = _repo_test_lease_fixture(
+            tmp_path, monkeypatch, advance_base=local_merge, conflicting=conflicting,
+        )
+    finally:
+        if fixture_turn_token is not None:
+            reset_current_turn(fixture_turn_token)
     scope = state.action_scope
     lease = state.checkout_lease
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
@@ -3125,11 +3137,15 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         if conflicting:
             # Real public checkout -> conflict -> resolution -> stage. Do not
             # mock admission or interrupted-operation authority.
+            assert lease.last_turn_id == queue_turn.turn_id
             checkout = repository.repo_checkout.func(
                 scope.canonical_repo, scope.pr_number, runtime=runtime,
             )
-            assert checkout["status"] in {"checked_out", "resumed"}
+            assert checkout["status"] in {"checked_out", "resumed"}, checkout
+            assert not checkout.get("preserved_prior_work")
             lease = state.checkout_lease
+            assert (lease.path / "tests/test_changed.py").is_file()
+            assert (lease.path / "scripts/heavy_run.sh").is_file()
             assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
             operation = "rebase" if case == "uncommitted_rebase" else "merge"
             with pytest.raises(repository.ToolException, match="conflict"):
