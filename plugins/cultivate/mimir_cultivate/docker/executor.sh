@@ -1,5 +1,28 @@
 #!/bin/sh
 set -eu
+install_pytest_guard() {
+    # Both exact wheels carry these assets, including in source-free PyPI
+    # images. Never execute the builder checkout's helper or startup hook.
+    /opt/mimir-worklink/venv/bin/python -c '
+import pathlib
+import mimir
+import mimir_cultivate
+import shutil
+Path = pathlib.Path
+guard = Path("/opt/mimir-worklink/pytest-guard")
+for directory in ("bin", "python"):
+    (guard / directory).mkdir(parents=True, exist_ok=True)
+assets = Path(mimir_cultivate.__file__).parent / "docker/pytest_guard"
+for name in ("pytest", "worklink_pytest.py", "worklink_pytest_args.py", "sitecustomize.py"):
+    target = guard / ("bin" if name == "pytest" else "python") / name
+    shutil.copyfile(assets / name, target)
+    target.chmod(0o755 if name == "pytest" else 0o644)
+for name in ("heavy_run.sh", "heavy_run.py"):
+    target = guard / name
+    shutil.copyfile(Path(mimir.__file__).parent / "heavy_run" / name, target)
+    target.chmod(0o644)
+'
+}
 if [ "${MIMIR_INSTALL_MODE:-}" = pypi ]; then
     python3 /opt/cultivate-docker/verify_wheels.py /opt/mimir-worklink/wheels \
         "$MIMIR_VERSION" "$MIMIR_AGENT_WHEEL" "$MIMIR_AGENT_SHA256" \
@@ -20,6 +43,7 @@ if [ "${MIMIR_INSTALL_MODE:-}" = pypi ]; then
         "/opt/mimir-worklink/wheels/$MIMIR_AGENT_WHEEL[${MIMIR_EXTRAS}]" \
         "/opt/mimir-worklink/wheels/$MIMIR_CULTIVATE_WHEEL"
     /opt/mimir-worklink/venv/bin/python -c 'from mimir_cultivate.install_identity import write_startup_hooks, EXECUTOR_HOOKS, executor_identity; write_startup_hooks(EXECUTOR_HOOKS); executor_identity()'
+    install_pytest_guard
     chown -R root:root /opt/mimir-worklink
     chmod -R go-w /opt/mimir-worklink
     exit 0
@@ -52,5 +76,6 @@ UV_CACHE_DIR=/opt/mimir-worklink/uv-cache uv sync --directory /opt/mimir-worklin
     --locked --extra dev --extra bench --no-install-workspace
 rm -rf /opt/mimir-worklink/source/.venv
 rm -rf /opt/mimir-worklink/source
+install_pytest_guard
 chown -R root:root /opt/mimir-worklink
 chmod -R go-w /opt/mimir-worklink

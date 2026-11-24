@@ -23,7 +23,7 @@ SITES = {
     ("control.py", "stop_worklink", "LocalSubprocessComputeBackend().cancel"): (2, "explicit operator stop for factory or leaf; verified process identity"),
     ("orchestrator.py", "invoke_backend", "compute.cancel"): (2, "leaf launch-state failure or verified daemon quiescence before release"),
     ("control.py", "cancel_owned_session", "backend.cancel"): (1, "operator stop uses owned session identity and verified cancellation"),
-    ("evidence.py", "_run_compute_gate", "compute.cancel"): (2, "leaf evidence gate, not a factory handle"),
+    ("evidence.py", "_run_compute_gate_command", "compute.cancel"): (2, "leaf evidence gate, not a factory handle"),
     ("orchestrator.py", "_reattach_under_issue_lock", "LocalSubprocessComputeBackend().cancel"): (1, "explicit leaf reattach stop under the issue controller lease"),
     ("orchestrator.py", "_reattach_under_issue_lock", "compute.cancel"): (1, "owned session must be quiescent after observation before release under the issue controller lease"),
     ("orchestrator.py", "reconcile_current_session", "session_compute.cancel"): (1, "early completed-evidence or failed-label recovery verifies the current session before releasing state"),

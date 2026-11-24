@@ -127,6 +127,9 @@ class ComputeResult:
     output_truncated: bool = False
     stdout_bytes: int = 0
     stderr_bytes: int = 0
+    lease_wait_timed_out: bool = False
+    lease_wait_s: float = 0.0
+    run_duration_s: float = 0.0
 
 
 class ComputeLaunchError(RuntimeError):
@@ -625,6 +628,10 @@ def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
     if unknown:
         name = sorted(str(item) for item in unknown)[0]
         raise ComputeLaunchError(f"worker environment {name} was not requested")
+    if claude:
+        from .pytest_environment import pytest_session_environment
+
+        env.update(pytest_session_environment(env["PATH"]))
     return filter_otlp_env(env)
 
 

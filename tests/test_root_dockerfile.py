@@ -182,6 +182,10 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
             # 2. The uv link replaces a uv the scaffold image already installed.
             link = "ln -s /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv"
             expected_steps[expected_steps.index(link)] = link.replace("ln -s", "ln -sf")
+            # 3. Image-owned pytest enforcement is installed before permissions
+            #    are sealed, in both source and source-free wheel builds.
+            expected_steps.insert(expected_steps.index("chown -R root:root /opt/mimir-worklink"),
+                                  "install_pytest_guard")
         if name == "service.sh":
             # The installed daemon wrapper now sets its own umask (#2140).
             expected_steps = [step.replace("#!/bin/sh exec", "#!/bin/sh umask 022 exec")

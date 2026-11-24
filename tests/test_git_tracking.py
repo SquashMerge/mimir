@@ -125,7 +125,8 @@ async def test_git_group_drained_before_rebase_abort(
         "import fcntl, os, time; from pathlib import Path; "
         "guard = open('writer.lock', 'w'); "
         "fcntl.flock(guard, fcntl.LOCK_EX); "
-        "Path('child.pid').write_text(str(os.getpid())); "
+        "Path('child.pid.tmp').write_text(str(os.getpid())); "
+        "os.replace('child.pid.tmp', 'child.pid'); "
         "os.write(1, b'x' * 1048576); time.sleep(300)"
     )
     parent_source = (
@@ -145,15 +146,23 @@ async def test_git_group_drained_before_rebase_abort(
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 8
             pid_file = tmp_path / "child.pid"
-            while not pid_file.exists() or not pid_file.read_text():
+            content = None
+            while True:
+                try:
+                    content = pid_file.read_text()
+                    child_pid = int(content)
+                    break
+                except (FileNotFoundError, ValueError):
+                    pass
                 assert loop.time() < deadline, (
                     f"child did not acknowledge writer.lock ownership; "
+                    f"last content={content!r}; "
                     f"parent_returncode={proc.returncode}; "
                     f"stdout: {proc.stdout.diagnostic()}; "
                     f"stderr: {proc.stderr.diagnostic()}"
                 )
                 await asyncio.sleep(0.001)
-            child_pids.append(int(pid_file.read_text()))
+            child_pids.append(child_pid)
             # A killed parent alone cannot close the child's inherited pipes.
             # With a 1 KiB reader limit, >2 KiB received and a non-reading
             # transport demonstrate backpressure without inspecting _paused.

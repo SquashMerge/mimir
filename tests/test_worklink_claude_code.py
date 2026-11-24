@@ -28,6 +28,79 @@ from mimir_cultivate.worklink.execution_policy import CLAUDE_LEAF, ExecutionPoli
 FIXTURES = Path(__file__).parent / "fixtures/worklink/claude_code_2_1_326"
 
 
+async def _wait_for_json_marker(marker, *, on_missing=None, timeout=10):
+    """Existence alone does not prove that a child's write has completed."""
+    content = None
+
+    async def poll():
+        nonlocal content
+        while True:
+            try:
+                content = marker.read_text()
+            except FileNotFoundError:
+                if on_missing is not None:
+                    await on_missing()
+            else:
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    pass
+            await asyncio.sleep(0.01)
+
+    try:
+        return await asyncio.wait_for(poll(), timeout)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"Timed out waiting for JSON marker {marker}; last content: {content!r}"
+        ) from exc
+
+
+@pytest.mark.asyncio
+async def test_json_marker_poll_retries_empty_and_partial_json(tmp_path, monkeypatch):
+    marker = tmp_path / "child.json"
+    marker.write_text("")
+    read_text = Path.read_text
+    pending = iter(['{"child":', '{"child": 123, "uid": 456}'])
+    observed = []
+
+    def read(path, *args, **kwargs):
+        content = read_text(path, *args, **kwargs)
+        if path == marker:
+            observed.append(content)
+            replacement = next(pending, None)
+            if replacement is not None:
+                marker.write_text(replacement)
+        return content
+
+    monkeypatch.setattr(Path, "read_text", read)
+    assert await _wait_for_json_marker(marker) == {"child": 123, "uid": 456}
+    assert observed == ["", '{"child":', '{"child": 123, "uid": 456}']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["", '{"child":', "not JSON"])
+async def test_json_marker_poll_timeout_includes_malformed_content(tmp_path, content):
+    marker = tmp_path / "child.json"
+    marker.write_text(content)
+    with pytest.raises(TimeoutError) as raised:
+        await _wait_for_json_marker(marker, timeout=0.05)
+    assert str(marker) in str(raised.value)
+    assert f"last content: {content!r}" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_json_marker_poll_waits_for_missing_marker(tmp_path):
+    marker = tmp_path / "child.json"
+    calls = []
+
+    async def publish():
+        calls.append("missing")
+        marker.write_text('{"child": 123}')
+
+    assert await _wait_for_json_marker(marker, on_missing=publish) == {"child": 123}
+    assert calls == ["missing"]
+
+
 @pytest.fixture
 def order(tmp_path):
     return base.WorkOrder(2126, tmp_path, "build the leaf", "keep boundaries", 30,
@@ -371,7 +444,10 @@ async def test_deterministic_gate_retires_sessioned_child_through_executor(
         "assert not (home / '.claude').exists()\n"
         "assert not list(home.rglob('*.json'))\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
-        f"pathlib.Path({str(marker)!r}).write_text(json.dumps({{'child': child.pid, 'uid': os.getuid()}}))\n"
+        f"marker = pathlib.Path({str(marker)!r})\n"
+        "pending = marker.with_suffix('.tmp')\n"
+        "pending.write_text(json.dumps({'child': child.pid, 'uid': os.getuid()}))\n"
+        "os.replace(pending, marker)\n"
         + ("time.sleep(120)\n" if ending in {"timeout", "cancel"} else
            f"sys.exit({7 if ending == 'nonzero' else 0})\n")
     )
@@ -441,15 +517,12 @@ async def test_deterministic_gate_retires_sessioned_child_through_executor(
         checkout=order.checkout, work_spec=spec, compute=backend, on_launch=launched))
     child = None
     try:
-        async def spawned():
-            while not marker.exists():
-                if task.done():
-                    await task
-                    pytest.fail("gate exited before spawning its child")
-                await asyncio.sleep(0.01)
-            return json.loads(marker.read_text())
+        async def gate_exited():
+            if task.done():
+                await task
+                pytest.fail("gate exited before spawning its child")
 
-        observed = await asyncio.wait_for(spawned(), 10)
+        observed = await _wait_for_json_marker(marker, on_missing=gate_exited)
         child = observed["child"]
         assert observed["uid"] == os.getuid()
         if ending == "cancel":

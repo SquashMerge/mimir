@@ -1,0 +1,1 @@
+- Keep the heavy-run lease helper working under Python 3.9 (the macOS system `python3` that ssh sessions get): a 3.10-only `Path.stat` call made it fail while releasing, leaving the lease held until stale-breaking cleared it.

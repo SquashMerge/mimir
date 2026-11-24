@@ -55,6 +55,481 @@ def test_git_fetch_transport_failures_are_typed(args, stderr, transport) -> None
     assert isinstance(raised.value, repository.GitTransportError) is transport
 
 
+@pytest.mark.parametrize("test_path,modules,action", [
+    ("tests/test_viability.py", ("mimir/viability.py",), "report"),
+    ("tracked.txt", ("mimir/viability.py",), "remediate"),
+    ("tests/test_viability.py", ("tracked.txt",), "remediate"),
+])
+def test_ci_failure_scope_reports_unrelated_and_remediates_related(
+    tmp_path, test_path, modules, action,
+):
+    _, _, scope, state = _repo_scope_and_state(tmp_path, event_type="pr_ci_failure")
+    lease = state.checkout_lease
+    # A local draft cannot manufacture relevance; nor can a path filter hide it.
+    (lease.path / "tests").mkdir()
+    (lease.path / "tests/test_viability.py").write_text("unrelated draft\n")
+    before = _git(lease.path, "status", "--porcelain=v1")
+    from mimir.plugins.core import policy_scope
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        result = repository.RepoGitTools(state).execute(
+            repository.GitDiff("base", ("not-in-pr.txt",), test_path, modules),
+        )
+    assert result.ok
+    decision = json.loads(result.stdout)
+    assert decision["action"] == action
+    assert decision["edit_allowed"] is (action == "remediate")
+    assert result.code == ("ci_failure_related" if action == "remediate" else "ci_failure_unrelated")
+    if action == "report":
+        assert "pr_comment or operator escalation" in decision["guidance"]
+        assert "leave the PR unchanged" in decision["guidance"]
+    assert _git(lease.path, "status", "--porcelain=v1") == before
+
+
+@pytest.mark.parametrize("dirty_kind", ["tracked", "staged", "untracked", "legacy", "no_context"])
+@pytest.mark.parametrize("entry", ["acquire", "recover"])
+def test_prior_turn_dirty_lease_refused_and_signalled(tmp_path, monkeypatch, dirty_kind, entry):
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "prior-turn-2193")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    def unavailable(*_):
+        raise OSError("archive store unavailable")
+    monkeypatch.setattr(repository, "_archive_prior_turn_draft", unavailable)
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    metadata = lease.path / repository._METADATA
+    if dirty_kind in {"legacy", "no_context"}:
+        raw = json.loads(metadata.read_text())
+        raw.pop("last_turn_id")
+        metadata.write_text(json.dumps(raw))
+    path = lease.path / ("draft.txt" if dirty_kind in {"untracked", "legacy"} else "tracked.txt")
+    path.write_text("abandoned draft\n")
+    if dirty_kind == "staged":
+        _git(lease.path, "add", "tracked.txt")
+    before = metadata.read_bytes()
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "next-turn-2193")
+    if dirty_kind == "no_context":
+        monkeypatch.setattr(repository, "_lease_turn_id", lambda: None)
+    run = lambda args: subprocess.run(
+        args, capture_output=True, text=True, env=_fixture_git_env(),
+    )
+    with pytest.raises(repository.DirtyPRCheckoutLeaseRefusal) as caught:
+        if entry == "acquire":
+            repository.acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=lease.lease_root, runner=run,
+            )
+        else:
+            repository.recover_pr_checkout_lease(
+                lease.path, scope, owner=scope.principal, lease_root=lease.lease_root, runner=run,
+            )
+    signal = caught.value.signal
+    assert signal["reason"] == "dirty_lease_from_prior_turn"
+    assert signal["prior_turn_id"] == (
+        None if dirty_kind in {"legacy", "no_context"} else "prior-turn-2193"
+    )
+    assert signal["mutation_allowed"] is False
+    assert signal["disposition"] == "operator_required"
+    assert signal["path"] == str(lease.path)
+    assert "dirty lease from prior turn" in signal["message"]
+    assert path.read_text() == "abandoned draft\n"
+    assert metadata.read_bytes() == before  # no renewal or authority attachment
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("entry", ["acquire", "recover"])
+def test_prior_turn_draft_artifact_round_trip_and_next_mutation(tmp_path, monkeypatch, legacy, entry):
+    import tarfile
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "old-draft-turn")
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    if legacy:
+        metadata_path = lease.path / repository._METADATA
+        raw = json.loads(metadata_path.read_text())
+        raw.pop("last_turn_id")
+        metadata_path.write_text(json.dumps(raw))
+    tracked = lease.path / "tracked.txt"
+    tracked.write_bytes(b"staged\0binary\xff\n")
+    _git(lease.path, "add", "tracked.txt")
+    staged = _git(lease.path, "write-tree")
+    tracked.write_bytes(b"unstaged\0binary\xfe\n")
+    (lease.path / "new staged.txt").write_text("staged addition\n")
+    (lease.path / "new staged.txt").write_bytes(b"staged CRLF\r\nsecond\r\n")
+    _git(lease.path, "add", "new staged.txt")
+    staged = _git(lease.path, "write-tree")
+    (lease.path / "new staged.txt").write_bytes(b"unstaged CRLF\r\nsecond\r\n")
+    (lease.path / "untracked\nname.txt").write_bytes(b"untracked\0\xff")
+    (lease.path / "link").symlink_to("tracked.txt")
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda kind, **kw: events.append((kind, kw)))
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "new-draft-turn")
+    run = lambda args: subprocess.run(args, capture_output=True, text=True, env=_fixture_git_env())
+    # OrbStack's 0000 umask must not make artifacts public, even transiently.
+    old_umask = os.umask(0)
+    try:
+        if entry == "acquire":
+            resumed, _ = repository.acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=lease.lease_root,
+                review_state=state, runner=run,
+            )
+        else:
+            resumed = repository.recover_pr_checkout_lease(
+                lease.path, scope, owner=scope.principal, lease_root=lease.lease_root,
+                review_state=state, runner=run,
+            )
+    finally:
+        os.umask(old_umask)
+    assert _git(resumed.path, "status", "--porcelain=v1") == ""
+    assert _git(resumed.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    notice, = state.checkout_recovery_notices
+    artifact = Path(notice["artifact"])
+    assert artifact.is_relative_to(tmp_path / "state/pr-lease-drafts")
+    assert artifact.stat().st_mode & 0o777 == 0o700
+    assert artifact.parent.stat().st_mode & 0o777 == 0o700
+    assert all(p.stat().st_mode & 0o777 == 0o600 for p in artifact.iterdir())
+    metadata = json.loads((artifact / "metadata.json").read_text())
+    assert metadata["prior_turn_id"] == (None if legacy else "old-draft-turn")
+    assert metadata["lease_path"] == str(lease.path)
+    assert metadata["head_sha"] == scope.observed_head_sha
+    assert datetime.fromisoformat(metadata["timestamp"]).tzinfo is not None
+    assert {kind for kind, _ in events} >= {
+        "pr_checkout_prior_turn_draft_archived", "pr_checkout_prior_turn_draft_disposed",
+    }
+    prompt = build_turn_prompt(
+        AgentEvent(trigger="poller", channel_id="test", content="review"),
+        prechecked_pr_leases=[{
+            "path": str(resumed.path), "head_sha": resumed.head_sha,
+            "preserved_prior_work": state.checkout_recovery_notices,
+        }],
+    )
+    assert str(artifact) in prompt and "prior_turn_draft_archived" in prompt
+    # Prove the next scoped mutation works on a clean, newly bound lease.
+    (resumed.path / "tracked.txt").write_text("new turn fix\n")
+    from mimir.plugins.core import policy_scope
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        result = repository.RepoGitTools(state).execute(repository.GitStage(("tracked.txt",)))
+    assert result.ok, result
+    _git(resumed.path, "reset", "--hard", scope.observed_head_sha)
+    # Restore patches in order to retain the index/worktree distinction, not
+    # merely the final text. Binary patches must retain their last newline.
+    _git(resumed.path, "apply", "--index", str(artifact / "staged.patch"))
+    assert _git(resumed.path, "write-tree") == staged
+    _git(resumed.path, "apply", str(artifact / "worktree.patch"))
+    assert tracked.read_bytes() == b"unstaged\0binary\xfe\n"
+    assert (resumed.path / "new staged.txt").read_bytes() == b"unstaged CRLF\r\nsecond\r\n"
+    with tarfile.open(artifact / "untracked.tar") as archive:
+        assert archive.extractfile("untracked\nname.txt").read() == b"untracked\0\xff"
+        assert archive.getmember("link").issym()
+        archive.extractall(resumed.path, filter="data")
+    assert (resumed.path / "link").is_symlink()
+    assert (resumed.path / "untracked\nname.txt").read_bytes() == b"untracked\0\xff"
+    _git(resumed.path, "bundle", "verify", str(artifact / "history.bundle"))
+
+
+@pytest.fixture
+def draft_disposal(tmp_path, monkeypatch):
+    """Real Git/archive control, observed at the destructive boundary itself.
+
+    Calling acquire/recover here would let their later identity checks hide a
+    missing disposal guard. Every negative case shares this successful setup.
+    """
+    from mimir_cultivate import scheduler
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "old")
+    _, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_bytes(b"staged\x00draft\n")
+    _git(lease.path, "add", "tracked.txt")
+    (lease.path / "tracked.txt").write_bytes(b"unstaged\x00draft\n")
+    (lease.path / "untracked.txt").write_bytes(b"untracked\x00draft\n")
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "new")
+    monkeypatch.setattr(scheduler, "active_pr_checkout_lease_paths", lambda: set())
+    events, commands, archives, notices = [], [], [], []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda kind, **kw: events.append(kind))
+    real_archive = repository._archive_prior_turn_draft
+
+    def archive(candidate, runner):
+        artifact = real_archive(candidate, runner)
+        archives.append(artifact)
+        return artifact
+
+    monkeypatch.setattr(repository, "_archive_prior_turn_draft", archive)
+
+    def runner(args):
+        commands.append(tuple(args[3:]))
+        return subprocess.run(args, capture_output=True, text=True, env=_fixture_git_env())
+
+    def snapshot():
+        return (
+            _git(lease.path, "rev-parse", "HEAD"),
+            _git(lease.path, "write-tree"),
+            _git(lease.path, "status", "--porcelain=v1", "--untracked-files=all"),
+            (lease.path / "tracked.txt").read_bytes(),
+            (lease.path / "untracked.txt").read_bytes(),
+            (lease.path / repository._METADATA).read_bytes(),
+        )
+
+    return SimpleNamespace(
+        lease=lease, scope=scope, source=source, runner=runner,
+        archive=archive, archives=archives, events=events,
+        commands=commands, notices=notices, snapshot=snapshot,
+    )
+
+
+def test_prior_turn_draft_disposal_success_control(draft_disposal):
+    case = draft_disposal
+    repository._dispose_prior_turn_draft(case.lease, case.scope, case.runner, case.notices)
+    assert len(case.archives) == 1
+    assert case.events == [
+        "pr_checkout_prior_turn_draft_archived", "pr_checkout_prior_turn_draft_disposed",
+    ]
+    assert ("reset", "--hard", case.scope.observed_head_sha) in case.commands
+    assert ("clean", "-fd") in case.commands
+    assert _git(case.lease.path, "status", "--porcelain=v1") == ""
+    notice, = case.notices
+    assert notice["artifact"] == str(case.archives[0])
+    assert notice["prior_turn_id"] == "old"
+
+
+@pytest.mark.parametrize("blocker", [
+    "live", "canonical_repo", "owner", "source_root", "destination_ref",
+    "canonical_origin", "origin", "branch", "stale_head", "merge", "rebase",
+])
+def test_prior_turn_draft_disposition_refuses_before_reset(draft_disposal, monkeypatch, blocker):
+    from mimir_cultivate import scheduler
+
+    case = draft_disposal
+    lease = case.lease
+    expected_type = RuntimeError
+    expected_message = "^prior-turn draft checkout identity mismatch$"
+    if blocker == "live":
+        monkeypatch.setattr(scheduler, "active_pr_checkout_lease_paths", lambda: {lease.path})
+        expected_type = repository.DirtyPRCheckoutLeaseRefusal
+    elif blocker in {"canonical_repo", "owner", "source_root", "destination_ref", "canonical_origin"}:
+        replacements = {
+            "canonical_repo": "other/repo", "owner": "other-owner",
+            "source_root": lease.path, "destination_ref": "refs/heads/other",
+            "canonical_origin": str(case.source),
+        }
+        lease = replace(lease, **{blocker: replacements[blocker]})
+    elif blocker == "origin":
+        # A reachable repository containing the scoped branch: without D3 this
+        # must not fail later merely because fetch has no usable remote.
+        _git(lease.path, "remote", "set-url", "origin", str(case.source))
+    elif blocker == "branch":
+        _git(lease.path, "checkout", "-b", "unrelated")
+    elif blocker == "stale_head":
+        (case.source / "tracked.txt").write_text("new remote\n")
+        _git(case.source, "commit", "-am", "remote advanced")
+        _git(case.source, "push", "origin", "HEAD:worklink/7")
+        expected_message = "^prior-turn draft scoped head is stale$"
+    else:
+        git_dir = lease.path / ".git"
+        if blocker == "merge":
+            (git_dir / "MERGE_HEAD").write_text(case.scope.observed_base_sha + "\n")
+        else:
+            directory = git_dir / "rebase-merge"
+            directory.mkdir()
+            (directory / "head-name").write_text(f"refs/heads/{case.scope.head_ref}\n")
+            (directory / "orig-head").write_text(case.scope.observed_head_sha + "\n")
+        operation = repository.interrupted_pr_checkout(lease, case.scope, runner=case.runner)
+        assert operation.kind == blocker  # valid, attributable operation, not malformed metadata
+        expected_type = repository.DirtyPRCheckoutLeaseRefusal
+    if expected_type is repository.DirtyPRCheckoutLeaseRefusal:
+        expected_message = "dirty lease from prior turn"
+    before = case.snapshot()
+    with pytest.raises(expected_type, match=expected_message) as caught:
+        repository._dispose_prior_turn_draft(lease, case.scope, case.runner, case.notices)
+    assert type(caught.value) is expected_type
+    assert caught.value.__cause__ is None  # not an archival error masking the missing guard
+    assert case.archives == []
+    assert case.events == []
+    assert case.notices == []
+    assert not any(command[0] in {"reset", "clean"} for command in case.commands)
+    assert case.snapshot() == before
+
+
+@pytest.mark.parametrize("corruption", ["manifest", "lease_path", "prior_turn_id"])
+def test_prior_turn_draft_artifact_identity_checked_before_reset(draft_disposal, monkeypatch, corruption):
+    case = draft_disposal
+
+    def corrupt_archive(lease, runner):
+        artifact = case.archive(lease, runner)
+        if corruption == "manifest":
+            manifest = artifact / "complete.json"
+            names = json.loads(manifest.read_text())
+            manifest.write_text(json.dumps([name for name in names if name != "history.bundle"]))
+        else:
+            metadata = artifact / "metadata.json"
+            values = json.loads(metadata.read_text())
+            values[corruption] = "different-identity"
+            metadata.write_text(json.dumps(values))
+        return artifact
+
+    monkeypatch.setattr(repository, "_archive_prior_turn_draft", corrupt_archive)
+    before = case.snapshot()
+    with pytest.raises(repository.DirtyPRCheckoutLeaseRefusal) as caught:
+        repository._dispose_prior_turn_draft(case.lease, case.scope, case.runner, case.notices)
+    expected = "draft artifact is incomplete" if corruption == "manifest" else "draft artifact identity mismatch"
+    assert type(caught.value.__cause__) is RuntimeError
+    assert str(caught.value.__cause__) == expected
+    assert len(case.archives) == 1
+    assert case.events == []
+    assert case.notices == []
+    assert not any(command[0] in {"reset", "clean"} for command in case.commands)
+    assert case.snapshot() == before
+
+
+def test_prior_turn_draft_disposal_requires_clean_status(draft_disposal):
+    case = draft_disposal
+
+    def ineffective_cleanup(args):
+        if args[3] in {"reset", "clean"}:
+            case.commands.append(tuple(args[3:]))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return case.runner(args)
+
+    before = case.snapshot()
+    with pytest.raises(RuntimeError, match="^archived prior-turn draft lease is not clean$"):
+        repository._dispose_prior_turn_draft(case.lease, case.scope, ineffective_cleanup, case.notices)
+    assert len(case.archives) == 1
+    assert ("reset", "--hard", case.scope.observed_head_sha) in case.commands
+    assert ("clean", "-fd") in case.commands
+    assert case.events == ["pr_checkout_prior_turn_draft_archived"]
+    assert case.notices == []
+    assert case.snapshot() == before
+
+
+def test_prior_turn_draft_archival_event_failure_cannot_reset(draft_disposal, monkeypatch):
+    case = draft_disposal
+
+    def broken_event(kind, **_kw):
+        case.events.append(kind)
+        raise RuntimeError("event unavailable")
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", broken_event)
+    before = case.snapshot()
+    with pytest.raises(RuntimeError, match="^event unavailable$"):
+        repository._dispose_prior_turn_draft(case.lease, case.scope, case.runner, case.notices)
+    assert len(case.archives) == 1
+    assert case.events == ["pr_checkout_prior_turn_draft_archived"]
+    assert case.notices == []
+    assert not any(command[0] in {"reset", "clean"} for command in case.commands)
+    assert case.snapshot() == before
+
+
+@pytest.mark.parametrize("pre_turn", [False, True])
+def test_prior_turn_draft_notice_reaches_real_checkout(tmp_path, monkeypatch, pre_turn):
+    from mimir_cultivate import forge
+    from mimir.plugins.core import policy_scope
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "old")
+    _, _, scope, prior = _repo_scope_and_state(tmp_path)
+    lease = prior.checkout_lease
+    (lease.path / "tracked.txt").write_text("draft\n")
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "new")
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *_a, **_kw: None)
+    state = RepoReviewState(scope)
+    auth = replace(
+        _untainted_ifc_auth(), repo_review_state=state, repo_pr_action_scope=scope,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: True)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        result = repository.checkout_scoped_pr(
+            scope.canonical_repo, scope.pr_number,
+            SimpleNamespace(context=auth, pre_turn_checkout=pre_turn),
+        )
+    notice, = result["preserved_prior_work"]
+    assert Path(notice["artifact"]).is_dir()
+    assert notice["prior_turn_id"] == "old"
+    assert state.checkout_lease is not None
+    assert _git(state.checkout_lease.path, "status", "--porcelain=v1") == ""
+
+
+def test_prior_turn_draft_skipped_artifact_cannot_reset(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "old")
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("must survive\n")
+    before = (lease.path / repository._METADATA).read_bytes()
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "new")
+    # Simulate a permissive capture helper that claims success without writing.
+    monkeypatch.setattr(repository, "_archive_prior_turn_draft", lambda *_: tmp_path / "missing")
+    with pytest.raises(repository.DirtyPRCheckoutLeaseRefusal):
+        repository.acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease.lease_root,
+        )
+    assert (lease.path / "tracked.txt").read_text() == "must survive\n"
+    assert (lease.path / repository._METADATA).read_bytes() == before
+
+
+@pytest.mark.parametrize("same_turn", [False, True])
+def test_clean_prior_lease_and_same_turn_draft_unaffected(tmp_path, monkeypatch, same_turn):
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "first-turn")
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    if same_turn:
+        (lease.path / "tracked.txt").write_text("active draft\n")
+    else:
+        monkeypatch.setattr(repository, "_lease_turn_id", lambda: "second-turn")
+    resumed, _ = repository.acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root,
+        runner=lambda args: subprocess.run(args, capture_output=True, text=True, env=_fixture_git_env()),
+    )
+    assert resumed.path == lease.path
+    assert resumed.last_turn_id == ("first-turn" if same_turn else "second-turn")
+
+
+@pytest.mark.parametrize("pre_turn", [False, True])
+def test_dirty_lease_signal_reaches_checkout_and_model(tmp_path, monkeypatch, pre_turn):
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+    from mimir_cultivate import forge
+
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "abandoned-turn-2193")
+    def unavailable(*_):
+        raise OSError("archive store unavailable")
+    monkeypatch.setattr(repository, "_archive_prior_turn_draft", unavailable)
+    _, _, scope, old_state = _repo_scope_and_state(tmp_path)
+    lease = old_state.checkout_lease
+    (lease.path / "draft.txt").write_text("retain this draft\n")
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "next-turn-2193")
+    state = RepoReviewState(scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    auth = replace(
+        _untainted_ifc_auth(), repo_review_state=state, repo_pr_action_scope=scope,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    result = repository.checkout_scoped_pr(
+        scope.canonical_repo, scope.pr_number,
+        SimpleNamespace(context=auth, pre_turn_checkout=pre_turn),
+    )
+    assert result["status"] == "attestation_refused"
+    assert result["reason"] == "checkout_state_mismatch"
+    assert result["details"]["prior_turn_id"] == "abandoned-turn-2193"
+    assert result["details"]["mutation_allowed"] is False
+    assert state.checkout_lease is None
+    prompt = build_turn_prompt(
+        AgentEvent(trigger="poller", channel_id="test", content="CI failed"),
+        prechecked_pr_refusals=[{
+            "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+            "reason": result["reason"], "details": result["details"],
+        }],
+    )
+    assert "dirty_lease_from_prior_turn" in prompt
+    assert "abandoned-turn-2193" in prompt
+    assert "operator_required" in prompt
+
+
 def test_repository_implementation_is_owned_by_provider() -> None:
     root = Path(__file__).resolve().parents[3] / "mimir"
     for retired in (
@@ -1054,6 +1529,7 @@ def test_repo_rebase_records_unpublished_replay_and_next_turn_discards_it(
 def test_dirty_equivalent_checkout_is_preserved_not_discarded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "active-recovery-turn")
     _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
     (lease.path / "draft.txt").write_text("working tree draft\n")
     events = []
@@ -1199,6 +1675,7 @@ def test_behind_head_with_untracked_file_recovers_empty_incremental_bundle(
     import shutil
     import tarfile
 
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "active-recovery-turn")
     source, original, scope, lease = _rebased_divergent_lease(tmp_path, production_clone=True)
     replay = _git(lease.path, "rev-parse", "HEAD")
     reflog_commits = [replay]
@@ -1451,6 +1928,7 @@ def test_preserved_notice_reaches_real_checkout_result(tmp_path: Path, monkeypat
     from mimir.plugins.core import policy_scope
     from langgraph.prebuilt import ToolRuntime
 
+    monkeypatch.setattr(repository, "_lease_turn_id", lambda: "active-recovery-turn")
     _source, _original, scope, lease = _rebased_divergent_lease(tmp_path)
     (lease.path / "draft.txt").write_text("recover me\n")
     state = RepoReviewState(scope)
@@ -2063,11 +2541,23 @@ async def test_repo_test_legs_share_timeout_budget(
 
 def _repo_test_lease_fixture(
     tmp_path, monkeypatch, *, command="/usr/bin/true", wrapper=True,
-    event_type="pr_changes_requested_stale", advance_base=False,
+    event_type="pr_changes_requested_stale", advance_base=False, conflicting=False,
 ):
-    _, _, _, state = _repo_scope_and_state(
-        tmp_path, event_type=event_type, advance_base=advance_base,
-    )
+    if conflicting:
+        from tests.test_repo_tools import _two_sided_conflict_tools
+
+        _, scope, _, _ = _two_sided_conflict_tools(tmp_path)
+        state = RepoReviewState(replace(scope, event_type=event_type))
+        lease_root = tmp_path / "test-leases"
+        lease_root.mkdir()
+        repository.create_pr_checkout_lease(
+            state.action_scope, owner=scope.principal,
+            lease_root=lease_root, review_state=state,
+        )
+    else:
+        _, _, _, state = _repo_scope_and_state(
+            tmp_path, event_type=event_type, advance_base=advance_base,
+        )
     root = state.checkout_lease.path
     (root / "tests").mkdir()
     (root / "tests/test_changed.py").write_text("def test_changed(): pass\n")
@@ -2290,6 +2780,7 @@ async def test_repo_test_async_head_binding(tmp_path, monkeypatch, head_move):
 
     state = _repo_test_lease_fixture(tmp_path, monkeypatch)
     scope = state.action_scope
+    initial_expiry = state.checkout_lease.expires_at
     head = scope.observed_head_sha
     events = []
     started, release = asyncio.Event(), asyncio.Event()
@@ -2340,6 +2831,10 @@ async def test_repo_test_async_head_binding(tmp_path, monkeypatch, head_move):
         registry.save(job, snapshot={**job.record["snapshot"], "head_sha": "b" * 40})
     release.set()
     await job.task
+    # This fixture has no scoped grant binding: test completion alone must not
+    # renew checkout authority.
+    assert job.grant_binding is None
+    assert state.checkout_lease.expires_at == initial_expiry
     assert len(calls) == 2
     [event] = events
     data = json.loads(event.content)
@@ -2526,6 +3021,8 @@ async def test_repo_test_completion_followup_push_gate(tmp_path, monkeypatch, ca
     "lease_metadata", "lease_metadata_symlink",
     "local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge",
     "changed_lease", "missing_lease_before_mint", "failed",
+    "uncommitted_merge", "uncommitted_rebase", "resolved_merge",
+    "dirty_draft_resumed_not_archived",
 ])
 async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     """Real mint -> queue -> route -> fresh mint -> enforced grant validation."""
@@ -2538,7 +3035,22 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     from unittest.mock import AsyncMock
 
     local_merge = case in {"local_merge", "forge_moved_after_merge", "tested_head_after_merge"}
-    state = _repo_test_lease_fixture(tmp_path, monkeypatch, advance_base=local_merge)
+    conflicting = case in {"uncommitted_merge", "uncommitted_rebase", "resolved_merge"}
+    # These cases call public checkout after adding fixture-owned untracked
+    # test/wrapper files. Create them in the queueing turn, not as an abandoned
+    # prior-turn draft: ordinary recovery must not archive/reset this setup.
+    fixture_turn_token = None
+    if conflicting:
+        fixture_turn = _ifc_turn(_untainted_ifc_auth())
+        fixture_turn.turn_id = "queue-turn"
+        fixture_turn_token = set_current_turn(fixture_turn)
+    try:
+        state = _repo_test_lease_fixture(
+            tmp_path, monkeypatch, advance_base=local_merge, conflicting=conflicting,
+        )
+    finally:
+        if fixture_turn_token is not None:
+            reset_current_turn(fixture_turn_token)
     scope = state.action_scope
     lease = state.checkout_lease
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
@@ -2562,7 +3074,8 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     auth.scoped_pr_grants.issue(scope)
     token = ac.consume_scoped_pr_checkout(auth, scope, "cultivate")
-    assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    if not conflicting:
+        assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
     if local_merge:
         # The fixture advanced main independently of the PR; merge only locally.
         repository.RepoGitTools(state, auth_context=auth).execute(repository.GitMerge())
@@ -2621,13 +3134,72 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         state, runner=runner, checkout_factory=_test_checkout_factory,
     ))
     draft = lease.path / "tracked.txt"
-    draft.write_text("queueing turn's uncommitted draft\n")
     queue_turn = _ifc_turn(auth)
     queue_turn.turn_id = "queue-turn"
     turn_token = set_current_turn(queue_turn)
     try:
+        runtime = SimpleNamespace(context=auth)
+        if conflicting:
+            # Real public checkout -> conflict -> resolution -> stage. Do not
+            # mock admission or interrupted-operation authority.
+            assert lease.last_turn_id == queue_turn.turn_id
+            checkout = repository.repo_checkout.func(
+                scope.canonical_repo, scope.pr_number, runtime=runtime,
+            )
+            assert checkout["status"] in {"checked_out", "resumed"}, checkout
+            assert not checkout.get("preserved_prior_work")
+            lease = state.checkout_lease
+            assert (lease.path / "tests/test_changed.py").is_file()
+            assert (lease.path / "scripts/heavy_run.sh").is_file()
+            assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+            operation = "rebase" if case == "uncommitted_rebase" else "merge"
+            with pytest.raises(repository.ToolException, match="conflict"):
+                getattr(repository, f"repo_{operation}").func(
+                    scope.canonical_repo, scope.pr_number, runtime=runtime,
+                )
+            assert state.interrupted_operation is not None
+            assert "<<<<<<<" in draft.read_text()
+            draft.write_text("base property\nhead property\n")
+            assert repository.repo_stage.func(
+                scope.canonical_repo, scope.pr_number, paths=("tracked.txt",), runtime=runtime,
+            )["ok"]
+            assert not _git(lease.path, "ls-files", "-u")
+            assert "tracked.txt" in _git(lease.path, "diff", "--cached", "--name-only")
+            if case != "resolved_merge":
+                from mimir.access_control import (
+                    begin_protected_result_capture, end_protected_result_capture,
+                )
+
+                capture = begin_protected_result_capture()
+                try:
+                    with pytest.raises(repository.ToolPolicyRefusal) as refused:
+                        await repository.repo_test.coroutine(
+                            scope.canonical_repo, scope.pr_number, runtime=runtime,
+                        )
+                finally:
+                    provenance = end_protected_result_capture(capture)
+                    # Also reap a wrongly queued job during mutation testing.
+                    await registry.close()
+                assert "commit the merge with repo_commit before queuing repo_test" in str(refused.value)
+                assert "a completion turn cannot resume an in-progress merge" in str(refused.value)
+                assert refused.value.__cause__.execution_started is False
+                assert provenance is None
+                assert registry.jobs == {}
+                assert not list(registry.directory.glob("*.json"))
+                owner._dispatcher.enqueue.assert_not_called()
+                assert state.full_tested_head is None
+                return
+            assert repository.repo_commit.func(
+                scope.canonical_repo, scope.pr_number,
+                paths=("tracked.txt", "base-test", "head-test", "suite"),
+                message="resolve merge before queuing tests", runtime=runtime,
+            )["ok"]
+            assert not (lease.path / ".git/MERGE_HEAD").exists()
+            assert state.interrupted_operation is None
+            assert len(_git(lease.path, "rev-list", "--parents", "-n", "1", "HEAD").split()) == 3
+        draft.write_text("queueing turn's uncommitted draft\n")
         queued = await repository.repo_test.coroutine(
-            scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+            scope.canonical_repo, scope.pr_number, runtime=runtime,
         )
     finally:
         reset_current_turn(turn_token)
@@ -2650,7 +3222,7 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         event = owner._dispatcher.enqueue.call_args.args[0]
         assert event.continuation_auth_context is None
     completion = event.extra["_repo_test_completion"]
-    if case in {"local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge"}:
+    if case in {"local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge", "resolved_merge"}:
         assert completion.head == state.git_expected_head != scope.observed_head_sha
         assert completion.binding.tested_head == completion.head
         assert completion.binding.observed_head_sha == scope.observed_head_sha
@@ -2771,6 +3343,7 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     )
     has_grant = case in {
         "green", "reduced_actions", "expired_after_queue", "local_merge", "local_commit",
+        "resolved_merge", "dirty_draft_resumed_not_archived",
     } or case.startswith("lease_")
     if not has_grant:
         # Isolate mint admission from the independent ingress IFC classifier:
@@ -2853,9 +3426,34 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
                 assert target.read_text() == "must not be overwritten\n"
             assert not grants._follow
             return
+        if case == "dirty_draft_resumed_not_archived":
+            # Observe the real destructive boundary, not a replacement refusal.
+            # The completion route must return before normal acquisition can
+            # mistake the queueing turn's dirty draft for abandoned work.
+            from unittest.mock import Mock
+
+            disposal = Mock(wraps=repository._dispose_prior_turn_draft)
+            archival = Mock(wraps=repository._archive_prior_turn_draft)
+            monkeypatch.setattr(repository, "_dispose_prior_turn_draft", disposal)
+            monkeypatch.setattr(repository, "_archive_prior_turn_draft", archival)
+            dirty_before = _git(lease.path, "status", "--porcelain=v1")
+            assert dirty_before
+            draft_before = draft.read_bytes()
+            artifact_root = Path(repository.os.environ["MIMIR_HOME"]) / "state" / "pr-lease-drafts"
+            artifacts_before = set(artifact_root.glob("draft-*"))
         result = repository.repo_checkout.func(
             scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=followup),
         )
+        if case == "dirty_draft_resumed_not_archived":
+            disposal.assert_not_called()
+            archival.assert_not_called()
+            assert _git(lease.path, "status", "--porcelain=v1") == dirty_before
+            assert draft.read_bytes() == draft_before
+            assert set(artifact_root.glob("draft-*")) == artifacts_before
+            assert not any(kind in {
+                "pr_checkout_prior_turn_draft_archived", "pr_checkout_prior_turn_draft_disposed",
+            } for kind, _ in handoffs)
+            assert "preserved_prior_work" not in result
         assert result["status"] == "resumed"
         assert state.checkout_lease is lease
         assert draft.read_text() == "queueing turn's uncommitted draft\n"
@@ -2889,6 +3487,205 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) != job.record["head_sha"]
     finally:
         reset_current_turn(turn_token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("repository_git_policy")
+async def test_repo_test_checkout_ttl_chain_excludes_heavy_queue(tmp_path, monkeypatch):
+    """Three real queue/handoff cycles; queue, run and delivery exceed the TTL."""
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import AsyncMock
+
+    from mimir import access_control as ac, event_logger, repo_test_jobs
+    from mimir.agent import _create_turn_auth_context
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge, policy as cultivate_policy
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope, lease = state.action_scope, state.checkout_lease
+    identity = (str(lease.path), lease.recovery_id)
+    initial_metadata = repository._metadata(lease)
+    clock = [datetime.now(UTC)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    monkeypatch.setattr(repository, "datetime", Clock)
+    monkeypatch.setattr(cultivate_policy, "datetime", Clock)
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_a, **_kw: None)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    policy = selected_policy_registry()
+    protocol = policy.scoped_actions["cultivate"]
+    authority = ac.build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=ac.CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=tuple(policy.authority_profiles["github"]),
+        creation_path="mimir.pollers.run_poller", policy=policy, poller_owner="cultivate",
+    )
+    auth = ac.create_auth_context(
+        AgentEvent(trigger="poller", channel_id="poller:github-activity", source="poller",
+                   service_principal=authority.canonical, service_authority=authority,
+                   extra={"poller_name": "github-activity", "items": []}),
+        enforce=True, ifc_labels=InformationFlowLabels(), policy=policy,
+    )
+    auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((state,)))
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    auth.scoped_pr_grants.issue(scope)
+    token = ac.consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    delivered = AsyncMock(return_value=True)
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", delivered)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(forge, "_client", lambda _: object())
+    monkeypatch.setattr(forge, "_live_pr_head", lambda *_: scope.observed_head_sha)
+    monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: True)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(ac, "_github_repo_from_remote", lambda _: scope.canonical_repo)
+    real = repository.RepoProjectTests
+    runs = []
+
+    def assert_pending_survives():
+        def no_reclamation_commands(_argv):
+            pytest.fail("pending checkout reached reclamation proof")
+
+        assert registry.has_pending_checkout(lease)
+        assert lease.is_active
+        assert repository.active_pr_checkout_lease_for_path(lease.path) is not None
+        assert repository.reclaim_expired_pr_checkout_leases(
+            lease.lease_root, now=clock[0], runner=no_reclamation_commands,
+            event_logger=lambda *_a, **_kw: None,
+        ) == []
+        assert lease.path.is_dir()
+
+    async def runner(*args, **kwargs):
+        # No lease-start marker yet: model waiting behind a heavy holder for
+        # longer than the checkout's entire TTL. The snapshot root flock has
+        # already been released, so the real reaper can run here.
+        clock[0] += timedelta(hours=3)
+        assert_pending_survives()
+        started = _lease_start(kwargs["identifier"], repository.time.monotonic())
+        clock[0] += timedelta(minutes=20)
+        assert_pending_survives()
+        runs.append(kwargs["identifier"])
+        return CollectedExecutionResult(0, b"1 passed in 0.01s\n", started, False, False, 0, 0)
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    for index in range(3):
+        turn = _ifc_turn(auth)
+        turn.turn_id = f"queue-{index}"
+        turn_token = set_current_turn(turn)
+        try:
+            queued = await repository.repo_test.coroutine(
+                scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+            )
+        finally:
+            reset_current_turn(turn_token)
+        job = registry.jobs[queued["job_id"]]
+        assert job.grant_binding.lease_identity == identity
+        # Even scheduling the worker may take longer than the original TTL.
+        clock[0] += timedelta(hours=3)
+        assert_pending_survives()
+        await job.task
+        assert job.record["status"] == "completed", job.record
+        assert job.record["result"]["evidence"] is True
+        assert lease.expires_at == clock[0] + timedelta(hours=2)
+        assert job.record["delivered"]
+        # Delivery to the dispatcher is NOT consumption of the reservation.
+        clock[0] += timedelta(minutes=90)
+        assert_pending_survives()
+        event = delivered.call_args.args[0]
+        followup = _create_turn_auth_context(
+            event, None, policy_version=None, enforce=True,
+            ifc_labels=job.labels, policy=policy,
+        )
+        assert followup.scoped_pr_grants is not None
+        turn = _ifc_turn(followup)
+        turn.turn_id = f"completion-{index}"
+        turn_token = set_current_turn(turn)
+        try:
+            token = ac.consume_scoped_pr_checkout(followup, scope, "cultivate")
+            result = repository.checkout_scoped_pr(
+                scope.canonical_repo, scope.pr_number, SimpleNamespace(context=followup),
+            )
+            assert result["status"] == "resumed"
+            assert ac.observe_scoped_pr_checkout(
+                followup, scope, state, token, "cultivate", protocol,
+            )
+        finally:
+            reset_current_turn(turn_token)
+        assert lease.expires_at == clock[0] + timedelta(hours=2)
+        assert not registry.has_pending_checkout(lease)
+        assert state.checkout_lease is lease
+        metadata = repository._metadata(lease)
+        assert json.loads((lease.path / repository._METADATA).read_text()) == metadata
+        for key in initial_metadata.keys() - {"expires_at", "last_turn_id"}:
+            assert metadata[key] == initial_metadata[key]
+        clock[0] += timedelta(minutes=90)
+        assert lease.is_active
+        auth = followup
+    assert len(runs) == 6  # both legs of all three queued jobs
+    # Historical delivered jobs must not exempt an unattended lease.
+    clock[0] += timedelta(minutes=31)
+    assert not lease.is_active
+    [reclaimed] = repository.reclaim_expired_pr_checkout_leases(
+        lease.lease_root, now=clock[0], event_logger=lambda *_a, **_kw: None,
+    )
+    assert reclaimed.reclaimed
+    assert not lease.path.exists()
+
+
+def test_checkout_reaper_rechecks_job_before_rename(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from mimir import repo_test_jobs
+    from mimir.access_control import RepoTestGrantBinding
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope, lease = state.action_scope, state.checkout_lease
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock())
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    binding = RepoTestGrantBinding(
+        scope, frozenset(), (str(lease.path), lease.recovery_id),
+        scope.observed_head_sha, scope.observed_head_sha, lease.last_turn_id, None,
+    )
+    steps = []
+
+    def on_step(step):
+        steps.append(step)
+        if step == "rename":
+            registry.jobs["pending"] = repo_test_jobs.RepoTestJob({}, grant_binding=binding)
+
+    with pytest.raises(repository._LeaseBecameActive):
+        repository._reclaim_tombstone(lease, lambda: set(), on_step)
+    assert steps == ["rename"]
+    assert lease.path.is_dir()
+
+
+@pytest.mark.parametrize("symlink", ["metadata", "git_directory"])
+def test_checkout_ttl_renewal_refuses_symlink_write(tmp_path, monkeypatch, symlink):
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    lease = state.checkout_lease
+    before = repository._metadata(lease)
+    metadata = lease.path / repository._METADATA
+    target = tmp_path / "renewal-target"
+    if symlink == "metadata":
+        metadata.rename(target)
+        metadata.symlink_to(target)
+    else:
+        metadata.parent.rename(target)
+        metadata.parent.symlink_to(target, target_is_directory=True)
+        target = target / metadata.name
+    contents = target.read_bytes()
+    with pytest.raises(RuntimeError, match="symlink"):
+        repository._renew_pr_checkout_handoff(lease, last_turn_id="completion")
+    assert target.read_bytes() == contents
+    assert repository._metadata(lease) == before
 
 
 @pytest.mark.asyncio

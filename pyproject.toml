@@ -174,6 +174,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mimir"]
+# The editable-layout mirror is selected by packages above. Exclude it from
+# normal wheel discovery so force-include writes the canonical source exactly
+# once (including when building the wheel from the sdist).
+exclude = [
+    "mimir/heavy_run/heavy_run.py",
+    # Target-specific excludes replace the shared list; retain its protections.
+    "tests/fixtures/plugins/example/**",
+    "mimir/deepagent_poc/**",
+    "mimir/**/_smoke_*",
+    "mimir/**/_bench_*.log",
+]
 
 # Operator reference docs. They live at the repo root (docs/, README.md,
 # .env.example) for GitHub + README links, but must ALSO ship in the wheel so
@@ -186,6 +197,9 @@ packages = ["mimir"]
 ".env.example" = "mimir/bundled_docs/.env.example"
 "Dockerfile" = "mimir/docker_context/Dockerfile"
 "deploy/s6-overlay/s6-rc.d" = "mimir/docker_context/deploy/s6-overlay/s6-rc.d"
+"scripts/heavy_run.sh" = "mimir/heavy_run/heavy_run.sh"
+# One canonical protocol source, also used by the source-tree shell wrapper.
+"scripts/heavy_run.py" = "mimir/heavy_run/heavy_run.py"
 
 # ...and the sdist must CARRY those root paths, because `uv build` builds the
 # wheel FROM the freshly built sdist. With no sdist config, hatchling's default
@@ -200,6 +214,8 @@ packages = ["mimir"]
 ".env.example" = ".env.example"
 "Dockerfile" = "Dockerfile"
 "deploy/s6-overlay/s6-rc.d" = "deploy/s6-overlay/s6-rc.d"
+"scripts/heavy_run.sh" = "scripts/heavy_run.sh"
+"scripts/heavy_run.py" = "scripts/heavy_run.py"
 
 [tool.hatch.build]
 # The built React app (mimir/react_app/dist/) is a VCS-IGNORED build artifact:
