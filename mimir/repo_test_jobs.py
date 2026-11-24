@@ -144,6 +144,25 @@ class RepoTestJobRegistry:
             os.fsync(stream.fileno())
         temporary.replace(path)
 
+    def has_pending_checkout(self, lease: Any) -> bool:
+        """Protect only an in-process binding until its checkout handoff.
+
+        Delivery means queued to the agent, not resumed. Persisted records have
+        no binding and cannot keep a checkout alive after a restart.
+        """
+        from .access_control import RepoTestGrantBinding
+
+        for job in tuple(self.jobs.values()):
+            binding = job.grant_binding
+            if (
+                isinstance(binding, RepoTestGrantBinding)
+                and binding.lease_identity == (str(lease.path), lease.recovery_id)
+                and binding.scope.scope_id == lease.scope_id
+                and binding.starting_turn_id == lease.last_turn_id
+            ):
+                return True
+        return False
+
     def enqueue(
         self, *, repository: str, pull_request: int, head_sha: str, suite: str,
         selectors: tuple[str, ...], channel_id: str, starting_turn_id: str | None,

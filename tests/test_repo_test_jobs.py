@@ -38,6 +38,45 @@ def enqueue(registry, run, **overrides):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "queued", "delivered", "resumed", "identity", "scope", "turn", "missing", "untyped", "restart",
+])
+async def test_pending_checkout_requires_exact_in_process_binding(tmp_path, case):
+    from mimir.access_control import RepoTestGrantBinding
+
+    lease = SimpleNamespace(
+        path=tmp_path / "checkout", recovery_id="recovery", scope_id="scope", last_turn_id="turn-1",
+    )
+    binding = RepoTestGrantBinding(
+        SimpleNamespace(scope_id="scope"), frozenset(), (str(lease.path), "recovery"),
+        "a" * 40, "a" * 40, "turn-1", None,
+    )
+    if case == "identity":
+        binding = replace(binding, lease_identity=(str(lease.path), "other"))
+    elif case == "scope":
+        binding = replace(binding, scope=SimpleNamespace(scope_id="other"))
+    elif case == "turn":
+        binding = replace(binding, starting_turn_id="other")
+    elif case == "missing":
+        binding = None
+    elif case == "untyped":
+        binding = SimpleNamespace(**vars(binding))
+    registry = RepoTestJobRegistry(tmp_path / "jobs", AsyncMock(return_value=True))
+    queued = enqueue(registry, AsyncMock(return_value={"ok": True}), grant_binding=binding)
+    job = registry.jobs[queued["job_id"]]
+    try:
+        if case != "queued":
+            await job.task
+        if case == "resumed":
+            lease.last_turn_id = "completion-turn"
+        if case == "restart":
+            registry = RepoTestJobRegistry(registry.directory, AsyncMock())
+        assert registry.has_pending_checkout(lease) is (case in {"queued", "delivered"})
+    finally:
+        await job.task
+
+
+@pytest.mark.asyncio
 async def test_repo_test_job_deduplication_and_durable_private_result(tmp_path):
     delivered = AsyncMock(return_value=True)
     registry = RepoTestJobRegistry(tmp_path / "jobs", delivered)
