@@ -54,6 +54,7 @@ from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain.agents.middleware.types import ModelRequest
 
 from .channel_registry import (
     ChannelRegistry,
@@ -1505,6 +1506,24 @@ def _trace_usage(message: AIMessage) -> dict[str, int] | None:
         return None
 
 
+class _SynthesisSkillsMiddleware(SeedFilteredSkillsMiddleware):
+    """Do not advertise a file read for the memory skill inlined in synthesis."""
+
+    def modify_request(self, request: ModelRequest) -> ModelRequest:
+        context = getattr(request.runtime, "context", None)
+        if isinstance(context, AuthContext) and context.trigger == "saga_session_end":
+            # Request-local only: the graph and checkpointed catalog can also
+            # serve normal turns, which still load memory via the usual path.
+            request = request.override(state={
+                **request.state,
+                "skills_metadata": [
+                    skill for skill in (request.state.get("skills_metadata") or [])
+                    if skill["name"] != "memory"
+                ],
+            })
+        return super().modify_request(request)
+
+
 class Agent:
     """Deepagents-backed mimir Agent.
 
@@ -2156,7 +2175,7 @@ class Agent:
                 # Replaces deepagents' default skills slot (main agent and the
                 # general-purpose subagent) so skills seeded by a deselected
                 # plugin never reach the catalog.
-                self._agent_skills_middleware = SeedFilteredSkillsMiddleware(
+                self._agent_skills_middleware = _SynthesisSkillsMiddleware(
                     backend=self._backend, sources=skill_sources,
                     home=self._config.home, policy=self._config.plugin_manager.policy,
                 )

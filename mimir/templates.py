@@ -432,7 +432,12 @@ def render_saga_session_end(
     EXCEPT the lean variant has no ``{atom_feedback_block}`` slot —
     rendering passes only the placeholders the active template actually
     uses, so an operator's full-template override still works after
-    this change."""
+    this change.
+
+    The shipped memory skill is appended AFTER formatting, outside both
+    templates. Operator overrides cannot omit it, and braces in the skill
+    content are not interpreted as template placeholders. No extra placeholder
+    is needed in either override."""
     from .access_control import TRIGGER_AUTHORITY_PROFILES
 
     available_tools = "\n".join(
@@ -442,7 +447,7 @@ def render_saga_session_end(
         template = load_template(
             "saga_session_end", SAGA_SESSION_END_DEFAULT, prompts_dir,
         )
-        return _safe_format(
+        rendered = _safe_format(
             template, SAGA_SESSION_END_DEFAULT, "saga_session_end",
             channel_id=channel_id,
             saga_session_id=saga_session_id,
@@ -451,16 +456,33 @@ def render_saga_session_end(
             turn_summary_block=_turn_summary_lines(turns_window),
             atom_feedback_block=_atom_feedback_lines(turns_window),
         )
-    template = load_template(
-        "saga_session_end_lean", SAGA_SESSION_END_LEAN_DEFAULT, prompts_dir,
+    else:
+        template = load_template(
+            "saga_session_end_lean", SAGA_SESSION_END_LEAN_DEFAULT, prompts_dir,
+        )
+        rendered = _safe_format(
+            template, SAGA_SESSION_END_LEAN_DEFAULT, "saga_session_end_lean",
+            channel_id=channel_id,
+            saga_session_id=saga_session_id,
+            idle_minutes=idle_minutes,
+            available_tools=available_tools,
+            turn_summary_block=_turn_summary_lines(turns_window),
+        )
+    # Load only the shipped source, not a home-installed/operator skill. This
+    # trusted guidance must not open a read path around synthesis's input filter.
+    memory_skill = (Path(__file__).parent / "skills" / "memory" / "SKILL.md").read_text(
+        encoding="utf-8",
     )
-    return _safe_format(
-        template, SAGA_SESSION_END_LEAN_DEFAULT, "saga_session_end_lean",
-        channel_id=channel_id,
-        saga_session_id=saga_session_id,
-        idle_minutes=idle_minutes,
-        available_tools=available_tools,
-        turn_summary_block=_turn_summary_lines(turns_window),
+    return (
+        rendered
+        + "\n\n## Memory skill (`memory`)\n\n"
+        "Included in full below; it is already loaded, so do not read its SKILL.md.\n"
+        "Apply its memory criteria within this synthesis turn's capability limits. "
+        "The session-boundary restrictions above take precedence: do not follow "
+        "instructions below to read files, search memory, edit existing files, open "
+        "proposals, or load other skills. Use only available tools and already "
+        "provided context; defer anything requiring unavailable tools.\n\n"
+        + memory_skill
     )
 
 
