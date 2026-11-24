@@ -2768,6 +2768,7 @@ async def test_repo_test_async_head_binding(tmp_path, monkeypatch, head_move):
 
     state = _repo_test_lease_fixture(tmp_path, monkeypatch)
     scope = state.action_scope
+    initial_expiry = state.checkout_lease.expires_at
     head = scope.observed_head_sha
     events = []
     started, release = asyncio.Event(), asyncio.Event()
@@ -2818,6 +2819,10 @@ async def test_repo_test_async_head_binding(tmp_path, monkeypatch, head_move):
         registry.save(job, snapshot={**job.record["snapshot"], "head_sha": "b" * 40})
     release.set()
     await job.task
+    # This fixture has no scoped grant binding: test completion alone must not
+    # renew checkout authority.
+    assert job.grant_binding is None
+    assert state.checkout_lease.expires_at == initial_expiry
     assert len(calls) == 2
     [event] = events
     data = json.loads(event.content)
@@ -3394,6 +3399,205 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) != job.record["head_sha"]
     finally:
         reset_current_turn(turn_token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("repository_git_policy")
+async def test_repo_test_checkout_ttl_chain_excludes_heavy_queue(tmp_path, monkeypatch):
+    """Three real queue/handoff cycles; queue, run and delivery exceed the TTL."""
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import AsyncMock
+
+    from mimir import access_control as ac, event_logger, repo_test_jobs
+    from mimir.agent import _create_turn_auth_context
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge, policy as cultivate_policy
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope, lease = state.action_scope, state.checkout_lease
+    identity = (str(lease.path), lease.recovery_id)
+    initial_metadata = repository._metadata(lease)
+    clock = [datetime.now(UTC)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    monkeypatch.setattr(repository, "datetime", Clock)
+    monkeypatch.setattr(cultivate_policy, "datetime", Clock)
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_a, **_kw: None)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    policy = selected_policy_registry()
+    protocol = policy.scoped_actions["cultivate"]
+    authority = ac.build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=ac.CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=tuple(policy.authority_profiles["github"]),
+        creation_path="mimir.pollers.run_poller", policy=policy, poller_owner="cultivate",
+    )
+    auth = ac.create_auth_context(
+        AgentEvent(trigger="poller", channel_id="poller:github-activity", source="poller",
+                   service_principal=authority.canonical, service_authority=authority,
+                   extra={"poller_name": "github-activity", "items": []}),
+        enforce=True, ifc_labels=InformationFlowLabels(), policy=policy,
+    )
+    auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((state,)))
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    auth.scoped_pr_grants.issue(scope)
+    token = ac.consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    delivered = AsyncMock(return_value=True)
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", delivered)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(forge, "_client", lambda _: object())
+    monkeypatch.setattr(forge, "_live_pr_head", lambda *_: scope.observed_head_sha)
+    monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: True)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(ac, "_github_repo_from_remote", lambda _: scope.canonical_repo)
+    real = repository.RepoProjectTests
+    runs = []
+
+    def assert_pending_survives():
+        def no_reclamation_commands(_argv):
+            pytest.fail("pending checkout reached reclamation proof")
+
+        assert registry.has_pending_checkout(lease)
+        assert lease.is_active
+        assert repository.active_pr_checkout_lease_for_path(lease.path) is not None
+        assert repository.reclaim_expired_pr_checkout_leases(
+            lease.lease_root, now=clock[0], runner=no_reclamation_commands,
+            event_logger=lambda *_a, **_kw: None,
+        ) == []
+        assert lease.path.is_dir()
+
+    async def runner(*args, **kwargs):
+        # No lease-start marker yet: model waiting behind a heavy holder for
+        # longer than the checkout's entire TTL. The snapshot root flock has
+        # already been released, so the real reaper can run here.
+        clock[0] += timedelta(hours=3)
+        assert_pending_survives()
+        started = _lease_start(kwargs["identifier"], repository.time.monotonic())
+        clock[0] += timedelta(minutes=20)
+        assert_pending_survives()
+        runs.append(kwargs["identifier"])
+        return CollectedExecutionResult(0, b"1 passed in 0.01s\n", started, False, False, 0, 0)
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda state: real(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    for index in range(3):
+        turn = _ifc_turn(auth)
+        turn.turn_id = f"queue-{index}"
+        turn_token = set_current_turn(turn)
+        try:
+            queued = await repository.repo_test.coroutine(
+                scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+            )
+        finally:
+            reset_current_turn(turn_token)
+        job = registry.jobs[queued["job_id"]]
+        assert job.grant_binding.lease_identity == identity
+        # Even scheduling the worker may take longer than the original TTL.
+        clock[0] += timedelta(hours=3)
+        assert_pending_survives()
+        await job.task
+        assert job.record["status"] == "completed", job.record
+        assert job.record["result"]["evidence"] is True
+        assert lease.expires_at == clock[0] + timedelta(hours=2)
+        assert job.record["delivered"]
+        # Delivery to the dispatcher is NOT consumption of the reservation.
+        clock[0] += timedelta(minutes=90)
+        assert_pending_survives()
+        event = delivered.call_args.args[0]
+        followup = _create_turn_auth_context(
+            event, None, policy_version=None, enforce=True,
+            ifc_labels=job.labels, policy=policy,
+        )
+        assert followup.scoped_pr_grants is not None
+        turn = _ifc_turn(followup)
+        turn.turn_id = f"completion-{index}"
+        turn_token = set_current_turn(turn)
+        try:
+            token = ac.consume_scoped_pr_checkout(followup, scope, "cultivate")
+            result = repository.checkout_scoped_pr(
+                scope.canonical_repo, scope.pr_number, SimpleNamespace(context=followup),
+            )
+            assert result["status"] == "resumed"
+            assert ac.observe_scoped_pr_checkout(
+                followup, scope, state, token, "cultivate", protocol,
+            )
+        finally:
+            reset_current_turn(turn_token)
+        assert lease.expires_at == clock[0] + timedelta(hours=2)
+        assert not registry.has_pending_checkout(lease)
+        assert state.checkout_lease is lease
+        metadata = repository._metadata(lease)
+        assert json.loads((lease.path / repository._METADATA).read_text()) == metadata
+        for key in initial_metadata.keys() - {"expires_at", "last_turn_id"}:
+            assert metadata[key] == initial_metadata[key]
+        clock[0] += timedelta(minutes=90)
+        assert lease.is_active
+        auth = followup
+    assert len(runs) == 6  # both legs of all three queued jobs
+    # Historical delivered jobs must not exempt an unattended lease.
+    clock[0] += timedelta(minutes=31)
+    assert not lease.is_active
+    [reclaimed] = repository.reclaim_expired_pr_checkout_leases(
+        lease.lease_root, now=clock[0], event_logger=lambda *_a, **_kw: None,
+    )
+    assert reclaimed.reclaimed
+    assert not lease.path.exists()
+
+
+def test_checkout_reaper_rechecks_job_before_rename(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from mimir import repo_test_jobs
+    from mimir.access_control import RepoTestGrantBinding
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope, lease = state.action_scope, state.checkout_lease
+    registry = repo_test_jobs.RepoTestJobRegistry(tmp_path / "jobs", AsyncMock())
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    binding = RepoTestGrantBinding(
+        scope, frozenset(), (str(lease.path), lease.recovery_id),
+        scope.observed_head_sha, scope.observed_head_sha, lease.last_turn_id, None,
+    )
+    steps = []
+
+    def on_step(step):
+        steps.append(step)
+        if step == "rename":
+            registry.jobs["pending"] = repo_test_jobs.RepoTestJob({}, grant_binding=binding)
+
+    with pytest.raises(repository._LeaseBecameActive):
+        repository._reclaim_tombstone(lease, lambda: set(), on_step)
+    assert steps == ["rename"]
+    assert lease.path.is_dir()
+
+
+@pytest.mark.parametrize("symlink", ["metadata", "git_directory"])
+def test_checkout_ttl_renewal_refuses_symlink_write(tmp_path, monkeypatch, symlink):
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    lease = state.checkout_lease
+    before = repository._metadata(lease)
+    metadata = lease.path / repository._METADATA
+    target = tmp_path / "renewal-target"
+    if symlink == "metadata":
+        metadata.rename(target)
+        metadata.symlink_to(target)
+    else:
+        metadata.parent.rename(target)
+        metadata.parent.symlink_to(target, target_is_directory=True)
+        target = target / metadata.name
+    contents = target.read_bytes()
+    with pytest.raises(RuntimeError, match="symlink"):
+        repository._renew_pr_checkout_handoff(lease, last_turn_id="completion")
+    assert target.read_bytes() == contents
+    assert repository._metadata(lease) == before
 
 
 @pytest.mark.asyncio

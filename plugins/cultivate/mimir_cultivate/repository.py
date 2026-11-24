@@ -1045,10 +1045,38 @@ class PRCheckoutLease:
 
     @property
     def is_active(self) -> bool:
-        return not self.revoked and datetime.now(UTC) < self.expires_at and self.path.is_dir()
+        return (
+            not self.revoked and self.path.is_dir()
+            and (datetime.now(UTC) < self.expires_at or _pending_pr_checkout_job(self))
+        )
 
     def revoke(self) -> None:
         object.__setattr__(self, "revoked", True)
+
+
+def _pending_pr_checkout_job(lease: PRCheckoutLease) -> bool:
+    from mimir.repo_test_jobs import get_registry
+
+    registry = get_registry()
+    return registry is not None and registry.has_pending_checkout(lease)
+
+
+def _renew_pr_checkout_handoff(
+    lease: PRCheckoutLease, *, last_turn_id: str | None,
+) -> None:
+    """Persist before updating the shared object; never mint a new identity."""
+    metadata = lease.path / _METADATA
+    if metadata.is_symlink() or metadata.parent.is_symlink():
+        raise RuntimeError("PR checkout lease metadata may not be a symlink")
+    renewed = replace(
+        lease, expires_at=datetime.now(UTC) + timedelta(hours=2),
+        last_turn_id=last_turn_id,
+    )
+    metadata.write_text(
+        json.dumps(_metadata(renewed), sort_keys=True) + "\n", encoding="utf-8",
+    )
+    object.__setattr__(lease, "expires_at", renewed.expires_at)
+    object.__setattr__(lease, "last_turn_id", renewed.last_turn_id)
 
 
 def _observe_current_pr_head(scope: RepoPRActionScope) -> str:
@@ -1180,7 +1208,7 @@ def active_pr_checkout_lease_for_path(path: str | Path) -> PRCheckoutLease | Non
         if Path(raw["lease_root"]).resolve(strict=True) != root:
             return None
         lease = _lease_from_recorded_metadata(lease_path, root)
-        if lease.expires_at <= datetime.now(UTC) or not lease.path.is_dir():
+        if not lease.is_active:
             return None
         return lease
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
@@ -1933,7 +1961,7 @@ def _reclaim_tombstone(lease: PRCheckoutLease, active_paths: Callable[[], set[Pa
     # The caller holds the root flock. Recheck immediately before removing the
     # live name: Git commands during proof/bundling can attach a live turn.
     on_step("rename")
-    if lease.path.resolve(strict=False) in active_paths():
+    if lease.path.resolve(strict=False) in active_paths() or _pending_pr_checkout_job(lease):
         raise _LeaseBecameActive
     tombstone = lease.lease_root / f"{_TOMBSTONE_PREFIX}{lease.path.name}-{uuid.uuid4().hex}"
     os.rename(lease.path, tombstone)
@@ -1949,7 +1977,7 @@ def reclaim_expired_pr_checkout_leases(
     runner: Runner = _default_runner,
     event_logger: Callable[..., None] | None = None,
 ) -> list[PRCheckoutLeaseReclamation]:
-    """Safely reclaim expired leases not attached to a live turn."""
+    """Safely reclaim expired leases not attached to a live turn or test job."""
     if lease_root.is_symlink():
         raise RuntimeError("PR checkout lease root may not be a symlink")
     root = lease_root.resolve(strict=True)
@@ -1988,7 +2016,10 @@ def reclaim_expired_pr_checkout_leases(
                 lease = _lease_from_recorded_metadata(path, root)
             except RuntimeError:
                 continue
-            if observed_at < lease.expires_at or path.resolve(strict=False) in active():
+            if (
+                observed_at < lease.expires_at or path.resolve(strict=False) in active()
+                or _pending_pr_checkout_job(lease)
+            ):
                 continue
             size_bytes = 0
             proof = False
@@ -6497,10 +6528,7 @@ def checkout_scoped_pr(
 
         turn = get_current_turn()
         prior_turn_id = existing.last_turn_id
-        object.__setattr__(existing, "last_turn_id", getattr(turn, "turn_id", None))
-        (existing.path / _METADATA).write_text(
-            json.dumps(_metadata(existing), sort_keys=True) + "\n", encoding="utf-8",
-        )
+        _renew_pr_checkout_handoff(existing, last_turn_id=getattr(turn, "turn_id", None))
         from mimir.event_logger import log_event_sync
 
         log_event_sync(
@@ -6817,6 +6845,7 @@ async def _queue_repo_test(
 
     retained = isinstance(state, RetainedFactoryScope)
     scope = state if retained else state.action_scope
+    checkout_lease = None if retained else state.checkout_lease
     git_tools = (RepoGitTools(retained_scope=scope, runner=retained_factory_git_runner)
                  if retained else RepoGitTools(state))
     root = git_tools.validated_checkout_root()
@@ -6885,10 +6914,20 @@ async def _queue_repo_test(
             else:
                 stack.enter_context(hold_pr_checkout_lease(state.checkout_lease))
                 executor = RepoProjectTests(state)
-            result = asdict(await executor.execute(
-                selected, suite=suite_name, record_evidence=False,
-                job_checkpoint=checkpoint,
-            ))
+            try:
+                result = asdict(await executor.execute(
+                    selected, suite=suite_name, record_evidence=False,
+                    job_checkpoint=checkpoint,
+                ))
+            finally:
+                if binding is not None:
+                    # The snapshot checkpoint released the root lock before
+                    # waiting for the heavy lease. That wait (and the run) does
+                    # not consume the completion turn's checkout TTL.
+                    with hold_pr_checkout_lease(checkout_lease):
+                        _renew_pr_checkout_handoff(
+                            checkout_lease, last_turn_id=checkout_lease.last_turn_id,
+                        )
         result.pop("failure_summary", None)
         if retained:
             result["evidence"] = False
