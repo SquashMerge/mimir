@@ -1155,3 +1155,45 @@ def test_a_large_waiter_gives_back_its_reservation_when_a_ticket_lands_ahead(tmp
         for path, fd in held.held.items():
             module._release(path, fd)
             os.close(fd)
+
+
+def _python39() -> str | None:
+    """A Python 3.9 interpreter, the helper's floor, when the host has one.
+
+    heavy_run.sh runs the helper with whatever ``python3`` is on PATH; over ssh
+    on macOS that is the system 3.9, whatever the project's own interpreter is.
+    """
+    for candidate in ("/usr/bin/python3", "/usr/bin/python3.9", "/usr/local/bin/python3.9"):
+        if not os.access(candidate, os.X_OK):
+            continue
+        try:
+            probe = subprocess.run([candidate, "-I", "-c", "import sys; print(sys.version_info[:2])"],
+                                   capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0 and probe.stdout.strip() == "(3, 9)":
+            return candidate
+    return None
+
+
+def test_helper_source_parses_at_the_python39_floor() -> None:
+    import ast
+    ast.parse(SCRIPT.with_suffix(".py").read_text(), feature_version=(3, 9))
+
+
+@pytest.mark.parametrize("tier", ["medium", "large"])
+def test_acquire_run_release_under_python39(tmp_path: Path, tier: str) -> None:
+    # Regression: Path.stat(follow_symlinks=...) is 3.10+. Under the system 3.9 the
+    # helper ran its command, then raised in _release and left the lease held.
+    python = _python39()
+    if python is None:
+        pytest.skip("no Python 3.9 interpreter on this host")
+    done = tmp_path / "ran"
+    result = _run(tmp_path, "touch", str(done), MIMIR_HEAVY_PYTHON=python, MIMIR_HEAVY_TIER=tier)
+    assert result.returncode == 0, result.stderr
+    assert "Traceback" not in result.stderr, result.stderr
+    assert done.exists()
+    assert not _slot(tmp_path, "lease").exists() and not _slot(tmp_path, "lease2").exists()
+    queue = _slot(tmp_path, "queue")
+    assert not queue.exists() or not any(queue.iterdir())
+    assert not list(tmp_path.glob("*.retired-*"))

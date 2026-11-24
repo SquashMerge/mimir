@@ -28,6 +28,11 @@ idle while a large job waits for the second one. Ticket order is best-effort
 arrival order (see ``Queue``): a delayed enqueuer can land ahead of an earlier
 waiter, and a waiter that loses the head gives back any reserved slot, so the
 lease can be reordered but never wedged.
+
+Keep this helper compatible with Python 3.9. heavy_run.sh launches it with
+whatever ``python3`` is on PATH, and a non-interactive shell (ssh, cron) on
+macOS gets the system ``/usr/bin/python3``, which is 3.9. A 3.10+ call that
+fails mid-release leaves the lease held until stale-breaking clears it.
 """
 from __future__ import annotations
 
@@ -81,7 +86,8 @@ def _identity(fd: int) -> tuple[int, int]:
 
 def _is_current(path: Path, fd: int) -> bool:
     try:
-        stat = path.stat(follow_symlinks=False)
+        # os.stat, not Path.stat: Path.stat takes follow_symlinks only from 3.10.
+        stat = os.stat(path, follow_symlinks=False)
         return (stat.st_dev, stat.st_ino) == _identity(fd)
     except FileNotFoundError:
         return False
