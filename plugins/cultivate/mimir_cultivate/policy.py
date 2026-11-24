@@ -716,9 +716,11 @@ def _valid_interrupted_operation(scope, state, tool_name, turn_nonce, *, interru
     elif evidence.kind == "merge":
         # Resolving our own merge does not detach or advance HEAD. Preserve the
         # ordinary scoped writes through commit, but never publish MERGE_HEAD.
+        # Historical reads retain their base/head ancestry check and provenance;
+        # rebases deliberately remain limited to inspection and abort above.
         allowed.update({
             "repo_merge_abort", "edit_file", "write_file", "repo_stage",
-            "repo_restore_file", "repo_test", "repo_commit",
+            "repo_file_at_revision", "repo_restore_file", "repo_test", "repo_commit",
         })
     else:
         return False
