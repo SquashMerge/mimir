@@ -3152,7 +3152,6 @@ _HISTORY_REWRITE_EVENT_TYPES = frozenset({
     "pr_changes_requested_stale",
     "pr_ci_failure",
     "pr_mergeability_rebase",
-    "pr_mergeability_conflicting",
 })
 _PROTECTED_BRANCH_REFS = frozenset({"refs/heads/main", "refs/heads/master"})
 _recent_agent_pushes: OrderedDict[tuple[str, int, str, str], None] = OrderedDict()
@@ -3334,9 +3333,27 @@ class GitStage:
 
 
 @dataclass(frozen=True)
+class ConflictResolutionEvidence:
+    path: str
+    base_property: str
+    base_verification: str
+    head_property: str
+    head_verification: str
+
+
+@dataclass(frozen=True)
+class _ConflictMerge:
+    original_head: str
+    base: str
+    pr_paths: frozenset[str]
+    conflicted_paths: frozenset[str]
+
+
+@dataclass(frozen=True)
 class GitCommit:
     paths: tuple[str, ...]
     message: str
+    conflict_evidence: tuple[ConflictResolutionEvidence, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3352,11 +3369,6 @@ class GitMergeAbort:
 @dataclass(frozen=True)
 class GitRebase:
     """Rebase onto the server-bound observed base commit."""
-
-    base_property: str = ""
-    base_verification: str = ""
-    head_property: str = ""
-    head_verification: str = ""
 
 
 @dataclass(frozen=True)
@@ -3929,7 +3941,7 @@ class RepoGitTools:
             self._state.record_git_head(self._scope.scope_id, self._expected_head)
 
     def _finish_recovery(
-        self, recovery: InterruptedGitOperation | None, *, continued: bool = False,
+        self, recovery: InterruptedGitOperation | None,
     ) -> None:
         if recovery is None:
             return
@@ -3942,7 +3954,7 @@ class RepoGitTools:
         def runner(args: list[str]) -> GitProcessResult:
             return self._command(tuple(args[3:]))
         head, valid = _foreign_candidate_head(lease, self._scope, owner=self._scope.principal, runner=runner)
-        if not valid or (not continued and head != recovery.original_head):
+        if not valid or head != recovery.original_head:
             raise GitRefusal("checkout_recovery_required", "post-abort PR lease validation failed")
         object.__setattr__(lease, "interrupted_operation", None)
 
@@ -4007,7 +4019,7 @@ class RepoGitTools:
             raise GitRefusal("lineage_record_failed", "local commit lineage could not be recorded") from exc
 
     @staticmethod
-    def _conflict_evidence(operation: GitRebase) -> tuple[str, str, str, str]:
+    def _conflict_evidence(operation: ConflictResolutionEvidence) -> tuple[str, str, str, str]:
         values = (
             operation.base_property,
             operation.base_verification,
@@ -4023,10 +4035,50 @@ class RepoGitTools:
         ):
             raise GitRefusal(
                 "conflict_evidence_required",
-                "continuing a conflicting rebase requires non-empty base/head properties "
+                "committing a conflict resolution requires non-empty base/head properties "
                 "and a verification for each",
             )
         return tuple(value.strip() for value in values)  # type: ignore[return-value]
+
+    def _changed_paths(self, before: str, after: str) -> frozenset[str]:
+        return frozenset(filter(None, self._command((
+            "diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv",
+            "--no-renames", before, after, "--",
+        )).stdout.split("\x00")))
+
+    def _merge_evidence_message(self, operation: GitCommit) -> str:
+        proof = self._state.conflict_merge
+        if (
+            not isinstance(proof, _ConflictMerge)
+            or proof.original_head != self._expected_head
+            or self._command(("rev-parse", "--verify", "MERGE_HEAD")).stdout.strip() != proof.base
+        ):
+            raise GitRefusal("conflict_evidence_required", "a typed conflicting base merge is required")
+        entries = operation.conflict_evidence
+        if (
+            not isinstance(entries, tuple)
+            or not 1 <= len(entries) <= _MAX_PATHS
+            or any(not isinstance(entry, ConflictResolutionEvidence) for entry in entries)
+            or len({entry.path for entry in entries}) != len(entries)
+            or {entry.path for entry in entries} != proof.conflicted_paths
+        ):
+            raise GitRefusal(
+                "conflict_evidence_required",
+                "provide exactly one evidence entry for every conflicted path",
+            )
+        sections = [operation.message, "Conflict resolution evidence:"]
+        for entry in entries:
+            _validate_path(entry.path)
+            base, base_check, head, head_check = self._conflict_evidence(entry)
+            sections.append(
+                f"Path: {json.dumps(entry.path)}\n"
+                f"Base property: {base}\nBase verification: {base_check}\n"
+                f"Head property: {head}\nHead verification: {head_check}"
+            )
+        message = "\n\n".join(sections)
+        if len(message.encode("utf-8")) > _MAX_MESSAGE_BYTES:
+            raise GitRefusal("invalid_message", "conflict evidence exceeds the commit message limit")
+        return message
 
     def _stranded_work_message(self) -> str:
         if self._expected_head == self._scope.observed_head_sha.lower():
@@ -4176,11 +4228,7 @@ class RepoGitTools:
         """Authorize one typed operation and execute only server-built argv."""
         recovery = self._state.checkout_lease.interrupted_operation if self._state is not None else None
         if recovery is not None:
-            continuing = (
-                isinstance(operation, GitRebase) and recovery.kind == "rebase"
-                and self._scope.event_type == "pr_mergeability_conflicting"
-            )
-            if not isinstance(operation, (GitStatus, GitUnmerged, GitRebaseAbort, GitMergeAbort)) and not continuing:
+            if not isinstance(operation, (GitStatus, GitUnmerged, GitRebaseAbort, GitMergeAbort)):
                 _refuse_recovery(self._state.checkout_lease)
             try:
                 recovery_checkout_state(self._state.checkout_lease, self._scope)
@@ -4312,6 +4360,10 @@ class RepoGitTools:
                 or len(operation.message.encode("utf-8")) > _MAX_MESSAGE_BYTES
             ):
                 raise GitRefusal("invalid_message", "commit message is empty or exceeds the server limit")
+            conflict_resolution = (
+                not self._retained and self._scope.event_type == "pr_mergeability_conflicting"
+            )
+            message = self._merge_evidence_message(operation) if conflict_resolution else operation.message
             staged_before = set(filter(None, self._command((
                 "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv",
             )).stdout.split("\x00")))
@@ -4326,7 +4378,7 @@ class RepoGitTools:
             staged_after = set(filter(None, self._command((
                 "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv",
             )).stdout.split("\x00")))
-            if not staged_after or not staged_after.issubset(paths):
+            if (not staged_after and not conflict_resolution) or not staged_after.issubset(paths):
                 raise GitRefusal(
                     "dirty_out_of_scope",
                     "staged paths do not match the explicit commit scope: "
@@ -4334,14 +4386,23 @@ class RepoGitTools:
                     "include them in `paths`, or unstage them",
                 )
             previous = self._expected_head
-            result = self._command(("commit", "-m", operation.message), identity=True)
+            result = self._command(("commit", "-m", message), identity=True)
             self._refresh_expected_head()
             self._record_local_head(previous)
+            if conflict_resolution:
+                self._state.record_conflict_evidence(self._scope.scope_id, self._expected_head)
             if self._state is not None:
                 object.__setattr__(self._state, "interrupted_operation", None)
         elif isinstance(operation, GitMerge):
             self._require("repo_merge", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             previous = self._expected_head
+            conflict_resolution = self._scope.event_type == "pr_mergeability_conflicting"
+            if conflict_resolution:
+                object.__setattr__(self._state, "conflict_merge", None)
+                merge_base = self._command((
+                    "merge-base", self._scope.observed_head_sha, self._state.checkout_lease.base_sha,
+                )).stdout.strip()
+                pr_paths = self._changed_paths(merge_base, self._scope.observed_head_sha)
             receipt = self._interruption_receipt("merge", self._state.checkout_lease.base_sha)
             try:
                 result = self._command(
@@ -4373,6 +4434,12 @@ class RepoGitTools:
                 unmerged = self._unmerged_paths()
                 if not unmerged:
                     raise
+                if conflict_resolution and self._command((
+                    "rev-parse", "--verify", "MERGE_HEAD",
+                )).stdout.strip() == self._state.checkout_lease.base_sha:
+                    object.__setattr__(self._state, "conflict_merge", _ConflictMerge(
+                        previous, self._state.checkout_lease.base_sha, pr_paths, frozenset(unmerged),
+                    ))
                 paths = ", ".join(repr(path) for path in sorted(unmerged))
                 raise GitRefusal(
                     "merge_conflict",
@@ -4382,11 +4449,21 @@ class RepoGitTools:
                 ) from exc
             self._refresh_expected_head()
             self._record_local_head(previous)
+            if conflict_resolution:
+                # The base may have advanced since GitHub reported conflicts.
+                # No per-path entries are needed for a clean merge, but retain
+                # the typed path boundary and the exact-head full-suite gate.
+                object.__setattr__(self._state, "conflict_merge", _ConflictMerge(
+                    self._scope.observed_head_sha, self._state.checkout_lease.base_sha,
+                    pr_paths, frozenset(),
+                ))
+                self._state.record_conflict_evidence(self._scope.scope_id, self._expected_head)
         elif isinstance(operation, GitMergeAbort):
             self._require("repo_merge_abort", RepoPRAction.WRITE)
             result = self._command(("merge", "--abort"))
             self._finish_recovery(recovery)
             object.__setattr__(self._state, "interrupted_operation", None)
+            object.__setattr__(self._state, "conflict_merge", None)
         elif isinstance(operation, GitRebase):
             self._require("repo_rebase", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             object.__setattr__(self._state, "_scoped_rebase", None)
@@ -4398,58 +4475,34 @@ class RepoGitTools:
                     "cannot publish rewritten history; use repo_merge to merge the base "
                     "and scoped published PR head, resolve any conflicts, then repo_push",
                 )
-            continuing = self._has_in_progress_merge_or_rebase()
-            verified_base = None
-            if not continuing:
-                # A scope's base can move while the turn runs. Only the freshly
-                # fetched protected destination tip may become the rebase base.
-                if f"refs/heads/{self._scope.base_ref}" not in _PROTECTED_BRANCH_REFS:
-                    raise GitRefusal("unverified_base", "rebase requires a protected base")
-                self._command((
-                    "fetch", "--no-tags", "--no-recurse-submodules",
-                    self._scope.canonical_origin, f"refs/heads/{self._scope.base_ref}",
-                ), network=True)
-                verified_base = self._command((
-                    "rev-parse", "--verify", "FETCH_HEAD^{commit}",
-                )).stdout.strip().lower()
-                ancestry = self._raw((
-                    "merge-base", "--is-ancestor", self._scope.observed_base_sha,
-                    verified_base,
-                ))
-                if ancestry.returncode != 0 or ancestry.timed_out or ancestry.output_limited:
-                    raise GitRefusal("unverified_base", "protected base does not descend from scoped base")
-            if continuing:
-                if self._scope.event_type != "pr_mergeability_conflicting":
-                    raise GitRefusal("rebase_continue_refused", "this scope may not continue a rebase")
-                base_property, base_verification, head_property, head_verification = (
-                    self._conflict_evidence(operation)
-                )
+            if self._has_in_progress_merge_or_rebase():
+                raise GitRefusal("rebase_continue_refused", "abort the interrupted rebase; continuation is not supported")
+            # A scope's base can move while the turn runs. Only the freshly
+            # fetched protected destination tip may become the rebase base.
+            if f"refs/heads/{self._scope.base_ref}" not in _PROTECTED_BRANCH_REFS:
+                raise GitRefusal("unverified_base", "rebase requires a protected base")
+            self._command((
+                "fetch", "--no-tags", "--no-recurse-submodules",
+                self._scope.canonical_origin, f"refs/heads/{self._scope.base_ref}",
+            ), network=True)
+            verified_base = self._command((
+                "rev-parse", "--verify", "FETCH_HEAD^{commit}",
+            )).stdout.strip().lower()
+            ancestry = self._raw((
+                "merge-base", "--is-ancestor", self._scope.observed_base_sha,
+                verified_base,
+            ))
+            if ancestry.returncode != 0 or ancestry.timed_out or ancestry.output_limited:
+                raise GitRefusal("unverified_base", "protected base does not descend from scoped base")
+            receipt = self._interruption_receipt("rebase", verified_base)
+            try:
                 result = self._command(
-                    ("rebase", "--continue"), identity=True,
-                    env={"GIT_EDITOR": "/usr/bin/true"},
+                    ("rebase", "--", verified_base), identity=True,
                 )
-                message = self._command(("log", "-1", "--format=%B")).stdout.rstrip()
-                evidence = (
-                    f"{message}\n\nConflict resolution evidence:\n"
-                    f"Base property: {base_property}\n"
-                    f"Base verification: {base_verification}\n"
-                    f"Head property: {head_property}\n"
-                    f"Head verification: {head_verification}"
-                )
-                self._command(("commit", "--amend", "-m", evidence), identity=True)
-                receipt = self._state.interrupted_operation
-                if receipt is not None:
-                    verified_base = receipt.target
-            else:
-                receipt = self._interruption_receipt("rebase", verified_base)
-                try:
-                    result = self._command(
-                        ("rebase", "--", verified_base), identity=True,
-                    )
-                except GitRefusal:
-                    if receipt is not None and self._has_in_progress_merge_or_rebase():
-                        object.__setattr__(self._state, "interrupted_operation", receipt)
-                    raise
+            except GitRefusal:
+                if receipt is not None and self._has_in_progress_merge_or_rebase():
+                    object.__setattr__(self._state, "interrupted_operation", receipt)
+                raise
             self._refresh_expected_head()
             self._record_local_head(previous, verified_base=verified_base, rewrite=True)
             object.__setattr__(self._state, "interrupted_operation", None)
@@ -4463,11 +4516,6 @@ class RepoGitTools:
                     _scoped_rebase_binding(self._scope, self._state.checkout_lease),
                     self._expected_head,
                 ))
-            if continuing:
-                self._state.record_conflict_evidence(
-                    self._scope.scope_id, self._expected_head,
-                )
-                self._finish_recovery(recovery, continued=True)
         elif isinstance(operation, GitRebaseAbort):
             self._require("repo_rebase_abort", RepoPRAction.WRITE)
             result = self._command(("rebase", "--abort"))
@@ -4501,7 +4549,17 @@ class RepoGitTools:
                 if self._state.full_tested_head != self._expected_head:
                     raise GitRefusal(
                         "full_test_required",
-                        "conflict push refused until the configured full suite passes against HEAD",
+                        "conflict push requires every configured full suite leg at clean HEAD",
+                    )
+                proof = self._state.conflict_merge
+                if not isinstance(proof, _ConflictMerge):
+                    raise GitRefusal("conflict_evidence_required", "typed merge proof is missing")
+                outside = self._changed_paths(proof.base, self._expected_head) - proof.pr_paths
+                if outside:
+                    raise GitRefusal(
+                        "conflict_resolution_outside_pr_paths",
+                        "resolution changes paths outside the original PR diff; escalate: "
+                        + _out_of_scope_paths_message(outside),
                     )
             overrides = self._config_overrides()
             ancestry = self._raw((
@@ -4535,7 +4593,7 @@ class RepoGitTools:
                         "stale_scope", self._stranded_work_message(),
                     )
                 push_args = ["push", "--porcelain"]
-                if rewritten_history:
+                if rewritten_history or self._scope.event_type == "pr_mergeability_conflicting":
                     push_args.append(
                         f"--force-with-lease={self._scope.destination_ref}:"
                         f"{self._scope.observed_head_sha}"
@@ -4949,6 +5007,7 @@ class ProjectTestResult:
     failure_summary: dict[str, object] | None = None
     failed_leg: str | None = None
     legs: tuple[dict[str, object], ...] = ()
+    full_suite_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -5574,6 +5633,15 @@ class RepoProjectTests:
                 execution_started=exc.execution_started,
                 fixed_message=exc.fixed_message,
             ) from exc
+        conflict_resolution = not retained and scope.event_type == "pr_mergeability_conflicting"
+        tested_head = self._state.git_expected_head if not retained else None
+        clean_snapshot = (
+            not conflict_resolution
+            or (
+                git_tools._command(("rev-parse", "--verify", "HEAD")).stdout.strip() == tested_head
+                and not git_tools._command(("status", "--porcelain", "--untracked-files=all")).stdout
+            )
+        )
         # Capture controller source before any worker/plugin can execute.
         node_inventory = await asyncio.to_thread(pytest_node_inventory, root)
         remember_node_inventory(root, scope.scope_id, node_inventory)
@@ -5861,7 +5929,30 @@ class RepoProjectTests:
                 failure_summary=(failure_summary if code == "tests_failed" else None),
             )
         # A non-default suite must not satisfy the existing default-test push gate.
-        if record_evidence and not retained and not selectors and is_default:
+        # This controller-computed qualification is shared by synchronous and
+        # asynchronous publication. Plugin names are not part of the contract:
+        # every configured default-suite leg must actually complete successfully.
+        all_legs_passed = (
+            len(leg_summaries) == len(legs)
+            and all(
+                summary["name"] == leg.name
+                and summary["returncode"] == 0
+                and not summary["timed_out"]
+                and not summary["output_limited"]
+                for leg, summary in zip(legs, leg_summaries)
+            )
+        )
+        conflict_snapshot_matches = (
+            clean_snapshot
+            and self._state.git_expected_head == tested_head
+            and git_tools._command(("rev-parse", "--verify", "HEAD")).stdout.strip() == tested_head
+            and not git_tools._command(("status", "--porcelain", "--untracked-files=all")).stdout
+        ) if conflict_resolution else True
+        full_suite_evidence = (
+            not retained and not selectors and is_default
+            and all_legs_passed and conflict_snapshot_matches
+        )
+        if record_evidence and full_suite_evidence:
             assert self._state is not None
             head = self._state.git_expected_head
             if head is None:
@@ -5875,6 +5966,7 @@ class RepoProjectTests:
         return ProjectTestResult(
             True, "tests_passed", 0, stdout, stderr, command, command_source,
             **truncation, **parsed, **leg_report, git_context=_git_execution_context(),
+            full_suite_evidence=full_suite_evidence,
         )
 
 # Model-facing repository tools
@@ -6387,7 +6479,43 @@ def checkout_scoped_pr(
         if not attestation.ok:
             raise LeaseAttestationRefusal(attestation.reason, existing=True)
 
+    grants = getattr(context, "scoped_pr_grants", None)
+    continuation = getattr(grants, "repo_test_continuation", None)
+
+    def resume_completion() -> dict[str, Any]:
+        # This is the same work, not an abandoned prior-turn draft. Admit it
+        # before ordinary recovery/archive classification, but still attest it.
+        if (continuation.scope is not scope or existing is None
+                or (str(existing.path), existing.recovery_id) != continuation.lease_identity
+                or existing.last_turn_id != continuation.starting_turn_id):
+            raise ToolPolicyRefusal("repository checkout rejected: completion lease handoff mismatch")
+        protocol = grants._protocols[scope.owner]
+        if protocol.live_lease(scope, state) is not existing:
+            raise ToolPolicyRefusal("repository checkout rejected: completion lease is no longer live")
+        attest_resume(existing)
+        from mimir._context import get_current_turn
+
+        turn = get_current_turn()
+        prior_turn_id = existing.last_turn_id
+        object.__setattr__(existing, "last_turn_id", getattr(turn, "turn_id", None))
+        (existing.path / _METADATA).write_text(
+            json.dumps(_metadata(existing), sort_keys=True) + "\n", encoding="utf-8",
+        )
+        from mimir.event_logger import log_event_sync
+
+        log_event_sync(
+            "pr_checkout_lease_completion_handoff", scope_id=scope.scope_id,
+            previous_turn_id=prior_turn_id, last_turn_id=existing.last_turn_id,
+        )
+        _publish_attested_lease_result(runtime, state)
+        return {
+            "status": "resumed", "path": str(existing.path), "scope_id": scope.scope_id,
+            "head_sha": existing.head_sha, "candidate_commits": (),
+        }
+
     try:
+        if continuation is not None:
+            return resume_completion()
         lease, candidates = acquire_pr_checkout_lease(
             state.action_scope, owner=state.action_scope.principal,
             review_state=state,
@@ -6539,6 +6667,28 @@ def repo_status(
     return _execute(runtime, repository, pull_request, GitStatus(include_untracked))
 
 
+def _project_test_refusal(
+    exc: RuntimeError | ValueError, selectors: tuple[str, ...],
+) -> ToolException:
+    """Use the same agent-facing refusal for execution and queue admission."""
+    code = getattr(exc, "code", "project_test_failed")
+    message = f"project test rejected ({code}): {exc}"
+    message += "\n" + _remediation_test_guidance(code, scoped=bool(selectors))
+    if (
+        isinstance(exc, ProjectTestRefusal)
+        and exc.fixed_message
+        and str(exc) in _FIXED_TEST_REFUSALS.get(code, ())
+    ):
+        return ToolPolicyRefusal(message)
+    return _tool_refusal(
+        message,
+        exc,
+        execution_started=(
+            exc.execution_started if isinstance(exc, ProjectTestRefusal) else True
+        ),
+    )
+
+
 async def _repo_test_unlocked(
     repository: str,
     pull_request: int,
@@ -6624,24 +6774,7 @@ async def _repo_test_unlocked(
             and str(exc) in _FIXED_TEST_REFUSALS.get(exc.code, ())
         ):
             _publish_attested_lease_result(runtime, state)
-        code = getattr(exc, "code", "project_test_failed")
-        message = f"project test rejected ({code}): {exc}"
-        message += "\n" + _remediation_test_guidance(code, scoped=bool(selectors))
-        if (
-            isinstance(exc, ProjectTestRefusal)
-            and exc.fixed_message
-            and str(exc) in _FIXED_TEST_REFUSALS.get(code, ())
-        ):
-            raise ToolPolicyRefusal(message) from exc
-        raise _tool_refusal(
-            message,
-            exc,
-            execution_started=(
-                exc.execution_started
-                if isinstance(exc, ProjectTestRefusal)
-                else True
-            ),
-        ) from exc
+        raise _project_test_refusal(exc, selectors) from exc
 
 
 async def recover_repo_test_job(record: dict[str, Any]) -> None:
@@ -6662,15 +6795,16 @@ async def recover_repo_test_job(record: dict[str, Any]) -> None:
 
 def _repo_test_head_matches(
     state: RepoReviewState, head: str, live_head: str | None, snapshot_head: str | None,
+    observed_head: str,
 ) -> bool:
     """No live observation, changed scope, local head, or superseded event is evidence."""
     scope = state.action_scope
     return (
-        live_head == head
-        and scope.observed_head_sha == head
+        live_head == observed_head
+        and scope.observed_head_sha == observed_head
         and state.git_expected_head == head
         and snapshot_head == head
-        and not was_superseded_by_own_push(scope.canonical_repo, scope.pr_number, head)
+        and not was_superseded_by_own_push(scope.canonical_repo, scope.pr_number, observed_head)
     )
 
 
@@ -6696,8 +6830,8 @@ async def _queue_repo_test(
     ctx = get_current_turn()
     if is_same_turn_auth_carrier(ctx, auth):
         auth = ctx.auth_with_plugin_state()
-    head = (git_tools._command(("rev-parse", "--verify", "HEAD")).stdout.strip()
-            if retained else scope.observed_head_sha)
+    head = git_tools._command(("rev-parse", "--verify", "HEAD")).stdout.strip()
+    observed_head = None if retained else scope.observed_head_sha
     # Publish the same attested repository provenance as the synchronous tool.
     # Inherited labels are monotonic; the result source is joined below rather
     # than attempting to reuse the spawning tool call's output collector.
@@ -6764,11 +6898,11 @@ async def _queue_repo_test(
         except Exception:
             live_head = None
         snapshot_head = (job.record.get("snapshot") or {}).get("head_sha")
-        if not _repo_test_head_matches(state, head, live_head, snapshot_head):
+        if not _repo_test_head_matches(state, head, live_head, snapshot_head, observed_head):
             result.update(stale=True, evidence=False, message="stale: head moved")
         else:
             result["evidence"] = True
-            if result["ok"] and not selected and is_default:
+            if result["ok"] and result["full_suite_evidence"]:
                 try:
                     state.record_full_test(scope.scope_id, head)
                 except ValueError:
@@ -6777,12 +6911,22 @@ async def _queue_repo_test(
                     result.update(evidence=False, message="informational: starting checkout lease expired")
         return result
 
+    from mimir.access_control import bind_repo_test_grant
+
+    starting_turn_id = getattr(ctx, "turn_id", None)
+    binding = (None if retained else
+               bind_repo_test_grant(auth, scope, state, starting_turn_id, tested_head=head))
+    if binding is not None:
+        object.__setattr__(state.checkout_lease, "last_turn_id", starting_turn_id)
+        (state.checkout_lease.path / _METADATA).write_text(
+            json.dumps(_metadata(state.checkout_lease), sort_keys=True) + "\n", encoding="utf-8",
+        )
     return registry.enqueue(
         repository=repository, pull_request=pull_request,
         head_sha=head, suite=suite_name, selectors=selected,
         channel_id=auth.channel_id,
-        starting_turn_id=getattr(ctx, "turn_id", None),
-        auth=auth, labels=labels, run=run,
+        starting_turn_id=starting_turn_id,
+        auth=auth, labels=labels, run=run, grant_binding=binding,
     )
 
 
@@ -6821,7 +6965,11 @@ async def repo_test(
             registry = get_registry()
             if registry is None:
                 raise ToolPolicyRefusal("project test rejected: background job registry unavailable")
-            return await _queue_repo_test(registry, runtime, retained, selectors, suite)
+            try:
+                queued = await _queue_repo_test(registry, runtime, retained, selectors, suite)
+            except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
+                raise _project_test_refusal(exc, selectors) from exc
+            return _retained_result(runtime, retained, queued)
         return await _repo_test_unlocked(
             repository, pull_request, selectors, runtime, suite, include_output,
         )
@@ -6830,7 +6978,15 @@ async def repo_test(
         registry = get_registry()
         if registry is None:
             raise ToolPolicyRefusal("project test rejected: background job registry unavailable")
-        return await _queue_repo_test(registry, runtime, state, selectors, suite)
+        try:
+            queued = await _queue_repo_test(registry, runtime, state, selectors, suite)
+        except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
+            raise _project_test_refusal(exc, selectors) from exc
+        # The queued result is a repository result like the synchronous one. Without
+        # published provenance it defaults to untrusted active ingest, and the turn
+        # that queued its tests could no longer commit, push or comment.
+        _publish_attested_lease_result(runtime, state)
+        return queued
     lease = getattr(state, "checkout_lease", None)
     if not isinstance(lease, PRCheckoutLease) or not lease.is_active:
         return await _repo_test_unlocked(
@@ -7134,13 +7290,19 @@ def repo_commit(
     paths: tuple[str, ...],
     message: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+    conflict_evidence: tuple[ConflictResolutionEvidence, ...] = (),
 ) -> dict[str, Any]:
     """Stage explicit paths and commit them with server-owned Git identity.
 
     On a retained Worklink remediation turn, ``repository`` is the retained
     run's repository and ``pull_request`` is the incident's Chainlink issue id.
+    For pr_mergeability_conflicting, supply one conflict_evidence entry per
+    conflicted path: path, base_property, base_verification, head_property,
+    head_verification. Both sides' intent and verification are recorded in the
+    merge commit. Run repo_test with no selectors; every configured leg of the
+    default suite must pass at the merge commit.
     """
-    return _execute(runtime, repository, pull_request, GitCommit(paths, message))
+    return _execute(runtime, repository, pull_request, GitCommit(paths, message, conflict_evidence))
 
 
 @tool
@@ -7154,6 +7316,11 @@ def repo_merge(
     cleanly, the merge commit already exists; next call repo_push.
     On conflicts: repo_unmerged, resolve, repo_stage, then repo_commit listing
     every staged path (the merge stages auto-merged files too), then repo_push.
+    A pr_mergeability_conflicting scope additionally requires per-path
+    repo_commit conflict_evidence. Run repo_test with no selectors; every configured
+    leg of the default suite must pass at the merge commit before pushing.
+    After push, comment on each resolution
+    and re-request review. Never rebase a conflicting scope.
     """
     return _execute(runtime, repository, pull_request, GitMerge())
 
@@ -7171,23 +7338,17 @@ def repo_merge_abort(
 def repo_rebase(
     repository: str,
     pull_request: int,
-    base_property: str = "",
-    base_verification: str = "",
-    head_property: str = "",
-    head_verification: str = "",
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Start a bound rebase, or continue it with two-sided preservation evidence.
+    """Start a bound rebase. Abort an interrupted rebase rather than continuing.
 
     Available only on turns for history-rewrite event types in
     _HISTORY_REWRITE_EVENT_TYPES (mimir/repo_tools.py):
     `heartbeat_pr_maintenance`, `pr_changes_requested_stale`, `pr_ci_failure`,
-    `pr_mergeability_rebase`, `pr_mergeability_conflicting`.
+    `pr_mergeability_rebase`.
     In other PR-remediation scopes, use repo_merge to update the branch with its base.
     """
-    return _execute(runtime, repository, pull_request, GitRebase(
-        base_property, base_verification, head_property, head_verification,
-    ))
+    return _execute(runtime, repository, pull_request, GitRebase())
 
 
 @tool

@@ -1,0 +1,1 @@
+- The github-poller's forwarded `MIMIR_FACTORY_PUBLISHING_IDENTITY` (the bot login) is no longer redacted from poller output, so remediation turns on the bot's own PRs stop failing lease attestation with `pr_author_mismatch`.

@@ -1,0 +1,1 @@
+- Queued (background) `repo_test` publishes the same lease-attested repository provenance as the synchronous run, so queueing tests no longer taints the remediation turn and blocks its commit, push and comments.

@@ -17,11 +17,21 @@ _REAP_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="worklink-reap
 
 
 def add_codex_reconcile_job(scheduler: Any, cron_expr: str = "*/15 * * * *") -> bool:
-    from .worklink.daemon_gate import prepare_daemon_health
+    from .opencode import CodexReconcileError, reconcile_codex_auth
 
     async def fire() -> None:
-        health = await asyncio.to_thread(prepare_daemon_health, dict(os.environ))
-        if health.get("codex_error"):
+        # Agent login maintenance is independent of daemon activation/readiness.
+        # Reconciliation itself records every result and skips unavailable APIs.
+        try:
+            await asyncio.to_thread(reconcile_codex_auth, dict(os.environ))
+        except CodexReconcileError as exc:
+            if hasattr(exc, "error_code"):
+                from mimir.codex_auth_alerts import notify_codex_auth_failure
+
+                try:
+                    await notify_codex_auth_failure(exc.error_code, permanent=exc.permanent)
+                except Exception:
+                    await log_event("codex_auth_operator_alert_unavailable")
             await log_event("worklink_codex_reconcile_failed", reason="agent_codex_login_unavailable")
 
     return scheduler.register_callable(

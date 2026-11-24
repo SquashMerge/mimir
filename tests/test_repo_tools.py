@@ -353,6 +353,7 @@ def _repo_scope_and_state(
     base_files: dict[str, bytes] | None = None,
     base_modes: dict[str, int] | None = None,
     history_entries: bool = False,
+    advance_base: bool = False,
 ) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
     origin = tmp_path / "origin.git"
     git_env = _fixture_git_env()
@@ -390,6 +391,13 @@ def _repo_scope_and_state(
         _git(source, "commit", "-qam", f"pull request {number}")
     head = _git(source, "rev-parse", "HEAD")
     _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+    if advance_base:
+        _git(source, "checkout", "-q", "main")
+        (source / "main.txt").write_text("new main work\n")
+        _git(source, "add", "main.txt")
+        _git(source, "commit", "-qm", "advance main")
+        base = _git(source, "rev-parse", "HEAD")
+        _git(source, "push", "-q", "origin", "HEAD:main")
     assert _git(origin, "rev-parse", "--verify", "refs/heads/main") == base
     assert _git(origin, "rev-parse", "--verify", "refs/heads/worklink/7") == head
     scope = RepoPRActionScope(
@@ -2148,9 +2156,7 @@ def test_interrupted_pr_lease_scoped_grants_and_continue(tmp_path, monkeypatch, 
     assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
     for tool_name in ("repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort", "repo_diff", "repo_push", "repo_test", "repo_cleanup", "repo_stage", "repo_rebase"):
         action = RepoPRAction.INSPECT if tool_name != "repo_rebase" else RepoPRAction.WRITE
-        expected = tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"} or (
-            tool_name == "repo_rebase" and event == "pr_mergeability_conflicting"
-        )
+        expected = tool_name in {"repo_status", "repo_unmerged", "repo_rebase_abort", "repo_merge_abort"}
         assert _valid_scoped_pr_grant(auth, "cultivate", action, protocol, scope, state, tool_name=tool_name) is expected
         for enforce in (False, True):
             decision = authorize_repo_pr_tool(
@@ -2162,17 +2168,11 @@ def test_interrupted_pr_lease_scoped_grants_and_continue(tmp_path, monkeypatch, 
             if not expected:
                 assert "repo_rebase_abort" in decision.refusal_detail
     lease = state.checkout_lease
-    if event == "pr_mergeability_conflicting":
-        # Resolution is external; recovery itself only permits continue, not staging.
-        (lease.path / "tracked.txt").write_text("conflicting base\npull request\n")
-        _git(lease.path, "add", "tracked.txt")
-        assert RepoGitTools(state, auth_context=auth).execute(GitRebase(
-            "base", "base check", "head", "head check",
-        )).ok
-        assert lease.interrupted_operation is None
-    else:
-        assert RepoGitTools(state).execute(GitRebaseAbort()).ok
-        assert _valid_scoped_pr_grant(auth, "cultivate", RepoPRAction.INSPECT, protocol, scope, state, tool_name="repo_diff")
+    with pytest.raises(GitRefusal, match="repo_rebase_abort"):
+        RepoGitTools(state, auth_context=auth).execute(GitRebase())
+    assert RepoGitTools(state).execute(GitRebaseAbort()).ok
+    assert lease.interrupted_operation is None
+    assert _valid_scoped_pr_grant(auth, "cultivate", RepoPRAction.INSPECT, protocol, scope, state, tool_name="repo_diff")
     assert RepoGitTools(state).execute(GitDiff()).ok
 
 
@@ -2212,6 +2212,25 @@ def _two_sided_conflict_tools(
     return origin, conflict_scope, state, RepoGitTools(state)
 
 
+def _conflict_commit_evidence():
+    from mimir_cultivate.repository import ConflictResolutionEvidence
+
+    return (ConflictResolutionEvidence(
+        "tracked.txt", "base property", "base-test checks the merged file",
+        "head property", "head-test checks the merged file",
+    ),)
+
+
+def _configure_conflict_suites(home, state):
+    _configure_test_suites(home, state, test_suites=[{
+        "name": "python", "default": True,
+        "legs": [
+            {"name": "core", "command": "./suite"},
+            {"name": "cultivate", "command": "./suite", "env": {"MIMIR_PLUGINS": "cultivate"}},
+        ],
+    }])
+
+
 @pytest.mark.parametrize("dropped_side", ["base", "head"])
 def test_conflict_resolution_dropping_either_test_pinned_side_is_not_pushed(
     tmp_path: Path,
@@ -2221,17 +2240,17 @@ def test_conflict_resolution_dropping_either_test_pinned_side_is_not_pushed(
     origin, scope, state, tools = _two_sided_conflict_tools(tmp_path)
     lease = state.checkout_lease
     with pytest.raises(GitRefusal):
-        tools.execute(GitRebase())
+        tools.execute(GitMerge())
     chosen = "head property\n" if dropped_side == "base" else "base property\n"
     (lease.path / "tracked.txt").write_text(chosen, encoding="utf-8")
     tools.execute(GitStage(("tracked.txt",)))
-    assert tools.execute(GitRebase(
-        "base property", "base-test",
-        "head property", "head-test",
+    assert tools.execute(GitCommit(
+        ("tracked.txt", "base-test", "head-test", "suite"), "resolve merge",
+        _conflict_commit_evidence(),
     )).ok
 
     home = tmp_path / "home"
-    _configure_worklink_test(home, str(lease.path / "suite"))
+    _configure_conflict_suites(home, state)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     result = _execute_project_tests(state)
     assert result.ok is False
@@ -2249,26 +2268,26 @@ def test_conflict_resolution_preserves_both_sides_records_evidence_and_pushes(
     origin, scope, state, tools = _two_sided_conflict_tools(tmp_path)
     lease = state.checkout_lease
     with pytest.raises(GitRefusal):
-        tools.execute(GitRebase())
+        tools.execute(GitMerge())
     (lease.path / "tracked.txt").write_text(
         "base property\nhead property\n", encoding="utf-8",
     )
     tools.execute(GitStage(("tracked.txt",)))
-    assert tools.execute(GitRebase(
-        "base property", "base-test checks the rebased file",
-        "head property", "head-test checks the rebased file",
+    assert tools.execute(GitCommit(
+        ("tracked.txt", "base-test", "head-test", "suite"), "resolve merge",
+        _conflict_commit_evidence(),
     )).ok
     message = _git(lease.path, "log", "-1", "--format=%B")
     assert "Base property: base property" in message
-    assert "Base verification: base-test checks the rebased file" in message
+    assert "Base verification: base-test checks the merged file" in message
     assert "Head property: head property" in message
-    assert "Head verification: head-test checks the rebased file" in message
+    assert "Head verification: head-test checks the merged file" in message
 
     with pytest.raises(GitRefusal) as untested:
         tools.execute(GitPush())
     assert untested.value.code == "full_test_required"
     home = tmp_path / "home"
-    _configure_worklink_test(home, str(lease.path / "suite"))
+    _configure_conflict_suites(home, state)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     assert _execute_project_tests(state).ok
     assert tools.execute(GitPush()).ok
@@ -5620,6 +5639,74 @@ async def test_failed_repo_test_after_tainted_commit_stays_untrusted(tmp_path, m
     integ, allowed = await _red_run_after_lineage(monkeypatch, scope, state, _lineage_turn(scope, state))
     assert integ == "untrusted" and allowed is False
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_repo_inventory")
+@pytest.mark.parametrize("tainted", [False, True])
+async def test_queued_repo_test_publishes_lease_attested_provenance(tmp_path, monkeypatch, tainted):
+    """Queueing background tests must not taint the turn that queued them.
+
+    The queued result is a repository result. Without the provenance the
+    synchronous path publishes, it defaulted to untrusted active ingest
+    (``no_published_provenance``), so every remediation turn that queued
+    repo_test could no longer commit, push or comment.
+    """
+    from mimir import access_control, repo_test_jobs
+    from mimir.access_control import (
+        SinkGate, ToolAuthorization, begin_protected_result_capture,
+        classify_protected_result, end_protected_result_capture,
+    )
+    from mimir.models import InformationFlowLabels
+    from mimir_cultivate import repository as repo
+
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: "owner/repo")
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    object.__setattr__(scope, "pull_request_author", scope.principal)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path / "leases"))
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", str(tmp_path / "heavy.lock"))
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_TIMEOUT", raising=False)
+    monkeypatch.delenv("MIMIR_HEAVY_TIER", raising=False)
+    lease = state.checkout_lease
+    if tainted:
+        (lease.path / "tracked.txt").write_text("tainted\n")
+        RepoGitTools(
+            state, auth_context=_lineage_turn(scope, state, tainted=True), enforce=False,
+        ).execute(GitCommit(("tracked.txt",), "t"))
+    turn = _lineage_turn(scope, state)
+    if not tainted:
+        assert_lease_attested(turn, scope, lease)
+    monkeypatch.setattr(repo, "_state", lambda *_: state)
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", object())
+    queued = {"status": "queued", "job_id": "rt_0", "head_sha": scope.observed_head_sha}
+
+    async def queue(registry, runtime, target, selectors, suite):
+        assert target is state
+        return dict(queued)
+
+    monkeypatch.setattr(repo, "_queue_repo_test", queue)
+    capture = begin_protected_result_capture()
+    try:
+        result = await repo.repo_test.coroutine(
+            "owner/repo", 7, runtime=SimpleNamespace(context=turn),
+        )
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert result == queued
+    labels = classify_protected_result(
+        "repo_test", {"repository": "owner/repo", "pull_request": 7}, turn,
+        ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope),
+        result=result, provenance=provenance,
+    )
+    assert labels.sources[0].integrity == ("untrusted" if tainted else "trusted")
+    turn.ifc_state.merge(labels)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        turn.ifc_state.current(InformationFlowLabels()), turn,
+        enforce=False, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is (not tainted)
 
 def test_recorded_inventory_unresolvable_key_fails_closed(tmp_path, monkeypatch):
     """An inventory key that cannot be resolved (e.g. a symlink loop on Python

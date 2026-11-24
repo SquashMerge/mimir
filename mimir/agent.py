@@ -651,6 +651,20 @@ def _initialize_ifc_labels(
             for source in event.ifc_labels.sources
         ):
             integrity = Integrity.TRUSTED
+    elif (
+        event.trigger == "repo_test_complete"
+        and continuation_auth is not None
+        and event.ifc_labels is not None
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in extra
+        and not any(source.has_untrusted_active_ingest for source in event.ifc_labels.sources)
+    ):
+        # The job registry delivers a bounded, controller-computed test result.
+        # Its labels are the queueing turn's labels plus the repository source,
+        # which is untrusted unless the lease was attested. Inherit that
+        # verdict: the result is not new external content. Only the in-process
+        # registry can attach a continuation carrier, and a recovered (post-
+        # restart) completion has none, so it stays untrusted.
+        integrity = Integrity.TRUSTED
     if poller_own_channel:
         # The synthetic queue channel is framework-owned routing metadata, not
         # poller content. Exact equality with the server-carried authority's
@@ -740,6 +754,12 @@ def _create_turn_auth_context(
             ifc_state=InformationFlowState(labels=ifc_labels),
             ingested_url_state=IngestedURLState(),
         )
+    if event.trigger == "repo_test_complete":
+        from .access_control import remint_repo_test_grants
+
+        # Never retain the queueing turn's grants on a failed/recovered result.
+        # An admitted completion gets its own nonce and normal turn lifetime.
+        context = replace(context, scoped_pr_grants=remint_repo_test_grants(event, context))
     from .proposals import ProposalRevision, PollerProposalScope, poller_worktree_path
     from .access_control import get_trusted_service_from_auth_context
 
@@ -3698,6 +3718,13 @@ class Agent:
         except Exception as exc:
             from .redaction import redact_text
 
+            try:
+                from .codex_auth_alerts import notify_codex_refresh_failure
+
+                await notify_codex_refresh_failure(exc)
+            except Exception:
+                # Never include provider error text (which may carry a body).
+                log.warning("Codex refresh operator alert unavailable")
             if event.trigger == "poller":
                 transient_reason, retry_after_s = _transient_provider_failure(exc)
             error = redact_text(f"{type(exc).__name__}: {exc}")[:2048]

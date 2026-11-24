@@ -361,9 +361,7 @@ def _atomic_auth_write(path: Path, document: dict[str, Any]) -> None:
 _CODEX_REFRESH_MARGIN_SECONDS = 20 * 60
 
 
-async def _reconcile_codex_locked(path: Path, client: Any) -> str:
-    # Both stores are read AFTER taking codex-plus's lock. A refresh that held
-    # the lock before us may have replaced auth.json while we were waiting.
+def _read_codex_document(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as stream:
             raw = stream.read(65537)
@@ -374,6 +372,13 @@ async def _reconcile_codex_locked(path: Path, client: Any) -> str:
     if (not isinstance(tokens, dict) or document.get("auth_mode") != "chatgpt"
             or not _oauth_tokens(tokens.get("access_token"), tokens.get("refresh_token"), tokens.get("account_id"))):
         raise CodexReconcileError(_CODEX_LOGIN_GUIDANCE)
+    return document
+
+
+async def _reconcile_codex_locked(path: Path, client: Any) -> str:
+    # Both stores are read AFTER taking codex-plus's lock.
+    document = _read_codex_document(path)
+    tokens = document["tokens"]
     entries = await client.credentials()
     active = [entry for entry in entries if entry.get("integrationID") == "openai" and entry.get("active") is True]
     if len(active) > 1:
@@ -423,6 +428,7 @@ async def _reconcile_codex_locked(path: Path, client: Any) -> str:
 def _codex_refresh_candidate(path: Path) -> Any:
     from langchain_codex_plus.codex_auth import load_codex_auth
 
+    _read_codex_document(path)
     auth = load_codex_auth(path)
     if auth is None:
         raise CodexReconcileError(_CODEX_LOGIN_GUIDANCE)
@@ -437,12 +443,52 @@ def _refresh_codex_coordinated(path: Path, stale: Any) -> None:
 
     try:
         refresh_codex_auth_coordinated(stale, path=path)
-    except CodexAuthRefreshError:
-        raise CodexReconcileError("OpenCode coordinated Codex refresh unavailable") from None
+    except CodexAuthRefreshError as exc:
+        from mimir.codex_auth_alerts import refresh_failure
+
+        code, permanent = refresh_failure(exc)
+        error = CodexReconcileError("OpenCode coordinated Codex refresh unavailable")
+        error.error_code = code
+        error.permanent = permanent
+        raise error from None
 
 
 def reconcile_codex_auth(
     env: Mapping[str, str] | None = None, *, paths: Any = None, identities: Any = None,
+) -> str:
+    """Record one durable, bounded result for every controller reconcile."""
+    # Fixed skip reasons: daemon_unavailable and reconcile_error. No exception
+    # messages, JWT payloads, remote bodies, or remote-supplied codes are logged.
+    result = {"outcome": "skipped_reconcile_error", "propagation": "skipped_daemon_unavailable",
+              "error_code": "other"}
+    try:
+        outcome = _reconcile_codex_auth(
+            env, paths=paths, identities=identities, result=result,
+        )
+        result["outcome"] = {"equal": "unchanged", "seeded": "agent_newer"}.get(outcome, outcome)
+        result.pop("error_code", None)
+        return outcome
+    except CodexReconcileError as exc:
+        if hasattr(exc, "error_code"):
+            result.update(outcome="refresh_failed", error_code=exc.error_code)
+        else:
+            result["error_code"] = "other"
+        raise
+    finally:
+        if event_logger.get_events_path() is not None:
+            event_logger.log_durable_event_sync("worklink_codex_reconcile", **result)
+        else:
+            # Setup's standalone controller probe runs before server startup.
+            values = os.environ if env is None else env
+            logger = event_logger.EventLogger(
+                Path(values.get("MIMIR_HOME", ".")) / "logs/events.jsonl", "codex-reconcile",
+            )
+            logger.log_durable_sync("worklink_codex_reconcile", **result)
+
+
+def _reconcile_codex_auth(
+    env: Mapping[str, str] | None = None, *, paths: Any = None, identities: Any = None,
+    result: dict[str, str],
 ) -> str:
     """Controller-side OpenCode 2/Codex newest-JWT reconciliation.
 
@@ -460,10 +506,11 @@ def reconcile_codex_auth(
     if os.getuid() != identities.mimir_uid or os.geteuid() != identities.mimir_uid:
         raise CodexReconcileError("Codex reconciliation requires the mimir controller uid")
     paths = paths or RuntimePaths()
+    api = None
     try:
         api = load_api(paths, uid=identities.mimir_uid, controller=True)
     except (OSError, ValueError, RuntimeError):
-        raise CodexReconcileError("OpenCode controller API connection unavailable") from None
+        pass
     path = (Path(values["CODEX_HOME"]).expanduser() if values.get("CODEX_HOME", "").strip()
             else _home(values) / ".codex") / "auth.json"
 
@@ -473,10 +520,18 @@ def reconcile_codex_auth(
             return await _reconcile_codex_locked(path, client)
 
     def propagate() -> tuple[str, Any]:
+        nonlocal api
         fd = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            outcome = asyncio.run(reconcile())
+            outcome = "skipped_daemon_unavailable"
+            if api is not None:
+                try:
+                    outcome = asyncio.run(reconcile())
+                    result["propagation"] = "propagated"
+                except DaemonClientError:
+                    api = None
+                    result["propagation"] = "skipped_daemon_unavailable"
             return outcome, _codex_refresh_candidate(path)
         finally:
             os.close(fd)
@@ -490,7 +545,7 @@ def reconcile_codex_auth(
             # An agent 401 may have refreshed while we were waiting. Re-read
             # under the lock rather than importing the API's returned snapshot.
             propagate()
-            return "agent_newer"
+            return "refreshed"
         return outcome
     except CodexReconcileError:
         raise

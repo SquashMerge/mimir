@@ -34,6 +34,17 @@ _identity_lock = threading.Lock()
 _verified_identity: tuple[str, str] | None = None
 
 
+def own_conflict_pr_author(author: object, self_login: str) -> bool:
+    """Recognize only deployment-configured PR publication identities."""
+    publisher = os.environ.get("MIMIR_FACTORY_PUBLISHING_IDENTITY", "").strip()
+    return (
+        bool(self_login)
+        and isinstance(author, str)
+        and bool(author)
+        and author.casefold() in {self_login.casefold(), publisher.casefold()}
+    )
+
+
 def same_github_repo(a: object, b: object) -> bool:
     """Compare complete GitHub owner/repo slugs, case-insensitively."""
     return (isinstance(a, str) and isinstance(b, str)
@@ -243,6 +254,7 @@ __all__ = [
     "confirm_github_identity",
     "credential_fingerprint",
     "fetch_github_login",
+    "own_conflict_pr_author",
     "verified_identity",
     "verify_github_identity",
 ]

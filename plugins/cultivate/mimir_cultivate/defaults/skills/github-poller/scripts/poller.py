@@ -159,6 +159,7 @@ from mimir.pollers import (
     bounded_github_author_cause, _github_author_diagnostic_sink,
 )
 from mimir.prompt_safety import sanitize_prompt_field
+from mimir.github_identity import own_conflict_pr_author
 from mimir_cultivate.ci import capture_job_log, clean_log_tail, classify_cancelled_run
 from mimir_cultivate.forge import ForgeError, GitHubForgeClient
 from mimir_cultivate.github_trust import partition, sanitize_login, sanitize_url
@@ -788,7 +789,9 @@ class _GhApiBudgetRefused:
 _GH_API_BUDGET_REFUSED = _GhApiBudgetRefused()
 
 
-def _gh_api(endpoint: str, token: str) -> list | dict | None | _GhApiBudgetRefused:
+def _gh_api(
+    endpoint: str, token: str,
+) -> list | dict | None | _GhApiBudgetRefused:
     """Call ``gh api <endpoint> --paginate`` and return parsed JSON.
 
     Returns ``None`` on an ordinary API error and a private marker when the tick
@@ -820,8 +823,9 @@ def _gh_api(endpoint: str, token: str) -> list | dict | None | _GhApiBudgetRefus
                 )
                 return _GH_API_BUDGET_REFUSED
             timeout = allowed
+        argv = ["gh", "api", endpoint, "--paginate"]
         result = subprocess.run(
-            ["gh", "api", endpoint, "--paginate"],
+            argv,
             capture_output=True, text=True, timeout=timeout, env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -3661,7 +3665,7 @@ def _deliver_pr_ci(
     }
 
 
-def _pr_merge_queue_status(repo: str, number: int, token: str) -> bool | None:
+def _pr_merge_queue_status(repo: str, number: int, head: str, token: str) -> bool | None:
     """Bound the typed queue read by the same hard deadline as REST reads."""
     budget = _ACTIVE_TICK_BUDGET
     timeout = budget.call_timeout() if budget is not None else float(GH_API_TIMEOUT_SECONDS)
@@ -3670,7 +3674,9 @@ def _pr_merge_queue_status(repo: str, number: int, token: str) -> bool | None:
         return None
     try:
         with _wall_clock_deadline(timeout):
-            return GitHubForgeClient(token=token, timeout=timeout).is_pull_request_queued(repo, number)
+            return GitHubForgeClient(token=token, timeout=timeout).is_pull_request_queued(
+                repo, number, expected_head=head,
+            )
     except (ForgeError, _DeadlineExceeded):
         return None
 
@@ -3713,7 +3719,7 @@ def _check_own_mergeability(
     reconciled = 0
     prs = _rotate(list(prs), rotate_offset)
     for listed_pr in prs:
-        if (listed_pr.get("user") or {}).get("login") != me:
+        if not own_conflict_pr_author((listed_pr.get("user") or {}).get("login"), me):
             continue
         number = listed_pr.get("number")
         if not isinstance(number, int) or isinstance(number, bool):
@@ -3736,13 +3742,6 @@ def _check_own_mergeability(
         # The merge queue already rebuilds/tests against the current base and
         # rejects branch pushes. Do not authorize even a checkout/test turn.
         # Review requests and operator asks use separate, unaffected paths.
-        queued = _pr_merge_queue_status(repo, number, token)
-        if queued is not False:
-            reason = "in merge queue" if queued is True else "merge queue status unavailable"
-            _eprint(f"Skipping non-review remediation for PR #{number}: {reason}")
-            if key in prior:
-                new[key] = prior[key]
-            continue
         head = pr.get("head") or {}
         base = pr.get("base") or {}
         head_sha = head.get("sha") or ""
@@ -3751,6 +3750,16 @@ def _check_own_mergeability(
         if not head_sha or not base_sha or not isinstance(mergeable, bool):
             if key in prior:
                 new[key] = prior[key]
+            continue
+        queued = _pr_merge_queue_status(repo, number, head_sha, token)
+        if queued is not False:
+            reason = "in merge queue" if queued is True else "merge queue status unavailable"
+            _eprint(f"Skipping non-review remediation for PR #{number}: {reason}")
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        author = (pr.get("user") or {}).get("login")
+        if not own_conflict_pr_author(author, me) or (mergeable and author != me):
             continue
         compare = _compare_data(repo, base_sha, head_sha, token)
         if compare is None:
@@ -3783,7 +3792,6 @@ def _check_own_mergeability(
             # Moving the head could make an unaddressed blocking review appear
             # stale. The changes-requested reconciler owns this PR until cleared.
             continue
-
         reason = "conflicting" if not mergeable else "behind_base"
         attempts = 0
         last_attempt: datetime | None = None
@@ -3877,17 +3885,26 @@ def _check_own_mergeability(
             prompt = (
                 f"Your PR #{number} on {repo} conflicts with its declared base "
                 f"{base.get('ref')} at {base_sha}: {title}\n"
-                "Use the scoped PR checkout and repo_rebase to reproduce the conflict, "
+                "Use the scoped PR checkout and repo_merge to merge the declared base into "
+                "the PR branch, "
                 "then collect every path with repo_unmerged. Resolve only when you can "
                 "identify the intended property from both the base and head; prefer "
-                "repo_rebase_abort and escalation over guessing. Stage only the conflict "
-                "paths and call repo_rebase again with the base property, head property, "
-                "and how you verified each so that evidence is recorded in the rebased "
-                "commit. Run repo_test with no selectors for the repository's configured "
-                "full suite; never push if it fails. Then repo_push with the existing lease "
+                "repo_merge_abort and escalation over guessing. Stage the resolved conflict "
+                "paths, then repo_commit listing every staged path, including auto-merged "
+                "files. Supply conflict_evidence for every conflicted path: base property, head property, "
+                "and a verification of each, recorded in the merge commit. Preserve base "
+                "changes: the resulting tree may differ from the merged base only on paths "
+                "already changed by the PR before merging. An outside-path refusal requires "
+                "escalation. Run repo_test with no selectors; every configured leg of the "
+                "default suite must pass at the merge commit. "
+                "Then repo_push with the lease against the observed head "
+                f"{head_sha}. After a successful push, post a PR comment listing every "
+                "conflicted path and how its two-sided intent was resolved and verified, "
                 f"and re-request review from {reviewer_text}. This path only resolves and "
                 "re-requests review: do not merge the PR.\n"
-                f"There is no blocking CHANGES_REQUESTED review. Base: {base_sha}.\n{url}"
+                "Use merge commits, never rebase or history rewriting. Eligibility was "
+                "verified: deployment-owned author, no blocking CHANGES_REQUESTED review, "
+                f"and not in a merge queue. Base: {base_sha}.\n{url}"
             )
             event_type = "pr_mergeability_conflicting"
         _emit(

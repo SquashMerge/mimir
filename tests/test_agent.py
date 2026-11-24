@@ -4838,6 +4838,38 @@ async def test_run_turn_emits_turn_failed_event_on_error(tmp_path: Path):
     assert ev["attempt_disposition"] == "charge"
 
 
+async def test_reactive_codex_refresh_failure_alerts_once(tmp_path, monkeypatch):
+    from langchain_codex_plus.codex_auth import CodexAuthRefreshError
+    import importlib
+
+    alerts = importlib.import_module("mimir.tools.operator_alert")
+    auth_dir = tmp_path / "codex"
+    auth_dir.mkdir()
+    (auth_dir / "auth.json").write_text(json.dumps({"last_refresh": "2026-11-22T01:21:29Z"}))
+    monkeypatch.setenv("CODEX_HOME", str(auth_dir))
+    notices = []
+
+    async def send(channel, text, **kwargs):
+        notices.append((channel, text))
+        return SimpleNamespace(sent=True)
+
+    class FailedRefresh:
+        async def astream(self, *args, **kwargs):
+            raise CodexAuthRefreshError("HTTP 401 from https://auth.openai.com/oauth/token")
+            yield
+
+    agent = _build_agent(tmp_path, fake_agent=FailedRefresh())
+    monkeypatch.setattr(alerts, "_config", SimpleNamespace(operator_alert_channel="discord:operator"))
+    monkeypatch.setattr(alerts, "_channel_registry", SimpleNamespace(send=send))
+    for _ in range(2):
+        await agent.run_turn(AgentEvent(trigger="poller", channel_id="ch-1", content="review PR"))
+    records = _read_events(tmp_path)
+    failures = [e for e in records if e["type"] == "codex_auth_refresh_failed"]
+    assert len(failures) == len(notices) == 1
+    assert failures[0]["error_code"] == "http_401"
+    assert "docker exec -u mimir <container> codex login --device-auth" in notices[0][1]
+
+
 @pytest.mark.parametrize("name,message,expected", [
     ("CodexResponseError", "Our servers are currently overloaded. Please try again later.",
      "provider_error_transient:CodexResponseError"),

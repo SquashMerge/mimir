@@ -911,6 +911,7 @@
       "tests/test_github_poller_event_coalescing.py": "d19afeeeaca68e5fdd458b1f6f9e257cc0e45ec732ca571e83694f557bd7c75a",
       "tests/test_github_poller_issue_notices.py": "8bf270a5fc30e418c425d46ad1d9dd54b96f4e2f26681a3e8c7230152f97e61f",
       "tests/test_github_poller_mergeability.py": "88a30924512f8df77b9ad0dd0afd5ab5d8343190d44d85b8daa533fb7031d1d1",
+
       "tests/test_github_poller_own_feedback.py": "fdc813cf84fad3be8560e18d1e9ce82072478b9df40772530919d2f714b95c75",
       "tests/test_github_poller_pr_pushes.py": "87b943017ceaa621c60747944c3a48383f4aa0d8559dd6aa47b1ca36aca5d6eb",
       "tests/test_github_poller_pr_scope_snapshot.py": "005137dbb24dff5cfe3892ff83d09efbb710ac2b02d8aacdacc7b444902b0094",
@@ -955,5 +956,104 @@
       "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
       "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
     }
+  },
+  "2195-merge-conflict-resolution": {
+    "github-poller": {
+      "SKILL.md": "3ea1fb6f9ebc4a5764438403a3c0799bfd8db570088657a50c7d0613301d8f94",
+      "pollers.json": "12c811024ac63bf8ab635f95ca50dcaa976b41c6e7adcbcb4fb38fbafe09692c",
+      "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
+      "scripts/poller.py": "6ebce25375dbd2d9dc9629a97a215c86a2a187670f426cdaade3ff4c3281bbed",
+      "tests/conftest.py": "06c6fdd21e3fe55ee2e29085aefb21740cf9941ad0bba4a5499056d662816de1",
+      "tests/github_poller_test_support.py": "43bba3c7a2dc4f741aa090dd4c23bb01a2457413ff7a3e4bd6d552aa57756fab",
+      "tests/test_github_poller_auto_review.py": "fe468ac55b21f14bee08a5ee3cc765f9a466d10a8b4e678d6a8f852990e752ba",
+      "tests/test_github_poller_changes_requested.py": "14eada4ed0f1eb0ae1b9b6e2288e77f9bd2cc8a64b87e97891d5a0eaff1a00d3",
+      "tests/test_github_poller_ci_failures.py": "70388f99cd78e18cfbcdaf5a6ce15e349f726aee1c6b64b9fe0548bffab44557",
+      "tests/test_github_poller_ci_logs.py": "fdeefc12d4483cbcd658f6a460fcc5c6f4c5d41f26f56cfd16a5b6c3014d1ce9",
+      "tests/test_github_poller_event_coalescing.py": "d19afeeeaca68e5fdd458b1f6f9e257cc0e45ec732ca571e83694f557bd7c75a",
+      "tests/test_github_poller_issue_notices.py": "8bf270a5fc30e418c425d46ad1d9dd54b96f4e2f26681a3e8c7230152f97e61f",
+      "tests/test_github_poller_mergeability.py": "0cfa4ead7a5e01823d81c6d47e31472d528408dd7bf26b6706306b7bccb83c3f",
+      "tests/test_github_poller_own_feedback.py": "fdc813cf84fad3be8560e18d1e9ce82072478b9df40772530919d2f714b95c75",
+      "tests/test_github_poller_pr_pushes.py": "87b943017ceaa621c60747944c3a48383f4aa0d8559dd6aa47b1ca36aca5d6eb",
+      "tests/test_github_poller_pr_scope_snapshot.py": "005137dbb24dff5cfe3892ff83d09efbb710ac2b02d8aacdacc7b444902b0094",
+      "tests/test_github_poller_pr_trust.py": "58fade4ccb673e234cc75e514afc7712cc9b8c0ca9dba919d44d1e80153a7af4",
+      "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
+      "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
+      "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
+    }
+  },
+  "2195-merge-conflict-resolution-main-integration": {
+    "github-poller": {
+      "SKILL.md": "159f30687fbc1f660dc307b0a03a751e484b803242f202b736cf3eacf0cf4d5c",
+      "pollers.json": "12c811024ac63bf8ab635f95ca50dcaa976b41c6e7adcbcb4fb38fbafe09692c",
+      "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
+      "scripts/poller.py": "c45b0d2cedb53e80d7f8dca034b73d29d0126cd56bc23bee25a2841b6d220b32",
+      "tests/conftest.py": "1f437551f8d130a352983136fdf7e6e4d25c3e50301d872d18c90d653c195d05",
+      "tests/github_poller_test_support.py": "43bba3c7a2dc4f741aa090dd4c23bb01a2457413ff7a3e4bd6d552aa57756fab",
+      "tests/test_github_poller_auto_review.py": "fe468ac55b21f14bee08a5ee3cc765f9a466d10a8b4e678d6a8f852990e752ba",
+      "tests/test_github_poller_changes_requested.py": "14eada4ed0f1eb0ae1b9b6e2288e77f9bd2cc8a64b87e97891d5a0eaff1a00d3",
+      "tests/test_github_poller_ci_failures.py": "70388f99cd78e18cfbcdaf5a6ce15e349f726aee1c6b64b9fe0548bffab44557",
+      "tests/test_github_poller_ci_logs.py": "fdeefc12d4483cbcd658f6a460fcc5c6f4c5d41f26f56cfd16a5b6c3014d1ce9",
+      "tests/test_github_poller_event_coalescing.py": "d19afeeeaca68e5fdd458b1f6f9e257cc0e45ec732ca571e83694f557bd7c75a",
+      "tests/test_github_poller_issue_notices.py": "8bf270a5fc30e418c425d46ad1d9dd54b96f4e2f26681a3e8c7230152f97e61f",
+      "tests/test_github_poller_mergeability.py": "4ab9bcea7c0c4826779a34ff0fe8bd10ad86e9b61dc480578d46c912f7f12f56",
+      "tests/test_github_poller_own_feedback.py": "fdc813cf84fad3be8560e18d1e9ce82072478b9df40772530919d2f714b95c75",
+      "tests/test_github_poller_pr_pushes.py": "87b943017ceaa621c60747944c3a48383f4aa0d8559dd6aa47b1ca36aca5d6eb",
+      "tests/test_github_poller_pr_scope_snapshot.py": "005137dbb24dff5cfe3892ff83d09efbb710ac2b02d8aacdacc7b444902b0094",
+      "tests/test_github_poller_pr_trust.py": "58fade4ccb673e234cc75e514afc7712cc9b8c0ca9dba919d44d1e80153a7af4",
+      "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
+      "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
+      "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
+    }
+  },
+  "2195-merge-conflict-resolution-async-integration": {
+    "github-poller": {
+      "SKILL.md": "159f30687fbc1f660dc307b0a03a751e484b803242f202b736cf3eacf0cf4d5c",
+      "pollers.json": "12c811024ac63bf8ab635f95ca50dcaa976b41c6e7adcbcb4fb38fbafe09692c",
+      "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
+      "scripts/poller.py": "3a8d614a11a45d521de2a9828819a02a6c19ce0a4af361d1189b32819e76bb30",
+      "tests/conftest.py": "1f437551f8d130a352983136fdf7e6e4d25c3e50301d872d18c90d653c195d05",
+      "tests/github_poller_test_support.py": "43bba3c7a2dc4f741aa090dd4c23bb01a2457413ff7a3e4bd6d552aa57756fab",
+      "tests/test_github_poller_auto_review.py": "fe468ac55b21f14bee08a5ee3cc765f9a466d10a8b4e678d6a8f852990e752ba",
+      "tests/test_github_poller_changes_requested.py": "14eada4ed0f1eb0ae1b9b6e2288e77f9bd2cc8a64b87e97891d5a0eaff1a00d3",
+      "tests/test_github_poller_ci_failures.py": "70388f99cd78e18cfbcdaf5a6ce15e349f726aee1c6b64b9fe0548bffab44557",
+      "tests/test_github_poller_ci_logs.py": "fdeefc12d4483cbcd658f6a460fcc5c6f4c5d41f26f56cfd16a5b6c3014d1ce9",
+      "tests/test_github_poller_event_coalescing.py": "d19afeeeaca68e5fdd458b1f6f9e257cc0e45ec732ca571e83694f557bd7c75a",
+      "tests/test_github_poller_issue_notices.py": "8bf270a5fc30e418c425d46ad1d9dd54b96f4e2f26681a3e8c7230152f97e61f",
+      "tests/test_github_poller_mergeability.py": "4ab9bcea7c0c4826779a34ff0fe8bd10ad86e9b61dc480578d46c912f7f12f56",
+      "tests/test_github_poller_own_feedback.py": "fdc813cf84fad3be8560e18d1e9ce82072478b9df40772530919d2f714b95c75",
+      "tests/test_github_poller_pr_pushes.py": "87b943017ceaa621c60747944c3a48383f4aa0d8559dd6aa47b1ca36aca5d6eb",
+      "tests/test_github_poller_pr_scope_snapshot.py": "005137dbb24dff5cfe3892ff83d09efbb710ac2b02d8aacdacc7b444902b0094",
+      "tests/test_github_poller_pr_trust.py": "58fade4ccb673e234cc75e514afc7712cc9b8c0ca9dba919d44d1e80153a7af4",
+      "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
+      "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
+      "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
+    }
+  },
+  "2195-merge-conflict-resolution-neutral-guidance": {
+    "github-poller": {
+      "SKILL.md": "159f30687fbc1f660dc307b0a03a751e484b803242f202b736cf3eacf0cf4d5c",
+      "pollers.json": "12c811024ac63bf8ab635f95ca50dcaa976b41c6e7adcbcb4fb38fbafe09692c",
+      "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
+      "scripts/poller.py": "a1633f63d7349c8662d6cf249125c9d4cae4dd4d5912c2d26a08b77ca491533a",
+      "tests/conftest.py": "1f437551f8d130a352983136fdf7e6e4d25c3e50301d872d18c90d653c195d05",
+      "tests/github_poller_test_support.py": "43bba3c7a2dc4f741aa090dd4c23bb01a2457413ff7a3e4bd6d552aa57756fab",
+      "tests/test_github_poller_auto_review.py": "fe468ac55b21f14bee08a5ee3cc765f9a466d10a8b4e678d6a8f852990e752ba",
+      "tests/test_github_poller_changes_requested.py": "14eada4ed0f1eb0ae1b9b6e2288e77f9bd2cc8a64b87e97891d5a0eaff1a00d3",
+      "tests/test_github_poller_ci_failures.py": "70388f99cd78e18cfbcdaf5a6ce15e349f726aee1c6b64b9fe0548bffab44557",
+      "tests/test_github_poller_ci_logs.py": "fdeefc12d4483cbcd658f6a460fcc5c6f4c5d41f26f56cfd16a5b6c3014d1ce9",
+      "tests/test_github_poller_event_coalescing.py": "d19afeeeaca68e5fdd458b1f6f9e257cc0e45ec732ca571e83694f557bd7c75a",
+      "tests/test_github_poller_issue_notices.py": "8bf270a5fc30e418c425d46ad1d9dd54b96f4e2f26681a3e8c7230152f97e61f",
+      "tests/test_github_poller_mergeability.py": "c624d2af87026b15d8938021e4ea1f01fae2b95c8c91c22b6597be2a27308e48",
+      "tests/test_github_poller_own_feedback.py": "fdc813cf84fad3be8560e18d1e9ce82072478b9df40772530919d2f714b95c75",
+      "tests/test_github_poller_pr_pushes.py": "87b943017ceaa621c60747944c3a48383f4aa0d8559dd6aa47b1ca36aca5d6eb",
+      "tests/test_github_poller_pr_scope_snapshot.py": "005137dbb24dff5cfe3892ff83d09efbb710ac2b02d8aacdacc7b444902b0094",
+      "tests/test_github_poller_pr_trust.py": "58fade4ccb673e234cc75e514afc7712cc9b8c0ca9dba919d44d1e80153a7af4",
+      "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
+      "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
+      "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
+    }
+  },
+  "2193-private-draft-archival-completion-integration": {
+    "github-poller": {}
   }
 }
