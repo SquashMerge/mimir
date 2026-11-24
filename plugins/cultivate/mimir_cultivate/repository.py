@@ -824,6 +824,184 @@ class InterruptedCheckoutRefusal(RuntimeError):
     """A retained checkout needs recovery but cannot be safely admitted."""
 
 
+class DirtyPRCheckoutLeaseRefusal(RuntimeError):
+    """Prior-turn drafts remain intact and require operator disposition."""
+
+    def __init__(self, lease: PRCheckoutLease) -> None:
+        prior = lease.last_turn_id or "unknown (legacy lease)"
+        self.signal = {
+            "status": "attestation_refused",
+            "reason": "dirty_lease_from_prior_turn",
+            "prior_turn_id": lease.last_turn_id,
+            "path": str(lease.path),
+            "mutation_allowed": False,
+            "disposition": "operator_required",
+            "message": (
+                f"dirty lease from prior turn {prior}; edits are preserved in place. "
+                "An operator must preserve or discard the draft and clean the lease "
+                "before checkout can be admitted. Report this refusal; leave the PR unchanged."
+            ),
+        }
+        super().__init__(self.signal["message"])
+
+
+def _lease_turn_id() -> str | None:
+    from mimir._context import get_current_turn
+
+    turn = get_current_turn()
+    return turn.turn_id if turn is not None else None
+
+
+def _archive_prior_turn_draft(lease: PRCheckoutLease, runner: Runner) -> Path:
+    """Write a private, independently recoverable snapshot before destructive Git."""
+    import tempfile
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise RuntimeError("draft archival requires MIMIR_HOME")
+    root = Path(home) / "state" / "pr-lease-drafts"
+    # Do not follow a redirected state/archive root, even on a retry.
+    for directory in (root.parent, root):
+        if directory.is_symlink():
+            raise RuntimeError("draft artifact root may not be a symlink")
+        directory.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(root, 0o700)
+    artifact = Path(tempfile.mkdtemp(prefix="draft-", dir=root))
+    os.chmod(artifact, 0o700)
+
+    def git(*args: str) -> str:
+        result = runner(["git", "-C", str(lease.path), *args])
+        if result.returncode:
+            raise RuntimeError("draft artifact Git capture failed")
+        return result.stdout  # No strip(): patches must retain their final newline.
+
+    def write(name: str, data: str) -> None:
+        with os.fdopen(os.open(artifact / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                       "w", encoding="utf-8", newline="") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    head = git("rev-parse", "--verify", "HEAD").strip()
+    # Let Git write exact patch bytes: a text-mode runner's universal-newline
+    # decoding would corrupt CRLF text hunks even with --binary enabled.
+    for name, revisions in (("staged.patch", ("--cached", "HEAD")),
+                            ("worktree.patch", ())):
+        write(name, "")
+        git("diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv",
+            f"--output={artifact / name}", *revisions, "--")
+        with (artifact / name).open("rb") as stream:
+            os.fsync(stream.fileno())
+    untracked = [name for name in git("ls-files", "--others", "--exclude-standard", "-z").split("\0") if name]
+    fd = os.open(artifact / "untracked.tar", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        with tarfile.open(fileobj=stream, mode="w") as archive:
+            for name in untracked:
+                path = Path(name)
+                if path.is_absolute() or ".." in path.parts:
+                    raise RuntimeError("invalid untracked artifact path")
+                # Git lists leaves; never recursively follow an untracked symlink.
+                archive.add(lease.path / path, arcname=name, recursive=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+    # Preserve local commits as well as staged/unstaged drafts. Git creates the
+    # bundle inside the already-private directory, then we fix its file mode.
+    git("bundle", "create", str(artifact / "history.bundle"), "--all", "HEAD")
+    os.chmod(artifact / "history.bundle", 0o600)
+    git("bundle", "verify", str(artifact / "history.bundle"))
+    write("metadata.json", json.dumps({
+        "version": 1, "prior_turn_id": lease.last_turn_id, "lease_path": str(lease.path),
+        "head_sha": head, "scoped_head_sha": lease.head_sha,
+        "timestamp": datetime.now(UTC).isoformat(), "untracked_paths": untracked,
+    }, sort_keys=True) + "\n")
+    # This manifest is written last. A caller must verify it before resetting,
+    # even if a broken/replaced capture helper returns without writing anything.
+    expected = {"staged.patch", "worktree.patch", "untracked.tar", "history.bundle", "metadata.json"}
+    write("complete.json", json.dumps(sorted(expected)) + "\n")
+    # Flush Git-created files and directory entries before reset can remove the
+    # only live copy. A failed durability barrier leaves the lease untouched.
+    for entry in artifact.iterdir():
+        with entry.open("rb") as stream:
+            os.fsync(stream.fileno())
+    for directory in (artifact, root, root.parent):
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return artifact
+
+
+def _dispose_prior_turn_draft(
+    lease: PRCheckoutLease, scope: RepoPRActionScope, runner: Runner,
+    notices: list[dict[str, str]] | None = None,
+) -> None:
+    current = _lease_turn_id()
+    if current is not None and lease.last_turn_id == current:
+        return
+    status = _run(runner, ["git", "-C", str(lease.path), "status", "--porcelain=v1",
+                           "--untracked-files=all"], "prior-turn PR checkout status inspection failed")
+    if not status:
+        return
+    from .scheduler import active_pr_checkout_lease_paths
+
+    # Archival is disposition, not a way to acquire another live turn's lease or
+    # launder an unvalidated identity. No reset occurs on uncertain evidence.
+    if lease.path.resolve() in {p.resolve() for p in active_pr_checkout_lease_paths()}:
+        raise DirtyPRCheckoutLeaseRefusal(lease)
+    if (lease.canonical_repo != scope.canonical_repo or lease.owner != scope.principal
+            or lease.source_root.resolve() != Path(scope.canonical_root).resolve()
+            or lease.destination_ref != scope.destination_ref
+            or lease.canonical_origin != scope.canonical_origin):
+        raise RuntimeError("prior-turn draft checkout identity mismatch")
+    origin = _run(runner, ["git", "-C", str(lease.path), "config", "--get", "remote.origin.url"],
+                  "prior-turn draft origin unavailable")
+    if origin != scope.canonical_origin or _retained_branch(lease.path, runner) != scope.head_ref:
+        raise RuntimeError("prior-turn draft checkout identity mismatch")
+    _assert_self_contained_checkout(lease.path, runner=runner)
+    if interrupted_pr_checkout(lease, scope, runner=runner) is not None:
+        raise DirtyPRCheckoutLeaseRefusal(lease)
+    _run(runner, ["git", "-C", str(lease.path), "fetch", "--no-tags", "origin",
+                  scope.checkout_ref or scope.destination_ref], "prior-turn draft PR head fetch failed")
+    remote_head = _run(runner, ["git", "-C", str(lease.path), "rev-parse", "FETCH_HEAD^{commit}"],
+                       "prior-turn draft PR head unavailable")
+    if remote_head.lower() != scope.observed_head_sha.lower():
+        raise RuntimeError("prior-turn draft scoped head is stale")
+    try:
+        artifact = _archive_prior_turn_draft(lease, runner)
+        required = {"staged.patch", "worktree.patch", "untracked.tar", "history.bundle", "metadata.json"}
+        if (artifact.is_symlink() or not artifact.is_dir()
+                or set(json.loads((artifact / "complete.json").read_text())) != required
+                or any(not (artifact / name).is_file() or (artifact / name).is_symlink()
+                       for name in required)):
+            raise RuntimeError("draft artifact is incomplete")
+        metadata = json.loads((artifact / "metadata.json").read_text())
+        if metadata["lease_path"] != str(lease.path) or metadata["prior_turn_id"] != lease.last_turn_id:
+            raise RuntimeError("draft artifact identity mismatch")
+    except (OSError, ValueError, KeyError, RuntimeError, tarfile.TarError) as exc:
+        raise DirtyPRCheckoutLeaseRefusal(lease) from exc
+    from mimir.event_logger import log_event_sync
+
+    notice = {
+        "reason": "prior_turn_draft_archived", "artifact": str(artifact),
+        "prior_turn_id": lease.last_turn_id or "unknown (legacy lease)",
+        "path": str(lease.path), "head_sha": metadata["head_sha"],
+    }
+    # Event delivery is mandatory here, unlike best-effort diagnostic logging.
+    log_event_sync("pr_checkout_prior_turn_draft_archived", repository=scope.canonical_repo,
+                   pull_request=scope.pr_number, **notice)
+    _run(runner, ["git", "-C", str(lease.path), "reset", "--hard", scope.observed_head_sha],
+         "archived prior-turn draft reset failed")
+    _run(runner, ["git", "-C", str(lease.path), "clean", "-fd"], "archived prior-turn draft clean failed")
+    if _run(runner, ["git", "-C", str(lease.path), "status", "--porcelain=v1", "--untracked-files=all"],
+            "archived prior-turn draft status failed"):
+        raise RuntimeError("archived prior-turn draft lease is not clean")
+    if notices is not None:
+        notices.append(notice)
+    log_event_sync("pr_checkout_prior_turn_draft_disposed", repository=scope.canonical_repo,
+                   pull_request=scope.pr_number, **notice)
+
+
 def _retained_branch(path: Path, runner: Runner) -> str:
     try:
         return _run(runner, ["git", "-C", str(path), "symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -1222,6 +1400,7 @@ def create_pr_checkout_lease(
             )
         lease = PRCheckoutLease(
             canonical_repo=scope.canonical_repo,
+            last_turn_id=_lease_turn_id(),
             canonical_origin=scope.canonical_origin,
             source_root=source,
             scope_base_sha=scoped_base,
@@ -1363,13 +1542,17 @@ def _recover_pr_checkout_lease_unlocked(
             pr_number=scope.pr_number,
             lineage=_recorded_lineage(raw),
             verified_base_sha=_recorded_verified_base(raw),
-            last_turn_id=raw.get("last_turn_id"),
+            last_turn_id=raw.get("last_turn_id") if isinstance(raw.get("last_turn_id"), str) else None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("PR checkout lease recovery metadata is invalid") from exc
     expired = datetime.now(UTC) >= lease.expires_at
     if (lease.revoked or not path.is_dir() or expired) and not (expired and renew_expired):
         raise RuntimeError("PR checkout lease is expired")
+    _dispose_prior_turn_draft(
+        lease, scope, runner,
+        review_state.checkout_recovery_notices if review_state else None,
+    )
     head = _run(
         runner, ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
         "recovered PR checkout has no HEAD",
@@ -1419,6 +1602,7 @@ def _recover_pr_checkout_lease_unlocked(
         lease, expires_at=datetime.now(UTC) + ttl,
         recovery_id=uuid.uuid4().hex,
         interrupted_operation=interrupted,
+        last_turn_id=_lease_turn_id(),
     )
     _attest_resume_candidate(lease, scope, head, review_state, attest_resume, prior=prior)
     try:
@@ -1471,7 +1655,7 @@ def _lease_from_recorded_metadata(path: Path, root: Path) -> PRCheckoutLease:
             pr_number=int(raw.get("pr_number", 0)),
             lineage=_recorded_lineage(raw),
             verified_base_sha=_recorded_verified_base(raw),
-            last_turn_id=raw.get("last_turn_id"),
+            last_turn_id=raw.get("last_turn_id") if isinstance(raw.get("last_turn_id"), str) else None,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("PR checkout lease reclamation metadata is invalid") from exc
@@ -2187,6 +2371,10 @@ def _rebind_foreign_candidate(
     attest_resume: Callable[[PRCheckoutLease], None] | None = None,
 ) -> PRCheckoutLease:
     """Move a proven same-PR lease onto the current immutable turn scope."""
+    _dispose_prior_turn_draft(
+        lease, scope, runner,
+        review_state.checkout_recovery_notices if review_state else None,
+    )
     interrupted = interrupted_pr_checkout(lease, scope, runner=runner)
     _run(
         runner,
@@ -2253,6 +2441,7 @@ def _rebind_foreign_candidate(
         lineage=lease.lineage,
         verified_base_sha=actual_base,
         interrupted_operation=interrupted,
+        last_turn_id=_lease_turn_id(),
     )
     _attest_resume_candidate(rebound, scope, head, review_state, attest_resume, prior=lease)
     metadata_path = lease.path / _METADATA
@@ -2525,6 +2714,8 @@ def acquire_pr_checkout_lease(
                     )
                 )
             )
+            # Inspect before any recovery, rebind, expiry renewal or divergent
+            # cleanup can turn another turn's draft into this turn's authority.
             if (path / _RECLAMATION_METADATA).exists():
                 if raw.get("scope_id") == scope.scope_id or same_pr:
                     _report_retained_candidates(
@@ -2539,6 +2730,10 @@ def acquire_pr_checkout_lease(
                         "pr_checkout_lease_retained", scope, [(path, "<unverifiable>")],
                     )
                     continue
+                _dispose_prior_turn_draft(
+                    _lease_from_recorded_metadata(path, root), scope, runner,
+                    review_state.checkout_recovery_notices if review_state else None,
+                )
             if raw.get("scope_id") == scope.scope_id:
                 paths.append(path)
                 continue
@@ -3123,6 +3318,8 @@ class GitStatus:
 class GitDiff:
     mode: Literal["working", "staged", "base"] = "working"
     paths: tuple[str, ...] = ()
+    failing_test: str | None = None
+    imported_modules: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4100,6 +4297,33 @@ class RepoGitTools:
             paths = _validated_paths(operation.paths, required=False)
             if operation.mode not in {"working", "staged", "base"}:
                 raise GitRefusal("invalid_shape", "unsupported diff mode")
+            if operation.failing_test is not None:
+                if operation.mode != "base" or self._retained:
+                    raise GitRefusal("invalid_shape", "CI failure classification requires a PR base diff")
+                evidence = _validated_paths(
+                    (operation.failing_test, *operation.imported_modules), required=True,
+                )
+                # Use the published immutable PR diff, not local drafts, an
+                # optional path filter, or commits produced during remediation.
+                changed = self._checked((
+                    "diff", "--name-only", "-z", "--no-renames",
+                    f"{self._scope.observed_base_sha}...{self._scope.observed_head_sha}", "--",
+                )).stdout.split("\0")
+                related = bool(set(evidence).intersection(changed))
+                decision = {
+                    "action": "remediate" if related else "report",
+                    "edit_allowed": related,
+                    "matched_paths": sorted(set(evidence).intersection(changed)),
+                    "guidance": (
+                        "Remediate the related failure, verify, and push with a lease."
+                        if related else
+                        "Report the unrelated failure with pr_comment or operator escalation; leave the PR unchanged."
+                    ),
+                }
+                return GitOperationResult(
+                    True, "ci_failure_related" if related else "ci_failure_unrelated",
+                    json.dumps(decision, sort_keys=True),
+                )
             revisions: tuple[str, ...] = ()
             if operation.mode == "staged":
                 revisions = ("--cached",)
@@ -6128,7 +6352,16 @@ def repo_checkout(
     pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Create the exact checkout lease bound to this turn's immutable PR scope."""
+    """Create the exact checkout lease bound to this turn's immutable PR scope.
+
+    Prior-turn drafts are automatically archived privately under state/pr-lease-drafts
+    before reset and cleanup; preserved_prior_work names the artifact. A
+    dirty_lease_from_prior_turn refusal preserves drafts if safe archival cannot
+    complete. After checkout, classify CI failures using
+    repo_diff(mode='base', failing_test=..., imported_modules=...). Remediate
+    failures related to the PR's changed paths; report unrelated failures with
+    pr_comment or operator escalation and leave the PR unchanged.
+    """
     if _retained_scope(runtime, repository, pull_request) is not None:
         raise _retained_refusal("repo_checkout")
     return checkout_scoped_pr(repository, pull_request, runtime)
@@ -6289,6 +6522,24 @@ def checkout_scoped_pr(
             # Tool and framework resumes share the no-renewal-on-refusal rule.
             attest_resume=attest_resume,
         )
+    except DirtyPRCheckoutLeaseRefusal as exc:
+        if context is not None and context.ifc_state is not None:
+            context.ifc_state.framework_pr_checkouts.pop(scope.scope_id, None)
+        if state.checkout_lease is not None:
+            attached = state.checkout_lease
+            attached.revoke()
+            state.revoke_checkout_lease(attached)
+        _report_retained_candidates(
+            "pr_checkout_dirty_lease_from_prior_turn", scope, [],
+            **exc.signal,
+        )
+        return {
+            **exc.signal,
+            # The host consumes the existing generic admission reason; opaque
+            # provider details carry the structured draft signal to the model.
+            "reason": "checkout_state_mismatch",
+            "details": exc.signal,
+        }
     except LeaseAttestationRefusal as exc:
         from mimir.access_control import log_pr_checkout_lease_attestation_refused
 
@@ -6803,14 +7054,27 @@ def repo_diff(
     mode: Literal["working", "staged", "base"] = "working",
     paths: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+    failing_test: str | None = None,
+    imported_modules: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Read a bounded working, staged, or base diff from the bound checkout.
 
     On a retained Worklink remediation turn, ``repository`` is the retained
     run's repository and ``pull_request`` is the incident's Chainlink issue id;
     retained scopes do not support ``mode='base'``.
+
+    Before CI remediation, classify with mode='base', failing_test=<test path>
+    and imported_modules=<repo-relative module paths imported by that test>.
+    Remediate when the failing test or an imported module is in the published
+    PR's changed paths. When both are outside those paths, report the unrelated
+    failure using pr_comment or operator escalation and leave the PR unchanged.
+    Unknown or insufficient evidence calls for reporting, not a speculative edit.
+    Classification returns action and edit_allowed in stdout JSON.
     """
-    return _execute(runtime, repository, pull_request, GitDiff(mode, paths))
+    return _execute(
+        runtime, repository, pull_request,
+        GitDiff(mode, paths, failing_test, imported_modules),
+    )
 
 
 @tool

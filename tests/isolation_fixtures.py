@@ -338,10 +338,22 @@ def synthetic_worklink_identities(monkeypatch, request):
 
 
 
+_MAINTENANCE_PINS_KEY = pytest.StashKey[dict[str, Path]]()
+
+
 @pytest.fixture(autouse=True, scope="session")
-def maintenance_pinned_executables():
-    """Isolate maintenance authorization tests from host executable layout."""
+def maintenance_pinned_executables(pytestconfig):
+    """Share one process-global pin set across both conftest fixture instances.
+
+    Importing this fixture into core and provider conftests creates distinct
+    FixtureDefs. Their session lifetimes overlap, so they must not independently
+    replace the same access-control map. The Config owns the resource and its
+    cleanup, rather than either FixtureDef's teardown.
+    """
     from mimir import access_control
+
+    if _MAINTENANCE_PINS_KEY in pytestconfig.stash:
+        return pytestconfig.stash[_MAINTENANCE_PINS_KEY]
 
     # Why not ``tmp_path_factory``: pytest's tmp base lives under ``/tmp``,
     # which is now a service-writable root, and #991 requires every pinned
@@ -354,10 +366,11 @@ def maintenance_pinned_executables():
     # base makes every pin fail its own non-symlink identity check — green on
     # Linux CI, 72 failures locally. Canonicalize before planting.
     pin_base = Path("/var/tmp").resolve()
-    with tempfile.TemporaryDirectory(
+    directory = tempfile.TemporaryDirectory(
         prefix="mimir-maintenance-executables-", dir=pin_base,
-    ) as executable_dir_text:
-        executable_dir = Path(executable_dir_text).resolve()
+    )
+    try:
+        executable_dir = Path(directory.name).resolve()
         real_git = Path(shutil.which("git") or "git").resolve(strict=True)
         replacements: dict[str, Path] = {}
         for command in access_control._MAINTENANCE_PINNED_EXECUTABLES:
@@ -371,12 +384,22 @@ def maintenance_pinned_executables():
                 executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             executable.chmod(0o755)
             replacements[command] = executable
+    except BaseException:
+        directory.cleanup()
+        raise
 
-        original = access_control._MAINTENANCE_PINNED_EXECUTABLES.copy()
-        access_control._MAINTENANCE_PINNED_EXECUTABLES.update(replacements)
-        yield replacements
+    original = access_control._MAINTENANCE_PINNED_EXECUTABLES.copy()
+
+    def cleanup():
         access_control._MAINTENANCE_PINNED_EXECUTABLES.clear()
         access_control._MAINTENANCE_PINNED_EXECUTABLES.update(original)
+        del pytestconfig.stash[_MAINTENANCE_PINS_KEY]
+        directory.cleanup()
+
+    pytestconfig.add_cleanup(cleanup)
+    access_control._MAINTENANCE_PINNED_EXECUTABLES.update(replacements)
+    pytestconfig.stash[_MAINTENANCE_PINS_KEY] = replacements
+    return replacements
 
 
 
