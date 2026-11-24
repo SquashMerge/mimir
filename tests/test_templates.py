@@ -281,6 +281,34 @@ class TestSessionHasAtoms:
 
 
 class TestRenderSagaSessionEnd:
+    @pytest.mark.parametrize("has_atoms", [False, True])
+    @pytest.mark.parametrize("override", [None, "valid", "malformed"])
+    def test_memory_skill_already_loaded_in_full(
+        self, tmp_path: Path, has_atoms: bool, override: str | None,
+    ) -> None:
+        """Both defaults, operator variants and format fallbacks retain guidance."""
+        if override is not None:
+            name = "saga_session_end" if has_atoms else "saga_session_end_lean"
+            (tmp_path / f"{name}.md").write_text(
+                "OPERATOR {channel_id}" if override == "valid" else "{unknown}",
+                encoding="utf-8",
+            )
+        prompt = render_saga_session_end(
+            channel_id="c", saga_session_id="s", idle_minutes=1,
+            turns_window=self._turns_with_atoms() if has_atoms else self._turns_no_atoms(),
+            prompts_dir=tmp_path if override is not None else None,
+        )
+        shipped = (
+            Path(__file__).parents[1] / "mimir" / "skills" / "memory" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        assert prompt.count(shipped) == 1
+        assert "## Memory skill (`memory`)" in prompt
+        assert "already loaded, so do not read its SKILL.md" in prompt
+        assert "session-boundary restrictions above take precedence" in prompt
+        assert "defer anything requiring unavailable tools" in prompt
+        if override == "valid":
+            assert prompt.startswith("OPERATOR c")
+
     def _turns_with_atoms(self) -> list[dict]:
         return [{
             "turn_id": "t1", "trigger": "user_message",
@@ -390,6 +418,9 @@ class TestRenderSagaSessionEnd:
                 channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
                 turns_window=turns, prompts_dir=None,
             )
+            # The full, general-purpose skill also documents other turn types.
+            # Its wrapper explicitly makes these synthesis instructions prevail.
+            prompt = prompt.split("\n\n## Memory skill (`memory`)", 1)[0]
             allowed = access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"]
             tool_names = set(access_control._TOOL_FLOW_MAP) | set(
                 access_control.TRIGGER_CAPABILITY_TIERS
@@ -420,6 +451,7 @@ class TestRenderSagaSessionEnd:
                 channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
                 turns_window=turns, prompts_dir=None,
             )
+            prompt = prompt.split("\n\n## Memory skill (`memory`)", 1)[0]
             guidance = prompt.split("Before calling `saga_end_session`", 1)[1].split(
                 "Synthesize and call:", 1,
             )[0]

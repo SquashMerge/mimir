@@ -2934,6 +2934,77 @@ async def test_poller_turn_cannot_read_another_pollers_channel_memory(
     assert "refused before execution" in str(fake_agent.result.content)
 
 
+@pytest.mark.parametrize("async_call", [False, True])
+@pytest.mark.parametrize("memory_source", [".mimir_builtin_skills", "skills"])
+async def test_synthesis_skill_catalog_omits_inlined_memory_per_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_call: bool, memory_source: str,
+) -> None:
+    from langchain.agents.middleware.types import ModelRequest, ModelResponse
+
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([]))
+    agent._agent = None
+    agent._agent_model = object()
+    monkeypatch.setattr(agent, "_current_system_prompt", lambda **kw: "stable prompt")
+    monkeypatch.setattr("mimir.tools.all_mimir_tools", lambda **kw: [])
+    monkeypatch.setattr("mimir.subagents.build_mimir_subagents", lambda **kw: [])
+    graphs = []
+    monkeypatch.setattr(
+        "deepagents.create_deep_agent", lambda **kw: graphs.append(kw) or object(),
+    )
+    for name in ("memory", "wiki"):
+        directory = agent._config.home / memory_source / name
+        directory.mkdir(parents=True)
+        (directory / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Use {name}.\n---\n{name} guidance\n",
+            encoding="utf-8",
+        )
+    await agent._build_agent_if_needed()
+    [middleware] = [m for m in graphs[0]["middleware"] if m.name == "SkillsMiddleware"]
+    auth = AuthContext(
+        principal=None, canonical_principal=None, roles=(), event_ingress=None,
+        trigger="user_message", channel_id="discord-a",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+    )
+    runtime = Runtime(context=auth)
+    loaded = await middleware.abefore_agent({}, runtime, {})
+    state = {**loaded, "messages": []}
+    assert {skill["name"] for skill in state["skills_metadata"]} == {"memory", "wiki"}
+    paths = {skill["name"]: skill["path"] for skill in state["skills_metadata"]}
+
+    # Reuse exactly the cached catalog across turns, including a return to a
+    # normal turn. Both framework call paths must hide only synthesis's memory.
+    for trigger in ("saga_session_end", "user_message", "scheduled_tick", "saga_session_end"):
+        request = ModelRequest(
+            model=object(), messages=[], tools=[], state=state,
+            runtime=Runtime(context=replace(auth, trigger=trigger)),
+        )
+        seen = []
+
+        def handler(filtered):
+            seen.append(filtered)
+            return ModelResponse(result=[AIMessage(content="done")])
+
+        if async_call:
+            async def async_handler(filtered):
+                return handler(filtered)
+
+            await middleware.awrap_model_call(request, async_handler)
+        else:
+            middleware.wrap_model_call(request, handler)
+        [sent] = seen
+        catalog = sent.system_message.text
+        assert "**wiki**" in catalog
+        assert f"Read `{paths['wiki']}`" in catalog
+        if trigger == "saga_session_end":
+            assert "**memory**" not in catalog
+            assert paths["memory"] not in catalog
+            assert {skill["name"] for skill in sent.state["skills_metadata"]} == {"wiki"}
+        else:
+            assert "**memory**" in catalog
+            assert f"Read `{paths['memory']}`" in catalog
+        assert {skill["name"] for skill in state["skills_metadata"]} == {"memory", "wiki"}
+
+
 @pytest.mark.parametrize(
     ("relative_path", "expected"),
     [
@@ -2950,6 +3021,7 @@ async def test_poller_turn_cannot_read_another_pollers_channel_memory(
         ("memory/shared/.git/token", "protected name\n"),
         ("memory/issues/unprotected-name.md", "ghp_" + "a" * 30),
         ("attachments/fetch-cache/body.txt", "cached attachment body\n"),
+        (".mimir_builtin_skills/memory/SKILL.md", "installed memory skill\n"),
     ],
 )
 async def test_enforced_synthesis_turn_denies_all_file_reads(
