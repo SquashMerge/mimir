@@ -24,7 +24,8 @@ def selected():
 def test_name_sets_are_pinned() -> None:
     assert policy.TRACKER_TOOL_NAMES == frozenset(PAYLOAD_ARGUMENT)
     assert policy.CULTIVATE_TOOL_NAMES == policy.CODING_TOOLS | policy.TRACKER_TOOL_NAMES
-    assert len(policy.CODING_TOOLS) == 42
+    assert len(policy.CODING_TOOLS) == 43
+    assert "package_compare" in policy.CODING_TOOLS
     assert not policy.CODING_TOOLS & policy.TRACKER_TOOL_NAMES
 
 

@@ -12747,6 +12747,55 @@ def _bound_repository_cleanup_result(
     )
 
 
+def _bound_package_compare_result(
+    tool_name: str, arguments: dict[str, Any], auth_context: Any,
+    authorization: ToolAuthorization, registered: Any, result: Any,
+    provenance: ProtectedResultProvenance | None, failed: bool,
+) -> bool:
+    """Only exact structural evidence at the authorized PR loses no write ability."""
+    from langchain_core.messages import ToolMessage
+    from .package_evidence import content_free_result
+
+    scope = authorization.repo_pr_action_scope
+    if not (
+        registered.owner == "cultivate" and tool_name == "package_compare"
+        and registered.resource_scope == "repo_pr" and registered.flow == "sink"
+        and registered.descriptor is not None
+        and registered.descriptor.result_origin == ResultOriginKind.NON_INGESTING
+        and registered.descriptor.sink_destination == "bound_pull_request"
+        and authorization.tool_name == tool_name
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.RESOURCE_SCOPED
+        and not failed and (provenance is None or not provenance.sources)
+        and scope is not None
+        and isinstance(arguments.get("repository"), str)
+        and type(arguments.get("pull_request")) is int
+        and arguments["repository"].lower() == scope.canonical_repo.lower()
+        and arguments["pull_request"] == scope.pr_number
+    ):
+        return False
+    registry = getattr(auth_context, "repo_pr_scope_registry", None)
+    discovered = getattr(auth_context, "server_discovered_pr_states", None)
+    state = registry.resolve(arguments["repository"], arguments["pull_request"]) if registry else None
+    if state is None and discovered is not None:
+        state = discovered.resolve_for_tool(tool_name, arguments["repository"], arguments["pull_request"])
+    if state is None:
+        state = getattr(auth_context, "repo_review_state", None)
+    if state is None or getattr(state, "action_scope", None) is not scope:
+        return False
+    artifact = getattr(result, "artifact", None)
+    if artifact is not None:
+        return False
+    if isinstance(result, ToolMessage):
+        if result.status != "success" or not isinstance(result.content, str):
+            return False
+        try:
+            result = json.loads(result.content)
+        except ValueError:
+            return False
+    return content_free_result(result, arguments.get("specs"), arguments.get("pairs"), arguments.get("paths"))
+
+
 def _bound_unsupported_operation_result(
     tool_name: str, arguments: dict[str, Any], auth_context: Any,
     authorization: ToolAuthorization, registered: Any, result: Any,
@@ -12958,6 +13007,11 @@ def classify_protected_result(
             tool_name, arguments or {}, auth_context, authorization, registered,
         )
         if not retained_verified and not pr_lease_verified:
+            if _bound_package_compare_result(
+                tool_name, arguments or {}, auth_context, authorization,
+                registered, result, provenance, failed or policy_refusal is not None,
+            ):
+                return None
             if _bound_tracker_status_result(
                 tool_name, arguments or {}, auth_context, authorization,
                 registered, result, provenance, failed,

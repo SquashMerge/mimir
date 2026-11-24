@@ -26,8 +26,8 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2193-private-draft-archival-completion-integration"
-CI_WATCH_RELEASE = "2193-private-draft-archival"
+GITHUB_POLLER_RELEASE = "2189-2193-npm-provenance-archival-integration"
+CI_WATCH_RELEASE = "2189-2193-npm-provenance-archival-integration"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.
 IDENTITY_EXCEPTIONS: dict[str, set[str]] = {}
@@ -56,7 +56,7 @@ def test_current_repository_skill_release_hash(name):
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     version = {
         "github-poller": GITHUB_POLLER_RELEASE,
-        "review": "2126-claude-subscription-main-integration",
+        "review": "2189-caller-selected-paths",
         "tracker-poller": "2066-pr-publication",
         "github-ci-watch": CI_WATCH_RELEASE,
     }.get(name, "0.9.10-2025")
@@ -102,11 +102,12 @@ def test_current_github_poller_release_inventory_is_complete():
     assert actual == expected, "Current github-poller inventory:\n" + json.dumps(actual, indent=2)
 
 
-def test_history_file_defaults_are_released_for_both_pollers():
+@pytest.mark.parametrize("name", ["github-poller", "github-ci-watch"])
+def test_history_file_defaults_are_released_for_both_pollers(name):
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     skills = skills_for_candidates(enabled_plugins(enable="cultivate"))
     for skill in skills:
-        if skill.name not in {"github-poller", "github-ci-watch"}:
+        if skill.name != name:
             continue
         # Keep historical release evidence intact; each poller can advance
         # independently after the shared history-file release.
@@ -114,7 +115,10 @@ def test_history_file_defaults_are_released_for_both_pollers():
             "github-poller": GITHUB_POLLER_RELEASE,
             "github-ci-watch": CI_WATCH_RELEASE,
         }[skill.name]
-        assert skill_inventory(skill) == releases[release][skill.name]
+        actual = skill_inventory(skill)
+        assert actual == releases[release][skill.name], (
+            f"Current {skill.name} inventory:\n" + json.dumps(actual, indent=2)
+        )
         capabilities = json.loads((SKILLS / skill.name / "pollers.json").read_text())["pollers"][0]["authority"]["capabilities"]
         assert {"repo_restore_file", "repo_file_at_revision"} <= set(capabilities)
 

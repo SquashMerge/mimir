@@ -25,8 +25,8 @@ def test_selected_cultivate_matches_frozen_pre_extraction_policy(monkeypatch, tm
     oracle = json.loads((Path(__file__).parents[3] / "tests/fixtures/plugin_core_policy_baseline.json").read_text())
     tables = oracle["tables"]
     selected = load_plugins(enable="cultivate").policy
-    assert len(CODING_TOOLS) == 42
-    for name in CODING_TOOLS - {"repo_restore_file", "repo_file_at_revision"}:
+    assert len(CODING_TOOLS) == 43
+    for name in CODING_TOOLS - {"repo_restore_file", "repo_file_at_revision", "package_compare"}:
         after = selected.tools[name]
         before = oracle["descriptors"][name]
         assert after.owner == "cultivate"
@@ -91,7 +91,7 @@ def test_selected_cultivate_matches_frozen_pre_extraction_policy(monkeypatch, tm
     _prepare_inputs(home, monkeypatch)
     with policy_scope(selected):
         extracted = _extractor_results(home)
-    for name in CODING_TOOLS - {"repo_restore_file", "repo_file_at_revision"}:
+    for name in CODING_TOOLS - {"repo_restore_file", "repo_file_at_revision", "package_compare"}:
         assert json.loads(_canonical(extracted[name], home)) == oracle["extractor_results"][name], name
 
 
