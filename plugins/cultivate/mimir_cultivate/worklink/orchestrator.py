@@ -2408,7 +2408,7 @@ class WorklinkRunner:
             log_evidence()
         transition_status = (
             "blocked"
-            if raw.output_overflow or {"gate_timed_out", "gate_command_not_found"}.intersection(validation.reasons)
+            if raw.output_overflow or {"gate_timed_out", "gate_lease_wait_timeout", "gate_command_not_found"}.intersection(validation.reasons)
             else validation.status
         )
         transition_reason = (

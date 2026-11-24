@@ -141,6 +141,9 @@ class ComputeResult:
     output_truncated: bool = False
     stdout_bytes: int = 0
     stderr_bytes: int = 0
+    lease_wait_timed_out: bool = False
+    lease_wait_s: float = 0.0
+    run_duration_s: float = 0.0
 
 
 class ComputeLaunchError(RuntimeError):
