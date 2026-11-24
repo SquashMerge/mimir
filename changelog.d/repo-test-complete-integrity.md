@@ -1,1 +1,0 @@
-- A `repo_test_complete` turn now inherits the queueing turn's integrity instead of always marking its channel untrusted, so a clean remediation turn can act on its own test results (check out, comment, push).
