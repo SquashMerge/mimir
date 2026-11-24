@@ -865,7 +865,8 @@ def test_session_environment_is_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_COUNT", "99")
     env = session_environment({"CFLAGS": "-O2"}, home=tmp_path, git_settings=(), credentials={})
     assert env == {
-        "PATH": "/opt/mimir-opencode/bin:/usr/local/bin:/usr/bin:/bin", "USER": "worklink",
+        "PATH": "/opt/mimir-worklink/pytest-guard/bin:/opt/mimir-opencode/bin:/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH": "/opt/mimir-worklink/pytest-guard/python", "USER": "worklink",
         "LOGNAME": "worklink", "SHELL": "/bin/sh", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
         "HOME": str(tmp_path), "TMPDIR": str(tmp_path / "tmp"), "MIMIR_WORKLINK_GATE": "1",
         "MIMIR_SPAWN_DEPTH": "1", "CFLAGS": "-O2", "GIT_CONFIG_NOSYSTEM": "1",

@@ -197,6 +197,7 @@ exclude = [
 ".env.example" = "mimir/bundled_docs/.env.example"
 "Dockerfile" = "mimir/docker_context/Dockerfile"
 "deploy/s6-overlay/s6-rc.d" = "mimir/docker_context/deploy/s6-overlay/s6-rc.d"
+"scripts/heavy_run.sh" = "mimir/heavy_run/heavy_run.sh"
 # One canonical protocol source, also used by the source-tree shell wrapper.
 "scripts/heavy_run.py" = "mimir/heavy_run/heavy_run.py"
 
@@ -213,6 +214,7 @@ exclude = [
 ".env.example" = ".env.example"
 "Dockerfile" = "Dockerfile"
 "deploy/s6-overlay/s6-rc.d" = "deploy/s6-overlay/s6-rc.d"
+"scripts/heavy_run.sh" = "scripts/heavy_run.sh"
 "scripts/heavy_run.py" = "scripts/heavy_run.py"
 
 [tool.hatch.build]

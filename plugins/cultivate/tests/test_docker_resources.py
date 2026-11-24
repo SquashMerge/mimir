@@ -68,6 +68,17 @@ def test_built_wheel_and_installed_inventory_contain_exact_scripts(tmp_path: Pat
         assert dist.locate_file(f"mimir_cultivate/docker/{name}").read_bytes() == (SCRIPTS / name).read_bytes()
 
 
+def test_core_wheel_carries_unchanged_lease_helper(daemon_packages):
+    _, wheels, _, _ = daemon_packages
+    with ZipFile(wheels["mimir-agent"]) as archive:
+        for name in ("heavy_run.sh", "heavy_run.py"):
+            assert archive.read(f"mimir/heavy_run/{name}") == (ROOT / "scripts" / name).read_bytes()
+    with ZipFile(wheels["mimir-cultivate"]) as archive:
+        for name in ("pytest", "worklink_pytest.py", "worklink_pytest_args.py", "sitecustomize.py"):
+            assert archive.read(f"mimir_cultivate/docker/pytest_guard/{name}") == (
+                SCRIPTS / "pytest_guard" / name).read_bytes()
+
+
 def test_missing_resource_or_untrusted_provider_cannot_get_privileged_slot() -> None:
     with pytest.raises(ValueError, match="resource is missing"):
         cultivate_scripts(_candidate(missing="executor.sh"))

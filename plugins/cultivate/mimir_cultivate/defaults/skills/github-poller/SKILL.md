@@ -220,6 +220,25 @@ For each repo in `GITHUB_REPOS`:
   discovery is intentionally bounded to the 100 most recently updated PRs; a
   newly completed check normally refreshes the affected PR into that window.
 
+### CI remediation scope
+
+Classify before editing: call `repo_diff(mode='base', failing_test=<test path>,
+imported_modules=<repo-relative module paths imported by that test>)` against
+the published PR diff. Remediate when the failing test or an imported module is
+in the PR's changed paths. When both the failing test and its imported modules
+are outside those paths, report the unrelated failure using `pr_comment` or
+operator escalation and leave the PR unchanged. Report insufficient evidence
+rather than drafting a speculative fix. A green rerun ends investigation.
+
+Prior-turn dirty leases are automatically archived under
+`state/pr-lease-drafts/` before reset to the scoped head and cleanup. The private
+artifact retains staged and worktree binary patches, untracked paths, history,
+and prior-turn metadata. Checkout returns `preserved_prior_work` naming it, and
+the next turn receives that structured notice. Same-turn drafts are untouched.
+If archival or identity validation cannot complete (including a live holder or
+interrupted Git operation), `dirty_lease_from_prior_turn` refuses mutation and
+preserves edits in place; report the refusal rather than hand-cleaning the lease.
+
 Issue / PR / comment / review detection is filtered by `created_at > cursor`
 and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
 detection are state-based (head-SHA delta / `requested_reviewers` membership),

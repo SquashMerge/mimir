@@ -262,6 +262,20 @@ def test_later_turn_reuses_same_pr_fast_forward_candidate(
         lambda _scope: scope.observed_head_sha,
     )
 
+    if work_kind == "uncommitted":
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *_a, **_kw: None)
+        resumed, _ = acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+        )
+        assert state.checkout_lease is resumed
+        assert not (resumed.path / "fix.txt").exists()
+        notice, = state.checkout_recovery_notices
+        import tarfile
+        with tarfile.open(Path(notice["artifact"]) / "untracked.tar") as archive:
+            assert archive.extractfile("fix.txt").read() == b"same PR fix\n"
+        return
+
     resumed, candidates = acquire_pr_checkout_lease(
         scope, owner=scope.principal, lease_root=lease_root, review_state=state,
     )
@@ -1678,6 +1692,8 @@ def test_acquire_archives_dirty_superseded_lease_before_releasing_it(
     monkeypatch: pytest.MonkeyPatch,
     dirty_kind: str,
 ) -> None:
+    # Same-turn recovery remains supported; cross-turn dirt is refused (#2193).
+    monkeypatch.setattr("mimir_cultivate.repository._lease_turn_id", lambda: "active-turn")
     repo, old_scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
