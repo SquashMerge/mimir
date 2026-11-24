@@ -3871,8 +3871,8 @@ async def test_invalid_stored_scope_refuses_reads_and_gates_typed_escalation(
         assert events[0]["repository"] == "owner/repo"
         assert events[0]["pull_request"] == 1291
         if invalid == "accept-denied":
-            assert events[0]["description"] == access_control.BOUNDED_UNSUPPORTED_NOTICE
-            assert events[0]["attempted_operations"] == []
+            assert events[0]["description"] == "PR reads refused"
+            assert events[0]["attempted_operations"] == ["pr_metadata"]
     with selection():
         with pytest.raises(ToolException, match=reason):
             pr_metadata.func(repository="owner/repo", pull_request=1291, runtime=runtime)
@@ -5471,15 +5471,16 @@ def test_unsupported_operation_is_durable_and_deduped(
     assert second["escalated"] is False
     assert set(first) == {"status", "escalated", "repository", "pull_request"}
     from mimir_cultivate.forge import _operation_key
-    operation = _operation_key(access_control.BOUNDED_UNSUPPORTED_NOTICE)
+    operation = _operation_key("Resolve an inline review thread")
+    assert operation.startswith("resolve_an_inline_review_thread:")
     records = [json.loads(line) for line in events.read_text().splitlines()]
     assert len(records) == 1
     assert records[0] | {
         "repository": "owner/repo",
         "pull_request": 17,
         "operation": operation,
-        "description": access_control.BOUNDED_UNSUPPORTED_NOTICE,
-        "attempted_operations": [],
+        "description": "Resolve an inline review thread",
+        "attempted_operations": ["pr_comments", "pr_inline_review_comment"],
         "operator_visible": True,
     } == records[0]
 
@@ -5492,12 +5493,8 @@ def test_malformed_escalation_is_normalized_bounded_and_non_fatal(
     events = home / "events.jsonl"
     init_logger(events, "test")
 
-    # Human-request prose still exercises normalization; autonomous prose is
-    # withheld entirely by the separately tested fixed-content path.
+    # Trusted autonomous prose retains normalization and redaction.
     runtime = _runtime(_scope(RepoPRAction.INSPECT))
-    runtime = replace(runtime, context=replace(
-        runtime.context, trigger="user_message", roles=("admin",),
-    ))
     result = unsupported_operation.func(
         repository="owner/repo",
         pull_request=17,
@@ -5523,9 +5520,6 @@ def test_distinct_escalations_with_same_slug_words_are_not_deduplicated(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     init_logger(home / "events.jsonl", "test")
     runtime = _runtime(_scope(RepoPRAction.INSPECT))
-    runtime = replace(runtime, context=replace(
-        runtime.context, trigger="user_message", roles=("admin",),
-    ))
 
     first = unsupported_operation.func(
         repository="owner/repo", pull_request=17,
@@ -5900,10 +5894,14 @@ def test_repeated_poller_escalation_suppressed_by_reason_and_head(tmp_path, monk
     from mimir_cultivate import forge
     same_head = replace(scope, event_type="pr_poller_tick")
     again = unsupported_operation.func(
-        "owner/repo", 17, "Different caller prose", runtime=_runtime(same_head),
+        "owner/repo", 17, "Need thread resolution", runtime=_runtime(same_head),
     )
     assert first["escalated"] is True
     assert again["escalated"] is False
+    distinct = unsupported_operation.func(
+        "owner/repo", 17, "Different caller prose", runtime=_runtime(same_head),
+    )
+    assert distinct["escalated"] is True
     changed_reason = forge._emit_unsupported(same_head, "different-reason", "Different", [])
     assert changed_reason is True
     changed_head = replace(same_head, observed_head_sha="b" * 40)

@@ -2647,6 +2647,11 @@ class Agent:
                 started_at=t_total_start,
                 agent_id=self._config.agent_id,
                 saga_session_id=saga_session_id,
+                escalation_job_id=(
+                    event.extra.get("job_id")
+                    if event.trigger == "repo_test_complete"
+                    and _shell_continuation_auth_context(event) is not None else None
+                ),
                 # Per-turn send-loop circuit breaker (SPEC §7.2.4). Attached
                 # to the TurnContext so send_message can reach it via
                 # ``_context.get_current_turn()`` without a separate

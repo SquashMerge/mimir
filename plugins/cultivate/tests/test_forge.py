@@ -716,11 +716,11 @@ def test_unsupported_operation_escalates_once_and_persists(tmp_path, monkeypatch
     assert result["status"] == "unsupported_operation"
     assert result["escalated"] is True
     assert set(result) == {"status", "escalated", "repository", "pull_request"}
-    operation = forge._operation_key(access_control.BOUNDED_UNSUPPORTED_NOTICE)
+    operation = forge._operation_key("Need a new operation")
     assert events == [(('unsupported_operation',), {
         "repository": "owner/repo", "pull_request": 17,
-        "operation": operation, "description": access_control.BOUNDED_UNSUPPORTED_NOTICE,
-        "attempted_operations": [],
+        "operation": operation, "description": "Need a new operation",
+        "attempted_operations": ["Checked review"],
         "scope_id": runtime.context.repo_pr_action_scope.scope_id,
         "operator_visible": True,
     })]

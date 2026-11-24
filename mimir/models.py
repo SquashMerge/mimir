@@ -1528,6 +1528,8 @@ class TurnContext:
     # or tool boundary. The model only receives rendered ToolMessages and cannot
     # populate this classification itself.
     hard_boundary_denials: list[dict[str, str]] = field(default_factory=list)
+    # Host-generated test job identity, copied only from an admitted continuation.
+    escalation_job_id: str | None = None
     # IDs of results successfully offloaded by deepagents during this turn.
     # Only these artifacts may be read back by session-boundary synthesis.
     evicted_tool_result_ids: list[str] = field(default_factory=list)

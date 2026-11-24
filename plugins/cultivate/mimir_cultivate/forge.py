@@ -3276,10 +3276,18 @@ def unsupported_operation(
     ):
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope if state is not None else _scope(runtime, repository, pull_request)
-    from mimir.access_control import bounded_escalation_turn, BOUNDED_UNSUPPORTED_NOTICE
+    from mimir.access_control import (
+        bounded_escalation_turn, BOUNDED_UNSUPPORTED_NOTICE,
+        bounded_escalation_notice, escalation_diagnostics,
+    )
+    from mimir._context import get_current_turn
 
-    if bounded_escalation_turn(context):
-        description = BOUNDED_UNSUPPORTED_NOTICE
+    turn = get_current_turn()
+    labels = turn.ifc_labels if turn is not None and turn.auth_context is context else None
+    facts = None
+    if bounded_escalation_turn(context, labels):
+        facts = escalation_diagnostics(context, scope)
+        description = bounded_escalation_notice(BOUNDED_UNSUPPORTED_NOTICE, facts)
         attempted_operations = None
     safe_description = _bounded_escalation_text(
         description,
@@ -3287,7 +3295,11 @@ def unsupported_operation(
         max_bytes=_ESCALATION_DESCRIPTION_MAX_BYTES,
     )
     safe_attempts = _normalize_attempts(attempted_operations)
-    operation = _operation_key(safe_description)
+    # Turn IDs locate traces but must not defeat cross-poll deduplication.
+    # Tainted callers cannot choose a blocker by changing their prose.
+    operation = _operation_key(json.dumps({
+        key: facts.get(key) for key in ("tool", "reason")
+    }, sort_keys=True)) if facts is not None else _operation_key(safe_description)
     emitted = _emit_unsupported(scope, operation, safe_description, safe_attempts)
     return {
         "status": "unsupported_operation",

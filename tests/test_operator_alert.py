@@ -297,7 +297,7 @@ def _request(name: str, auth: Any, args: dict[str, Any]) -> ToolCallRequest:
     )
 
 
-def _tainted_poller(tmp_path: Any) -> tuple[TurnContext, Any]:
+def _tainted_poller(tmp_path: Any, *, integrity: str = "untrusted") -> tuple[TurnContext, Any]:
     service = build_trigger_service_principal(
         canonical="poller:research",
         trigger="poller",
@@ -317,7 +317,7 @@ def _tainted_poller(tmp_path: Any) -> tuple[TurnContext, Any]:
         sensitivity="internal",
         authorized_principals=frozenset({principal}),
         source_kind="service",
-        integrity="untrusted",
+        integrity=integrity,
         integrity_effect="active_ingest",
     ))
     auth = create_auth_context(
@@ -402,10 +402,29 @@ async def test_tainted_service_alert_uses_configured_destination_and_other_sinks
         reset_current_turn(token)
 
     assert alert.status != "error"
-    assert channels.calls == [("discord-operator", BOUNDED_OPERATOR_NOTICE, False)]
+    expected = BOUNDED_OPERATOR_NOTICE + " " + json.dumps(
+        {"trigger": "poller", "turn_id": turn.turn_id},
+        sort_keys=True, separators=(",", ":"),
+    )
+    assert channels.calls == [("discord-operator", expected, False)]
     assert cross_channel.status == "error"
     assert write.status == "error"
     assert denied_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", ["0", "1"])
+async def test_trusted_autonomous_alert_keeps_caller_prose(tmp_path, monkeypatch, enforce):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", enforce)
+    channels = _Channels()
+    set_operator_alert_dependencies(channels, SimpleNamespace(operator_alert_channel="discord-operator"))
+    turn, _ = _tainted_poller(tmp_path, integrity="trusted")
+    token = set_current_turn(turn)
+    try:
+        await operator_alert.coroutine(text="review this finding")
+    finally:
+        reset_current_turn(token)
+    assert channels.calls == [("discord-operator", "review this finding", False)]
 
 
 @pytest.fixture
@@ -500,7 +519,11 @@ async def test_shipped_worklink_principal_can_use_real_operator_alert_sink(
         reset_current_turn(token)
 
     assert result.status != "error"
-    assert channels.calls == [("discord-operator", BOUNDED_OPERATOR_NOTICE, False)]
+    expected = BOUNDED_OPERATOR_NOTICE + " " + json.dumps(
+        {"trigger": "poller", "turn_id": turn.turn_id},
+        sort_keys=True, separators=(",", ":"),
+    )
+    assert channels.calls == [("discord-operator", expected, False)]
 
 
 @pytest.mark.asyncio
@@ -610,7 +633,8 @@ async def test_failed_alert_refunds_only_its_parallel_reservation(tmp_path, fail
         release[2].set()
         await tasks[2]
         assert turn.operator_alert_count == 3
-        assert calls == [BOUNDED_OPERATOR_NOTICE] * 4
+        expected = BOUNDED_OPERATOR_NOTICE + ' {"trigger":"poller","turn_id":"operator-alert-test"}'
+        assert calls == [expected] * 4
     finally:
         for event in release:
             event.set()

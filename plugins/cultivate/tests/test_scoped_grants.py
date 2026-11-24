@@ -28,7 +28,7 @@ from mimir.access_control import (
 from mimir.config import DEFAULT_TURN_TIMEOUT_SECONDS
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
-    NormalizedPullRequestSnapshot, SourceLabel, TurnInteractivity,
+    NormalizedPullRequestSnapshot, SourceLabel, TurnContext, TurnInteractivity,
 )
 from mimir.plugins.registry import PolicyRegistry
 from mimir_cultivate.repository import active_pr_checkout_lease_for_path, create_pr_checkout_lease
@@ -431,7 +431,13 @@ def _remediation_turn(tmp_path, monkeypatch, *, discovered=False, conflicting=Fa
         with policy_scope(policy):
             from mimir._context import reset_current_turn, set_current_turn
 
-            token = set_current_turn(SimpleNamespace(turn_id="remediation", auth_context=auth))
+            # Exercise the real turn contract, including live IFC labels used
+            # by escalation tools, rather than a partial namespace double.
+            token = set_current_turn(TurnContext(
+                turn_id="remediation", session_id=auth.channel_id,
+                trigger=auth.trigger, channel_id=auth.channel_id, started_at=0.0,
+                auth_context=auth, ifc_labels=auth.ifc_state.labels,
+            ))
             try:
                 return gate.wrap_tool_call(request, handler)
             finally:

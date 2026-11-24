@@ -73,6 +73,7 @@ def _turn(tmp_path, monkeypatch, *, completion=False, tainted=False, service=Tru
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [False, True])
 @pytest.mark.parametrize("completion,tainted,service,retained", [
     (False, False, True, False),
     (True, False, True, False),
@@ -80,7 +81,7 @@ def _turn(tmp_path, monkeypatch, *, completion=False, tainted=False, service=Tru
     (True, True, False, False),  # observed null service principal
     (False, True, True, True),  # discovery retained only escalation authority
 ])
-async def test_enforced_bounded_escalation(tmp_path, monkeypatch, completion, tainted, service, retained):
+async def test_enforced_bounded_escalation(tmp_path, monkeypatch, completion, tainted, service, retained, enforce):
     alerts = importlib.import_module("mimir.tools.operator_alert")
     from mimir import event_logger
 
@@ -97,6 +98,9 @@ async def test_enforced_bounded_escalation(tmp_path, monkeypatch, completion, ta
         channel_id=auth.channel_id, started_at=time.monotonic(),
         auth_context=auth, ifc_labels=auth.ifc_labels,
     )
+    turn.escalation_job_id = "rt_" + "f" * 32 if completion else None
+    turn.hard_boundary_denials.append({"tool": "repo_push", "reason": "repo_pr_grant_denied"})
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1" if enforce else "0")
     token = set_current_turn(turn)
     args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number,
             "description": "SECRET untrusted instructions", "attempted_operations": ["SECRET attempt"]}
@@ -106,7 +110,7 @@ async def test_enforced_bounded_escalation(tmp_path, monkeypatch, completion, ta
             for name, arguments in (("operator_alert", {"text": "SECRET caller prose"}),
                                     ("unsupported_operation", args)):
                 decision = ToolRegistry().authorize_tool(
-                    name, auth, enforce=True, arguments=arguments, policy=policy,
+                    name, auth, enforce=enforce, arguments=arguments, policy=policy,
                 )
                 assert decision.allowed and not decision.would_block, decision
                 request = ToolCallRequest(
@@ -127,11 +131,81 @@ async def test_enforced_bounded_escalation(tmp_path, monkeypatch, completion, ta
                 assert result.status != "error", result.content
     finally:
         reset_current_turn(token)
-    channels.send.assert_awaited_once_with("discord-operator", BOUNDED_OPERATOR_NOTICE, final=False)
-    assert events[0][1]["description"] == BOUNDED_UNSUPPORTED_NOTICE
-    assert events[0][1]["attempted_operations"] == []
-    assert "SECRET" not in json.dumps(events)
+    if tainted:
+        expected = {"turn_id": "bounded-escalation", "trigger": auth.trigger,
+                    "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                    "head": scope.observed_head_sha, "tool": "repo_push", "reason": "repo_pr_grant_denied"}
+        if completion:
+            expected["job_id"] = "rt_" + "f" * 32
+        alert_text = channels.send.await_args.args[1]
+        assert alert_text.startswith(BOUNDED_OPERATOR_NOTICE + " ")
+        assert json.loads(alert_text[len(BOUNDED_OPERATOR_NOTICE) + 1:]) == expected
+        description = events[0][1]["description"]
+        assert description.startswith(BOUNDED_UNSUPPORTED_NOTICE + " ")
+        assert json.loads(description[len(BOUNDED_UNSUPPORTED_NOTICE) + 1:]) == expected
+        assert events[0][1]["attempted_operations"] == []
+        assert "SECRET" not in json.dumps(events) + alert_text
+    else:
+        channels.send.assert_awaited_once_with("discord-operator", "SECRET caller prose", final=False)
+        assert events[0][1]["description"] == args["description"]
+        assert events[0][1]["attempted_operations"] == args["attempted_operations"]
+        assert events[0][1]["operation"] == forge._operation_key(args["description"])
     assert auth.ifc_state.has_untrusted_active_ingest() is tainted
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_live_taint_overrides_clean_auth_snapshot(tmp_path, monkeypatch, enforce):
+    from mimir.access_control import bounded_escalation_turn
+
+    scope, auth, policy = _turn(tmp_path, monkeypatch)
+    assert not bounded_escalation_turn(auth)
+    taint = InformationFlowLabels(sources=(SourceLabel(
+        principal="outsider", domain="web", resource_id="https://untrusted.invalid/new",
+        bridge_instance="web", sensitivity="internal",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ),))
+    auth.ifc_state.merge(taint)
+    assert bounded_escalation_turn(auth)
+    with policy_scope(policy):
+        decision = ToolRegistry().authorize_tool(
+            "unsupported_operation", auth, enforce=enforce, policy=policy,
+            arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        )
+    assert decision.allowed and not decision.would_block
+
+
+def test_tainted_escalation_dedup_uses_host_blocker_not_prose_or_turn(tmp_path, monkeypatch):
+    from mimir import event_logger
+
+    scope, auth, policy = _turn(tmp_path, monkeypatch, tainted=True)
+    events = []
+    monkeypatch.setattr(event_logger, "log_durable_event_sync", lambda *a, **kw: events.append(kw))
+    turn = TurnContext(
+        turn_id="first", session_id=auth.channel_id, trigger=auth.trigger,
+        channel_id=auth.channel_id, started_at=time.monotonic(),
+        auth_context=auth, ifc_labels=auth.ifc_labels,
+    )
+    turn.hard_boundary_denials.append({"tool": "repo_push", "reason": "repo_pr_grant_denied"})
+    token = set_current_turn(turn)
+    try:
+        with policy_scope(policy):
+            def emit(prose):
+                return forge.unsupported_operation.func(
+                    repository=scope.canonical_repo, pull_request=scope.pr_number,
+                    description=prose, runtime=SimpleNamespace(context=auth),
+                )
+            assert emit("SECRET first")["escalated"]
+            turn.turn_id = "second"
+            assert not emit("SECRET changed prose")["escalated"]
+            turn.hard_boundary_denials.append({"tool": "repo_test", "reason": "test_containment_unavailable"})
+            assert emit("SECRET first")["escalated"]
+            turn.hard_boundary_denials.append({"tool": "repo_test", "reason": "test_snapshot_unavailable"})
+            assert emit("SECRET first")["escalated"]
+    finally:
+        reset_current_turn(token)
+    assert len(events) == 3
+    assert len({event["operation"] for event in events}) == 3
+    assert "SECRET" not in json.dumps(events)
 
 
 @pytest.mark.parametrize("invalid", [

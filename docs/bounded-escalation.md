@@ -12,11 +12,21 @@ Alerts go only to the configured operator destination. A service with the explic
 alert capability can also alert without a PR scope. Unsupported-operation reports
 must name an exact host-bound repository and PR. Neither tool mints grants.
 
-In these autonomous turns both implementations **withhold all caller prose**,
-regardless of integrity: alerts use a fixed instruction to inspect the turn trace;
-unsupported-operation reports use a fixed description and empty attempted-operation
-list. The latter's repository, PR, head and scope identifiers come from the host
-scope. This fixed-content path bypasses the general notification/forge IFC sink
+Only autonomous turns with **live untrusted active ingest** withhold caller prose.
+Trusted poller and completion turns retain their alert text, report descriptions
+and attempted operations under the existing notification/forge IFC sink rules.
+The decision includes live turn taint, not just the original auth snapshot, and
+content withholding applies in both shadow and enforced modes.
+
+Tainted alerts and reports carry fixed prose plus host-derived turn ID, trigger,
+bound repository/PR/head (when present), admitted completion job ID (when present),
+and the latest registered blocker tool and machine-shaped refusal code. Caller
+arguments and exception bodies are not diagnostic fields. Tainted reports omit
+attempted operations. Their deduplication key uses blocker tool/reason, excluding
+turn/job IDs so repeated polls remain deduplicated while distinct blockers remain
+visible. Trusted reports continue deriving their key from the description.
+
+Only this bounded-content path bypasses the general notification/forge IFC sink
 check, not the turn's labels: taint is preserved, and other tools still pass their
 normal authorization and IFC gates. Existing alert length/rate and unsupported
 report deduplication bounds remain in force.
