@@ -6848,6 +6848,16 @@ async def _queue_repo_test(
     checkout_lease = None if retained else state.checkout_lease
     git_tools = (RepoGitTools(retained_scope=scope, runner=retained_factory_git_runner)
                  if retained else RepoGitTools(state))
+    # Interrupted-operation authority is bound to this turn's nonce. A fresh
+    # completion turn cannot resume it, even after every conflict is staged.
+    if not retained and git_tools._has_in_progress_merge_or_rebase():
+        raise ProjectTestRefusal(
+            "test_interrupted_operation",
+            "commit the merge with repo_commit before queuing repo_test; "
+            "a completion turn cannot resume an in-progress merge. "
+            "For an in-progress rebase, abort it before queuing repo_test.",
+            execution_started=False,
+        )
     root = git_tools.validated_checkout_root()
     repository = scope.repository if retained else scope.canonical_repo
     pull_request = scope.issue_id if retained else scope.pr_number

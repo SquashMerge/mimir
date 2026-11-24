@@ -2541,11 +2541,23 @@ async def test_repo_test_legs_share_timeout_budget(
 
 def _repo_test_lease_fixture(
     tmp_path, monkeypatch, *, command="/usr/bin/true", wrapper=True,
-    event_type="pr_changes_requested_stale", advance_base=False,
+    event_type="pr_changes_requested_stale", advance_base=False, conflicting=False,
 ):
-    _, _, _, state = _repo_scope_and_state(
-        tmp_path, event_type=event_type, advance_base=advance_base,
-    )
+    if conflicting:
+        from tests.test_repo_tools import _two_sided_conflict_tools
+
+        _, scope, _, _ = _two_sided_conflict_tools(tmp_path)
+        state = RepoReviewState(replace(scope, event_type=event_type))
+        lease_root = tmp_path / "test-leases"
+        lease_root.mkdir()
+        repository.create_pr_checkout_lease(
+            state.action_scope, owner=scope.principal,
+            lease_root=lease_root, review_state=state,
+        )
+    else:
+        _, _, _, state = _repo_scope_and_state(
+            tmp_path, event_type=event_type, advance_base=advance_base,
+        )
     root = state.checkout_lease.path
     (root / "tests").mkdir()
     (root / "tests/test_changed.py").write_text("def test_changed(): pass\n")
@@ -3009,6 +3021,7 @@ async def test_repo_test_completion_followup_push_gate(tmp_path, monkeypatch, ca
     "lease_metadata", "lease_metadata_symlink",
     "local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge",
     "changed_lease", "missing_lease_before_mint", "failed",
+    "uncommitted_merge", "uncommitted_rebase", "resolved_merge",
     "dirty_draft_resumed_not_archived",
 ])
 async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
@@ -3022,7 +3035,22 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     from unittest.mock import AsyncMock
 
     local_merge = case in {"local_merge", "forge_moved_after_merge", "tested_head_after_merge"}
-    state = _repo_test_lease_fixture(tmp_path, monkeypatch, advance_base=local_merge)
+    conflicting = case in {"uncommitted_merge", "uncommitted_rebase", "resolved_merge"}
+    # These cases call public checkout after adding fixture-owned untracked
+    # test/wrapper files. Create them in the queueing turn, not as an abandoned
+    # prior-turn draft: ordinary recovery must not archive/reset this setup.
+    fixture_turn_token = None
+    if conflicting:
+        fixture_turn = _ifc_turn(_untainted_ifc_auth())
+        fixture_turn.turn_id = "queue-turn"
+        fixture_turn_token = set_current_turn(fixture_turn)
+    try:
+        state = _repo_test_lease_fixture(
+            tmp_path, monkeypatch, advance_base=local_merge, conflicting=conflicting,
+        )
+    finally:
+        if fixture_turn_token is not None:
+            reset_current_turn(fixture_turn_token)
     scope = state.action_scope
     lease = state.checkout_lease
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
@@ -3046,7 +3074,8 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     auth.scoped_pr_grants.issue(scope)
     token = ac.consume_scoped_pr_checkout(auth, scope, "cultivate")
-    assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    if not conflicting:
+        assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
     if local_merge:
         # The fixture advanced main independently of the PR; merge only locally.
         repository.RepoGitTools(state, auth_context=auth).execute(repository.GitMerge())
@@ -3105,13 +3134,72 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         state, runner=runner, checkout_factory=_test_checkout_factory,
     ))
     draft = lease.path / "tracked.txt"
-    draft.write_text("queueing turn's uncommitted draft\n")
     queue_turn = _ifc_turn(auth)
     queue_turn.turn_id = "queue-turn"
     turn_token = set_current_turn(queue_turn)
     try:
+        runtime = SimpleNamespace(context=auth)
+        if conflicting:
+            # Real public checkout -> conflict -> resolution -> stage. Do not
+            # mock admission or interrupted-operation authority.
+            assert lease.last_turn_id == queue_turn.turn_id
+            checkout = repository.repo_checkout.func(
+                scope.canonical_repo, scope.pr_number, runtime=runtime,
+            )
+            assert checkout["status"] in {"checked_out", "resumed"}, checkout
+            assert not checkout.get("preserved_prior_work")
+            lease = state.checkout_lease
+            assert (lease.path / "tests/test_changed.py").is_file()
+            assert (lease.path / "scripts/heavy_run.sh").is_file()
+            assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+            operation = "rebase" if case == "uncommitted_rebase" else "merge"
+            with pytest.raises(repository.ToolException, match="conflict"):
+                getattr(repository, f"repo_{operation}").func(
+                    scope.canonical_repo, scope.pr_number, runtime=runtime,
+                )
+            assert state.interrupted_operation is not None
+            assert "<<<<<<<" in draft.read_text()
+            draft.write_text("base property\nhead property\n")
+            assert repository.repo_stage.func(
+                scope.canonical_repo, scope.pr_number, paths=("tracked.txt",), runtime=runtime,
+            )["ok"]
+            assert not _git(lease.path, "ls-files", "-u")
+            assert "tracked.txt" in _git(lease.path, "diff", "--cached", "--name-only")
+            if case != "resolved_merge":
+                from mimir.access_control import (
+                    begin_protected_result_capture, end_protected_result_capture,
+                )
+
+                capture = begin_protected_result_capture()
+                try:
+                    with pytest.raises(repository.ToolPolicyRefusal) as refused:
+                        await repository.repo_test.coroutine(
+                            scope.canonical_repo, scope.pr_number, runtime=runtime,
+                        )
+                finally:
+                    provenance = end_protected_result_capture(capture)
+                    # Also reap a wrongly queued job during mutation testing.
+                    await registry.close()
+                assert "commit the merge with repo_commit before queuing repo_test" in str(refused.value)
+                assert "a completion turn cannot resume an in-progress merge" in str(refused.value)
+                assert refused.value.__cause__.execution_started is False
+                assert provenance is None
+                assert registry.jobs == {}
+                assert not list(registry.directory.glob("*.json"))
+                owner._dispatcher.enqueue.assert_not_called()
+                assert state.full_tested_head is None
+                return
+            assert repository.repo_commit.func(
+                scope.canonical_repo, scope.pr_number,
+                paths=("tracked.txt", "base-test", "head-test", "suite"),
+                message="resolve merge before queuing tests", runtime=runtime,
+            )["ok"]
+            assert not (lease.path / ".git/MERGE_HEAD").exists()
+            assert state.interrupted_operation is None
+            assert len(_git(lease.path, "rev-list", "--parents", "-n", "1", "HEAD").split()) == 3
+        draft.write_text("queueing turn's uncommitted draft\n")
         queued = await repository.repo_test.coroutine(
-            scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+            scope.canonical_repo, scope.pr_number, runtime=runtime,
         )
     finally:
         reset_current_turn(turn_token)
@@ -3134,7 +3222,7 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
         event = owner._dispatcher.enqueue.call_args.args[0]
         assert event.continuation_auth_context is None
     completion = event.extra["_repo_test_completion"]
-    if case in {"local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge"}:
+    if case in {"local_merge", "local_commit", "forge_moved_after_merge", "tested_head_after_merge", "resolved_merge"}:
         assert completion.head == state.git_expected_head != scope.observed_head_sha
         assert completion.binding.tested_head == completion.head
         assert completion.binding.observed_head_sha == scope.observed_head_sha
@@ -3255,7 +3343,7 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
     )
     has_grant = case in {
         "green", "reduced_actions", "expired_after_queue", "local_merge", "local_commit",
-        "dirty_draft_resumed_not_archived",
+        "resolved_merge", "dirty_draft_resumed_not_archived",
     } or case.startswith("lease_")
     if not has_grant:
         # Isolate mint admission from the independent ingress IFC classifier:
