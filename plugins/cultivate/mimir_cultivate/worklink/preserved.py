@@ -18,10 +18,12 @@ operator repository after the snapshot commit reaches it.
 from __future__ import annotations
 
 import difflib
+import fcntl
 import hashlib
 import json
 import os
 import subprocess
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -32,7 +34,7 @@ from typing import Any
 from mimir._atomic import atomic_write_json
 from mimir.redaction import redact_text
 
-from .safe_git import ControllerGitPublication
+from .safe_git import ControllerGitPublication, SafeGitError
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
@@ -43,6 +45,8 @@ MAX_PROMPT_SPEC_DIFF = 20_000
 MAX_FILES = 200
 MAX_REASON = 2_000
 GIT_TIMEOUT_S = 120
+MAX_PRESERVATION_ATTEMPTS = 3
+RETRY_BACKOFF_S = 30 * 60
 _IDENTITY = ("-c", "user.name=Worklink", "-c", "user.email=worklink@localhost")
 
 
@@ -60,6 +64,9 @@ class PreservedAttempt:
     created_at: str = ""
     patch_truncated: bool = False
     error: str | None = None
+    status: str = "preserved"
+    failures: int = 0
+    retry_after: float | None = None
 
 
 def _positive(value: object, name: str) -> int:
@@ -75,6 +82,53 @@ def preserved_ref(issue_id: int, attempt: int) -> str:
 
 def _state_dir(home: Path, issue_id: int) -> Path:
     return home / "state" / "worklink" / "preserved" / str(_positive(issue_id, "issue"))
+
+
+def _lifecycle_dir(home: Path, issue_id: int) -> Path:
+    # Controller-owned tombstones outlive retention of refs, records and patches.
+    return home / "state" / "worklink" / "preservation-state" / str(_positive(issue_id, "issue"))
+
+
+@contextmanager
+def _preservation_lock(home: Path, issue_id: int) -> Iterator[None]:
+    directory = _lifecycle_dir(home, issue_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _load_lifecycle(home: Path, issue_id: int, attempt: int) -> dict[str, Any]:
+    for directory in (_lifecycle_dir(home, issue_id), _state_dir(home, issue_id)):
+        try:
+            data = json.loads((directory / f"{attempt}.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        # An unreadable marker must not authorize another snapshot.
+        if not isinstance(data, dict):
+            raise ValueError("invalid preservation state")
+        return data
+    return {}
+
+
+def _unrecoverable(exc: Exception) -> bool:
+    if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+        return True
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return False
+    message = str(exc).lower()
+    # SafeGit rejects invalid/replaced checkout metadata. Lock contention
+    # during private-index initialization, however, can heal on retry.
+    if isinstance(exc, SafeGitError):
+        return not any(text in message for text in ("index.lock", "cannot lock", "unable to lock"))
+    return any(text in message for text in (
+        "failed to unpack tree", "unable to read tree", "bad tree object",
+        "bad object", "invalid object", "missing blob", "missing tree",
+        "missing commit", "object file", "corrupt", "not a git repository",
+    ))
 
 
 def spec_text(title: str, description: str) -> str:
@@ -187,12 +241,37 @@ def preserve_attempt(
     runner: Runner,
     publication: ControllerGitPublication | None = None,
 ) -> PreservedAttempt | None:
-    """Keep an unpublished attempt's work. Never raises; ``None`` means nothing changed.
+    """Keep an unpublished attempt's work; return only durable state changes.
 
-    Call before the attempt checkout can be removed. Failure is returned in the
-    record's ``error`` so the caller can report it without blocking its
-    transition.
+    All callers (factory, dispatch and periodic pruning) share the same durable
+    terminal markers and bounded retry budget. Reporting happens only after a
+    state transition is persisted, never once per retry/cycle.
     """
+    preserved_ref(issue_id, attempt)
+    try:
+        with _preservation_lock(home, issue_id):
+            return _preserve_attempt(
+                home=home, trusted_repo=trusted_repo, checkout=checkout, branch=branch,
+                issue_id=issue_id, attempt=attempt, base_candidates=base_candidates,
+                reason=reason, runner=runner, publication=publication,
+            )
+    except Exception:  # noqa: BLE001 - no durable transition, so nothing to report
+        return None
+
+
+def _preserve_attempt(
+    *, home: Path, trusted_repo: Path, checkout: Path, branch: str,
+    issue_id: int, attempt: int, base_candidates: Sequence[str], reason: str | None,
+    runner: Runner, publication: ControllerGitPublication | None,
+) -> PreservedAttempt | None:
+    previous = _load_lifecycle(home, issue_id, attempt)
+    # Legacy successful records are terminal too; legacy errors get one bounded
+    # migration into the new failure state machine.
+    previous_status = previous.get("status") or ("preserved" if previous and not previous.get("error") else None)
+    if previous_status in ("preserved", "unpreservable", "pruned", "empty"):
+        return None
+    if previous.get("retry_after", 0) and time.time() < previous["retry_after"]:
+        return None
     ref = preserved_ref(issue_id, attempt)
     created = datetime.now(UTC).isoformat()
     spec = load_dispatch_spec(home, issue_id, attempt)
@@ -222,6 +301,9 @@ def preserve_attempt(
         files = [name for name in names.splitlines() if name]
         if not files:
             runner(["git", "-C", str(trusted_repo), "update-ref", "-d", ref])
+            atomic_write_json(_lifecycle_dir(home, issue_id) / f"{attempt}.json", {
+                "issue": issue_id, "attempt": attempt, "status": "empty",
+            })
             return None
         patch = runner(["git", "-C", str(trusted_repo), "diff", "--binary", "--no-color",
                         "--no-ext-diff", "--no-textconv", floor, head])
@@ -237,22 +319,23 @@ def preserve_attempt(
         state.mkdir(parents=True, exist_ok=True)
         (state / f"{attempt}.patch").write_text(text, encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 - preservation never blocks the transition
+        failures = int(previous.get("failures", 0)) + 1
+        terminal = _unrecoverable(exc) or failures >= MAX_PRESERVATION_ATTEMPTS
         record = PreservedAttempt(
             issue=issue_id, attempt=attempt, ref=None, base_sha=base, head_sha=head,
             gate=gate, reason=bounded_reason, spec_sha256=spec["sha256"] if spec else None,
             created_at=created, error=redact_text(f"{type(exc).__name__}: {exc}")[:MAX_REASON],
+            status="unpreservable" if terminal else "retry_pending", failures=failures,
+            retry_after=None if terminal else time.time() + RETRY_BACKOFF_S * 2 ** (failures - 1),
         )
-    try:
-        state = _state_dir(home, issue_id)
-        state.mkdir(parents=True, exist_ok=True)
-        payload = asdict(record)
-        if spec is not None:
-            payload["spec_text"] = spec["text"]
-        atomic_write_json(state / f"{attempt}.json", payload)
-    except Exception as exc:  # noqa: BLE001
-        if record.error is None:
-            record = PreservedAttempt(**{**asdict(record), "error": f"record write failed: {exc}"})
-    return record
+    state = _state_dir(home, issue_id)
+    state.mkdir(parents=True, exist_ok=True)
+    payload = asdict(record)
+    if spec is not None:
+        payload["spec_text"] = spec["text"]
+    atomic_write_json(_lifecycle_dir(home, issue_id) / f"{attempt}.json", payload)
+    atomic_write_json(state / f"{attempt}.json", payload)
+    return record if record.status != previous_status else None
 
 
 def attempt_numbers(name: str) -> tuple[int, int] | None:
@@ -287,17 +370,15 @@ def preserve_retained_attempt(
     runner: Runner,
     reason_if_unknown: str,
 ) -> PreservedAttempt | None:
-    """Preserve a retained ``<issue>-<attempt>`` directory that has no record yet.
+    """Preserve a retained directory, respecting terminal state and retry budget.
 
-    ``None`` means skipped: already preserved, published, not a checkout, or
-    nothing changed. Never raises past the per-attempt failure record.
+    ``None`` means no reportable state change (including a deferred retry).
+    Missing checkouts are recorded as terminal failures, not silently skipped.
     """
     numbers = attempt_numbers(attempt_dir.name)
     if numbers is None:
         return None
     issue_id, attempt = numbers
-    if is_preserved(home, issue_id, attempt):
-        return None
     try:
         evidence = json.loads((home / "state" / "worklink" / "evidence"
                                / f"{issue_id}-{attempt}.json").read_text(encoding="utf-8"))
@@ -314,8 +395,6 @@ def preserve_retained_attempt(
     else:
         checkout = attempt_dir / "checkout" if (attempt_dir / "checkout" / ".git").is_dir() else attempt_dir
         branch = f"issue/{issue_id}-a{attempt}"
-    if not (checkout / ".git").is_dir():
-        return None
     base = str(evidence.get("base_ref") or default_base)
     reason = (evidence.get("blocked_reason") or evidence.get("failure_reason")
               or (f"status={evidence['status']}" if evidence.get("status") else None)
@@ -332,6 +411,7 @@ def preserved_line(record: PreservedAttempt) -> str:
         "ref": record.ref, "base": record.base_sha, "head": record.head_sha,
         "files": record.files, "gate": record.gate, "reason": record.reason,
         "patch_truncated": record.patch_truncated,
+        "status": record.status,
     }
     if record.error is not None:
         fields["error"] = record.error
@@ -353,7 +433,8 @@ def list_preserved(home: Path, issue_id: int) -> list[dict[str, Any]]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(data, dict) and data.get("attempt") == int(path.stem):
+        if (isinstance(data, dict) and data.get("attempt") == int(path.stem)
+                and _load_lifecycle(home, issue_id, int(path.stem)).get("status") != "pruned"):
             records.append(data)
     return sorted(records, key=lambda item: item["attempt"])
 
@@ -365,13 +446,26 @@ def is_preserved(home: Path, issue_id: int, attempt: int) -> bool:
 def prune_preserved(
     home: Path, trusted_repo: Path, issue_id: int, *, keep: int, runner: Runner,
 ) -> list[int]:
-    """Drop preserved attempts beyond the newest ``keep`` (all of them when keep=0)."""
-    records = list_preserved(home, issue_id)
+    """Drop retained material, leaving tombstones so it cannot be re-selected."""
+    with _preservation_lock(home, issue_id):
+        return _prune_preserved(home, trusted_repo, issue_id, keep=keep, runner=runner)
+
+
+def _prune_preserved(
+    home: Path, trusted_repo: Path, issue_id: int, *, keep: int, runner: Runner,
+) -> list[int]:
+    records = [record for record in list_preserved(home, issue_id)
+               if keep == 0 or record.get("status") != "retry_pending"]
     doomed = records[:-keep] if keep > 0 else records
     pruned = []
     for record in doomed:
         attempt = record["attempt"]
-        runner(["git", "-C", str(trusted_repo), "update-ref", "-d", preserved_ref(issue_id, attempt)])
+        _git_ok(runner(["git", "-C", str(trusted_repo), "update-ref", "-d", preserved_ref(issue_id, attempt)]),
+                "prune preserved ref")
+        atomic_write_json(_lifecycle_dir(home, issue_id) / f"{attempt}.json", {
+            "issue": issue_id, "attempt": attempt, "status": "pruned",
+            "error": record.get("error"), "failures": record.get("failures", 0),
+        })
         for suffix in (".json", ".patch"):
             try:
                 (_state_dir(home, issue_id) / f"{attempt}{suffix}").unlink()

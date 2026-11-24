@@ -503,7 +503,8 @@ def _sweep_retained_attempts(
             if preserved is None:
                 continue
             _log_event("worklink_attempt_preserved", issue_id=issue_id, attempt=preserved.attempt,
-                       ref=preserved.ref, error=preserved.error, trigger="dispatch")
+                       ref=preserved.ref, error=preserved.error, status=preserved.status,
+                       failures=preserved.failures, trigger="dispatch")
             comment(issue_id, preserved_line(preserved))
             swept = True
         except Exception as exc:  # noqa: BLE001 - never blocks dispatch
@@ -1824,7 +1825,8 @@ class WorklinkRunner:
             if preserved is None:
                 return None
             _log_event("worklink_attempt_preserved", issue_id=record.issue_id,
-                       attempt=record.attempt, ref=preserved.ref, error=preserved.error)
+                       attempt=record.attempt, ref=preserved.ref, error=preserved.error,
+                       status=preserved.status, failures=preserved.failures)
             claims._run(  # noqa: SLF001
                 "issue", "comment", str(record.issue_id), preserved_line(preserved),
             )
@@ -1857,7 +1859,8 @@ class WorklinkRunner:
             if preserved is None:
                 return
             _log_event("worklink_attempt_preserved", issue_id=lease.issue_id,
-                       attempt=lease.attempt, ref=preserved.ref, error=preserved.error)
+                       attempt=lease.attempt, ref=preserved.ref, error=preserved.error,
+                       status=preserved.status, failures=preserved.failures)
             claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
                 "issue", "comment", str(lease.issue_id), preserved_line(preserved),
             )
