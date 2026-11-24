@@ -318,6 +318,58 @@ async def test_gate_two_legs_share_one_run_budget(tmp_path, lease):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("durations", [(1.25,), (0.4, 0.85)], ids=["only-leg", "cumulative-legs"])
+@pytest.mark.parametrize("later_leg", [False, True], ids=["last-leg", "later-leg-not-launched"])
+async def test_gate_successful_overrun_exhausts_cumulative_run_budget(
+    monkeypatch, lease, durations, later_leg,
+):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    # Drive the production accounting loop without real sleeps or a runner
+    # timeout flag: a successful leg can return just after its allotted time.
+    now = 1000.0
+    launched = []
+
+    @asynccontextmanager
+    async def acquired(environment, *, on_launch=None):
+        nonlocal now
+        assert environment == lease
+        now += 10.0  # Queue time must not consume the one-second run budget.
+        yield
+
+    async def run_command(leg, budget):
+        nonlocal now
+        launched.append((leg, budget))
+        index = len(launched) - 1
+        # Let an incorrectly launched later leg succeed too, so the failure
+        # diagnoses the missing budget guard rather than an exhausted fixture.
+        now += durations[index] if index < len(durations) else 0.0
+        return ComputeResult(0, f"leg-{index}\n", "")
+
+    monkeypatch.setattr(ev, "_gate_heavy_lease", acquired)
+    # Replace only evidence's asyncio binding, not the real event-loop clock
+    # used by pytest, cancellation, and unrelated runtime machinery.
+    monkeypatch.setattr(ev, "asyncio", SimpleNamespace(
+        get_running_loop=lambda: SimpleNamespace(time=lambda: now),
+    ))
+    legs = [command(f"print({index})") for index in range(len(durations) + later_leg)]
+    result = await ev._run_gate_with_lease(" && ".join(legs), 1.0, run_command)
+
+    assert result.exit_code == 0
+    assert result.timed_out is True
+    assert not result.lease_wait_timed_out
+    assert len(launched) == len(durations)
+    assert [budget for _, budget in launched] == pytest.approx(
+        [1.0] if len(durations) == 1 else [1.0, 0.6],
+    )
+    assert result.run_duration_s == pytest.approx(sum(durations))
+    assert result.lease_wait_s == pytest.approx(10.0 * len(durations))
+    assert result.stdout == "".join(f"leg-{index}\n" for index in range(len(durations)))
+    assert_released(lease)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("first_code,timed_out", [(3, False), (0, True)])
 async def test_gate_failed_or_timed_out_leg_cannot_be_hidden_by_later_leg(
     tmp_path, lease, first_code, timed_out,
