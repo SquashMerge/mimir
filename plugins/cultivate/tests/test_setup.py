@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import shlex
 import tomllib
 from pathlib import Path
 import subprocess
@@ -3466,6 +3467,161 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch,
     agent.symlink_to(config_path)
     with pytest.raises(RuntimeError, match='regular file'):
         installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+
+
+@pytest.fixture
+def worklink_script_config(tmp_path, monkeypatch):
+    """Exercise real config rendering/validation without Docker or live CLIs."""
+    home = tmp_path / 'home'
+    (home / '.chainlink').mkdir(parents=True)
+    (home / '.chainlink/agent.json').write_text('{}')
+    base = tmp_path / 'base'
+    subprocess.run(['git', 'init', '-b', 'main', str(base)], check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(base), 'remote', 'add', 'origin', 'origin'],
+                   check=True, capture_output=True)
+    monkeypatch.setenv('GH_USER_NAME', 'Test')
+    monkeypatch.setenv('GH_USER_EMAIL', 'test@example.com')
+
+    def provision(command='./tools/verify', **options):
+        entry = {'slug': 'org/repo', 'origin': 'origin', 'base_branch': 'main',
+                 'test_command': command}
+        return installer._provision_worklink(
+            home, entry, base=base, checkout=tmp_path / 'checkout',
+            git_auth=['git', '-c', 'credential.helper=fixture'], **options)
+
+    return home, provision
+
+
+@pytest.mark.parametrize('command, expected', [
+    ('./tools/verify', ['git *', './tools/verify', './tools/verify *']),
+    ('./verify.sh', ['git *', './verify.sh', './verify.sh *']),
+    ('./.tools/verify-v2.0', ['git *', './.tools/verify-v2.0', './.tools/verify-v2.0 *']),
+    ('./tools/verify+é', ['git *', './tools/verify+é', './tools/verify+é *']),
+    *[(command, ['git *', command]) for command in (
+        './tools/verify --lane ratchet', 'sh scripts/x.sh', 'make test',
+        'tools/verify', '/tools/verify', './../verify', './tools/../verify',
+        './tools/verify; curl example.com', './tools/verify && curl example.com',
+        './tools/verify$(id)', './tools/verify`id`', './tools/ver*', './tools/ver?',
+        './tools/ver[ify]', './tools/verify>out', './tools/verify\t--lane',
+        '"./tools/verify"', './tools/verify\\ name', './tools/verify/')],
+    ('uv run pytest -q', ['git *', 'uv *']),
+    ('cargo test', ['git *', 'cargo *']),
+    ('npm test', ['git *', 'npm *']),
+])
+def test_worklink_script_allowlist(command, expected, worklink_script_config):
+    home, provision = worklink_script_config
+    assert provision(command)
+    config = yaml.safe_load((home / 'worklink.yaml').read_text())
+    assert config['backends']['opencode']['bash_allowlist'] == expected
+    before = (home / 'worklink.yaml').read_bytes()
+    assert not provision(command)
+    assert (home / 'worklink.yaml').read_bytes() == before
+
+
+@pytest.mark.parametrize('separator', [';', '&&', '||', '|'])
+def test_worklink_script_allowlist_refuses_parsed_compound(separator, worklink_script_config):
+    from mimir_cultivate.worklink.backends.registry import _opencode_pattern_matches
+
+    home, provision = worklink_script_config
+    provision()
+    patterns = yaml.safe_load((home / 'worklink.yaml').read_text())['backends']['opencode']['bash_allowlist']
+    # OpenCode checks every scanner-extracted subcommand, not just the first:
+    # https://opencode.ai/docs/permissions#scanner . The registry helper models
+    # glob matching of ONE parsed command, not shell parsing. Tokenize these
+    # simple compounds to assert that the second command still needs permission.
+    command = f'./tools/verify --lane ratchet {separator} curl example.com'
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|')
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    boundary = tokens.index(separator)
+    parsed = [' '.join(tokens[:boundary]), ' '.join(tokens[boundary + 1:])]
+    assert parsed == ['./tools/verify --lane ratchet', 'curl example.com']
+    allowed = [any(_opencode_pattern_matches(pattern, part) for pattern in patterns) for part in parsed]
+    assert allowed == [True, False]
+    assert not all(allowed)
+    assert not any(_opencode_pattern_matches(pattern, './tools/verify-other --lane ratchet')
+                   for pattern in patterns)
+
+
+@pytest.mark.parametrize('has_digest', [False, True])
+@pytest.mark.parametrize('tracker', [None, {'close_on_merge': False, 'adapters': {'linear': {}}}])
+def test_worklink_script_allowlist_upgrades_exact_deployment(worklink_script_config, has_digest, tracker):
+    home, provision = worklink_script_config
+    provision(tracker=tracker)
+    path = home / 'worklink.yaml'
+    expected = path.read_bytes()
+    legacy = yaml.safe_load(expected)
+    legacy['backends']['opencode']['bash_allowlist'] = ['git *', './tools/verify']
+    old = yaml.safe_dump(legacy, sort_keys=False).encode()
+    assert old != expected
+    path.write_bytes(old)
+    digest = home / '.mimir/worklink-setup.sha256'
+    if has_digest:
+        digest.write_text(hashlib.sha256(old).hexdigest() + '\n')
+    else:
+        digest.unlink()
+    assert provision(tracker=tracker, previous_tracker=tracker)
+    assert path.read_bytes() == expected
+    assert digest.read_text().strip() == hashlib.sha256(expected).hexdigest()
+    assert not provision(tracker=tracker, previous_tracker=tracker)
+
+
+@pytest.mark.parametrize('has_digest', [False, True])
+@pytest.mark.parametrize('edit', ['comment', 'setting', 'allowlist'])
+def test_worklink_script_allowlist_preserves_operator_edits(worklink_script_config, has_digest, edit):
+    home, provision = worklink_script_config
+    provision()
+    path = home / 'worklink.yaml'
+    legacy = yaml.safe_load(path.read_bytes())
+    legacy['backends']['opencode']['bash_allowlist'] = ['git *', './tools/verify']
+    old = yaml.safe_dump(legacy, sort_keys=False).encode()
+    if edit == 'comment':
+        edited = old + b'# operator note\n'
+    elif edit == 'setting':
+        edited = old.replace(b'max_concurrent: 2', b'max_concurrent: 7')
+    else:
+        edited = old.replace(b'- git *', b'- curl *')
+    assert edited != old
+    path.write_bytes(edited)
+    digest = home / '.mimir/worklink-setup.sha256'
+    if has_digest:
+        digest.write_text(hashlib.sha256(old).hexdigest() + '\n')
+    else:
+        digest.unlink()
+    with pytest.raises(RuntimeError, match='--force'):
+        provision()
+    assert path.read_bytes() == edited
+    assert provision(force=True)
+    assert yaml.safe_load(path.read_bytes())['backends']['opencode']['bash_allowlist'] == [
+        'git *', './tools/verify', './tools/verify *']
+
+
+def test_worklink_script_allowlist_stale_digest_is_not_bypassed(worklink_script_config):
+    home, provision = worklink_script_config
+    provision()
+    path = home / 'worklink.yaml'
+    current = path.read_bytes()
+    legacy = yaml.safe_load(current)
+    legacy['backends']['opencode']['bash_allowlist'] = ['git *', './tools/verify']
+    path.write_text(yaml.safe_dump(legacy, sort_keys=False))
+    # The file looks exactly generated, but disagrees with the recorded digest.
+    with pytest.raises(RuntimeError, match='--force'):
+        provision()
+    assert path.read_bytes() != current
+
+
+def test_worklink_script_allowlist_legacy_rendering_is_script_only(worklink_script_config):
+    home, provision = worklink_script_config
+    provision('sh scripts/x.sh')
+    path = home / 'worklink.yaml'
+    config = yaml.safe_load(path.read_bytes())
+    config['backends']['opencode']['bash_allowlist'] = ['git *']
+    edited = yaml.safe_dump(config, sort_keys=False).encode()
+    path.write_bytes(edited)
+    (home / '.mimir/worklink-setup.sha256').unlink()
+    with pytest.raises(RuntimeError, match='--force'):
+        provision('sh scripts/x.sh')
+    assert path.read_bytes() == edited
 
 
 @pytest.mark.parametrize('store_state', ['fresh', 'existing', 'init_failure', 'init_missing_cli', 'init_no_store',
