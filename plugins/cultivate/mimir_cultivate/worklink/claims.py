@@ -65,6 +65,8 @@ BASE_FETCH_DEFERRED_PREFIX = "WORKLINK_BASE_FETCH_DEFERRED "
 # A planned restart must not consume the ordinary retry budget, but repeated
 # restarts must not turn max_attempts into an infinite-retry loophole.
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
+# Automatic infrastructure retries need their own finite, per-generation cap.
+MAX_BASE_FETCH_DEFERRAL_FORGIVENESS = 2
 REAPER_PREFIX = "WORKLINK_REAPER "
 REAPER_SKIP_SAMPLE_LIMIT = 20
 _CLEAN_PARK_MAX_BYTES = 2 * 1024 * 1024
@@ -254,7 +256,7 @@ def _parse_dt(value: str) -> datetime:
 
 def _scan_claim_history(
     comments: Iterable[str],
-) -> tuple[list[ClaimRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], int]:
+) -> tuple[list[ClaimRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], int]:
     """Parse every claim record with its reset generation, plus the final one.
 
     Scans in comment order, so a ``WORKLINK_CLAIM_RESET`` marker advances the
@@ -275,6 +277,7 @@ def _scan_claim_history(
     records: list[ClaimRecord] = []
     aborts: list[ShutdownAbortRecord] = []
     stops: list[ShutdownAbortRecord] = []
+    deferrals: list[ShutdownAbortRecord] = []
     seen_claims: set[tuple[int, int, str, datetime]] = set()
     generation = 0
     for comment in comments:
@@ -304,9 +307,11 @@ def _scan_claim_history(
                 )
                 if abort_key not in seen_claims:
                     continue
-                (aborts if prefix == SHUTDOWN_ABORT_PREFIX else stops).append(
-                    replace(abort, generation=generation)
+                target = (
+                    aborts if prefix == SHUTDOWN_ABORT_PREFIX else
+                    deferrals if prefix == BASE_FETCH_DEFERRED_PREFIX else stops
                 )
+                target.append(replace(abort, generation=generation))
                 continue
             try:
                 record = ClaimRecord.from_payload(json.loads(line[len(CLAIM_PREFIX) :]))
@@ -316,11 +321,11 @@ def _scan_claim_history(
             seen_claims.add(
                 (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
             )
-    return records, aborts, stops, generation
+    return records, aborts, stops, deferrals, generation
 
 
 def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], int]:
-    records, _aborts, _stops, generation = _scan_claim_history(comments)
+    records, _aborts, _stops, _deferrals, generation = _scan_claim_history(comments)
     return records, generation
 
 
@@ -1129,7 +1134,7 @@ class ChainlinkClaims:
         history forgive their matching claims. Attempt ordinals still advance,
         preventing checkout/branch/evidence collisions.
         """
-        records, aborts, stops, generation = _scan_claim_history(comments)
+        records, aborts, stops, deferrals, generation = _scan_claim_history(comments)
         claim_keys = {
             (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
             for record in records
@@ -1151,6 +1156,15 @@ class ChainlinkClaims:
             for record in records
             if record.generation == generation
         }
+        deferred_keys: set[tuple[int, int, str, datetime]] = set()
+        for deferred in deferrals:
+            key = (deferred.issue_id, deferred.attempt, deferred.agent_id, deferred.claimed_at)
+            if deferred.generation != generation or key not in active_claims or key in deferred_keys:
+                continue
+            if len(deferred_keys) >= MAX_BASE_FETCH_DEFERRAL_FORGIVENESS:
+                break
+            deferred_keys.add(key)
+        forgiven.update(deferred_keys)
         home = home_path if home_path is not None else self.home_path
         clean_parks = {
             key for record in records

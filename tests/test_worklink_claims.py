@@ -1864,6 +1864,31 @@ def test_shutdown_abort_forgiveness_is_capped_and_attempt_ordinals_keep_advancin
     assert claims.next_attempt(history) == MAX_SHUTDOWN_ABORT_FORGIVENESS + 2
 
 
+def test_base_fetch_deferral_credit_is_bounded_per_generation() -> None:
+    from mimir_cultivate.worklink.claims import BASE_FETCH_DEFERRED_PREFIX, CLAIM_RESET_PREFIX
+
+    claims = ChainlinkClaims(agent_id="next", max_attempts=3)
+    history: list[str] = []
+    now = datetime(2026, 11, 25, tzinfo=UTC)
+    ordinal = 0
+    for generation in range(3):
+        if generation:
+            history.append(CLAIM_RESET_PREFIX + '{}')
+        for attempt in range(1, 6):
+            ordinal += 1
+            claim = ClaimRecord(1033, ordinal, "worker", now + timedelta(minutes=ordinal))
+            marker = BASE_FETCH_DEFERRED_PREFIX + ShutdownAbortRecord(
+                claim.issue_id, claim.attempt, claim.agent_id, claim.claimed_at,
+                claim.claimed_at + timedelta(seconds=1),
+            ).to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
+            # A marker before its claim must not preauthorize credit.
+            assert claims.attempts_used([*history, marker, claim.to_comment()]) == max(0, attempt - 3) + 1
+            history.extend([claim.to_comment(), marker, marker])
+            assert claims.attempts_used(history) == max(0, attempt - 2)
+            assert claims.next_attempt(history) == ordinal + 1
+        assert claims.attempts_used(history) == claims.max_attempts
+
+
 def test_shutdown_abort_marker_cannot_pre_authorize_a_later_claim() -> None:
     now = datetime(2026, 7, 29, tzinfo=UTC)
     claim = ClaimRecord(1033, 1, "mimir-worklink:process-a", now)

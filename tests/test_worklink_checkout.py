@@ -1036,6 +1036,29 @@ def test_base_fetch_ref_lock_retries_are_bounded(
     assert delays == [0.1, 0.2][:min(failures, 2)]
 
 
+@pytest.mark.parametrize("age", [1, 599, 600, 601])
+def test_real_git_ref_lock_age_controls_deferral(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age: int,
+) -> None:
+    _, repo, _, _ = _repo_with_stale_local_main(tmp_path)
+    lock = repo / ".git" / "refs" / "remotes" / "origin" / "main.lock"
+    lock.write_text("external process")
+    os.utime(lock, (2000 - age, 2000 - age))
+    monkeypatch.setattr(checkout_module.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(checkout_module.time, "sleep", lambda _: None)
+    expected = RuntimeError if age >= 600 else checkout_module.BaseFetchContentionError
+    with pytest.raises(expected) as caught:
+        checkout_module._prepare_fresh_base(
+            repo, "main", base_fetch=True, runner=checkout_module._default_runner, event_logger=None,
+        )
+    if age >= 600:
+        assert not isinstance(caught.value, checkout_module.BaseFetchContentionError)
+        assert f"stale base fetch ref lock: {lock}" in str(caught.value)
+    else:
+        assert "after 3 attempts" in str(caught.value)
+    assert lock.read_text() == "external process"
+
+
 def test_base_with_no_origin_counterpart_fails_closed(tmp_path: Path) -> None:
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)

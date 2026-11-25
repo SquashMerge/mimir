@@ -1659,8 +1659,8 @@ class WorklinkRunner:
             if _exception_incident_handled(exc) or incident_owner.owns_terminal_failure:
                 incident_owner.bind(exc)
                 raise
-            base_fetch_deferred = isinstance(exc, BaseFetchContentionError) and lease is None
-            failure_status = "refused" if base_fetch_deferred else "failed"
+            base_fetch_deferred = False
+            failure_status = "failed"
             transition_applied = False
             transition_error = None
             from .compute import ComputeCleanupError
@@ -1675,6 +1675,23 @@ class WorklinkRunner:
             preserve_reason = str(exc)
             terminal_release.retain_for_recovery = True
             try:
+                deferred_comment = None
+                if isinstance(exc, BaseFetchContentionError) and lease is None:
+                    deferred = ShutdownAbortRecord(
+                        issue_id=issue.issue_id, attempt=record.attempt,
+                        agent_id=record.agent_id, claimed_at=record.claimed_at,
+                        aborted_at=datetime.now(UTC),
+                    )
+                    candidate = BASE_FETCH_DEFERRED_PREFIX + deferred.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
+                    history = claims._issue_comments(issue.issue_id, strict=True)
+                    # Use the same durable budget computation as admission. A
+                    # saturated allowance is an ordinary, incident-bearing failure.
+                    base_fetch_deferred = (
+                        claims.attempts_used([*history, candidate]) < claims.attempts_used(history)
+                    )
+                    if base_fetch_deferred:
+                        deferred_comment = candidate
+                        failure_status = "refused"
                 try:
                     incident = incident_owner.record(
                         producer="leaf_exception",
@@ -1691,19 +1708,10 @@ class WorklinkRunner:
                 except OSError as write_exc:
                     incident_owner.bind(write_exc)
                     raise
-                if base_fetch_deferred:
-                    deferred = ShutdownAbortRecord(
-                        issue_id=issue.issue_id, attempt=record.attempt,
-                        agent_id=record.agent_id, claimed_at=record.claimed_at,
-                        aborted_at=datetime.now(UTC),
-                    )
+                if deferred_comment is not None:
                     # Persist credit before rearming/releasing. Relabelling alone
                     # cannot undo a claim charged by the history-based budget.
-                    claims._run(
-                        "issue", "comment", str(issue.issue_id),
-                        BASE_FETCH_DEFERRED_PREFIX
-                        + deferred.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX),
-                    )
+                    claims._run("issue", "comment", str(issue.issue_id), deferred_comment)
                 claims.transition_issue(
                     issue.issue_id,
                     status=failure_status,

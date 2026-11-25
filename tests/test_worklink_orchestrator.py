@@ -4751,7 +4751,7 @@ def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path
     _reset_logger_for_tests()
 
 
-@pytest.mark.parametrize("failure", ["ref_lock", "network", "after_checkout", "credit_write"])
+@pytest.mark.parametrize("failure", ["ref_lock", "fresh_lock", "stale_lock", "network", "after_checkout", "credit_write"])
 def test_base_fetch_contention_defers_without_consuming_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
@@ -4774,9 +4774,18 @@ def test_base_fetch_contention_defers_without_consuming_attempt(
     monkeypatch.setattr(checkout.time, "sleep", delays.append)
     config = WorklinkConfig(defaults=WorklinkDefaults(allow_autonomous_local_subprocess=True))
     monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
+    ref_lock = repo / ".git" / "refs" / "remotes" / "origin" / "main.lock"
+    if failure in {"fresh_lock", "stale_lock"}:
+        ref_lock.parent.mkdir(parents=True, exist_ok=True)
+        ref_lock.write_text("external lock")
+        monkeypatch.setattr(checkout.time, "time", lambda: 2000.0)
+        timestamp = 1000 if failure == "stale_lock" else 1999
+        os.utime(ref_lock, (timestamp, timestamp))
 
     def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess:
         if isinstance(args, list):
+            if args[:5] == ["git", "-C", str(repo), "rev-parse", "--git-path"]:
+                return cp(args, stdout=str(ref_lock))
             if args[:4] == ["chainlink", "issue", "show", "441"]:
                 calls.append(args)
                 issue = json.loads(ISSUE_JSON)
@@ -4814,21 +4823,40 @@ def test_base_fetch_contention_defers_without_consuming_attempt(
     registry.select_compute = lambda **_: compute
     claims = ChainlinkClaims(agent_id="test", runner=runner, home_path=tmp_path)
     try:
-        # Exceed the shutdown-abort forgiveness cap: every infrastructure-only
-        # deferral remains eligible, but its attempt ordinal must keep advancing.
-        for ordinal in range(1, 5 if failure == "ref_lock" else 2):
+        # Two free deferrals, then an active incident stops automatic dispatch.
+        # Explicit operator retries still charge the remaining attempt budget.
+        for ordinal in range(1, 6 if failure == "ref_lock" else 2):
             result = asyncio.run(WorklinkRunner(
                 home=tmp_path, repo=repo, runner=runner, registry=registry,
-            ).run(441, backend_name="fake", test_command="echo ok", autonomous=True))
+            ).run(441, backend_name="fake", test_command="echo ok", autonomous=ordinal <= 3))
             assert result.attempt == ordinal, result.reason
             incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["441"]
-            if failure in {"network", "after_checkout"}:
+            if failure in {"network", "after_checkout", "stale_lock"} or (failure == "ref_lock" and ordinal > 2):
                 assert result.status == "failed"
                 assert incident["attempt_consumed"] is True
                 assert incident["active"] is True
-                assert claims.attempts_used(comments) == 1
-                assert not any(c.startswith(BASE_FETCH_DEFERRED_PREFIX) for c in comments)
-                break
+                assert claims.attempts_used(comments) == (ordinal - 2 if failure == "ref_lock" else 1)
+                if failure != "ref_lock":
+                    assert not any(c.startswith(BASE_FETCH_DEFERRED_PREFIX) for c in comments)
+                    if failure == "stale_lock":
+                        assert str(ref_lock) in incident["terminal_error"]
+                        assert "stale base fetch ref lock" in result.reason
+                        assert ref_lock.read_text() == "external lock"
+                    break
+                assert sum(c.startswith(BASE_FETCH_DEFERRED_PREFIX) for c in comments) == 2
+                assert labels == ({"worklink:blocked"} if ordinal == 5 else {"worklink:ready"})
+                if ordinal == 3:
+                    comments_before = list(comments)
+                    fetch_count_before = len(fetches)
+                    blocked = asyncio.run(WorklinkRunner(
+                        home=tmp_path, repo=repo, runner=runner, registry=registry,
+                    ).run(441, backend_name="fake", test_command="echo ok", autonomous=True))
+                    assert blocked.status == "refused"
+                    assert blocked.attempt is None
+                    assert "unresolved Worklink incident" in blocked.reason
+                    assert comments == comments_before
+                    assert len(fetches) == fetch_count_before
+                continue
             assert result.status == "refused"
             assert incident["attempt_consumed"] is False
             assert incident["active"] is False
@@ -4845,14 +4873,17 @@ def test_base_fetch_contention_defers_without_consuming_attempt(
             assert autonomous_dispatch_block_reason(dispatch_failure_state_dir(tmp_path), 441) is None
         if failure != "after_checkout":
             assert compute.specs == []
-        assert len(fetches) == (1 if failure in {"network", "after_checkout"} else 3 * (4 if failure == "ref_lock" else 1))
+        assert len(fetches) == (1 if failure in {"network", "after_checkout"} else 3 * (5 if failure == "ref_lock" else 1))
+        if failure == "fresh_lock":
+            assert ref_lock.read_text() == "external lock"
         if failure == "ref_lock":
-            assert delays == [0.1, 0.2] * 4
-            assert sum(isinstance(c, list) and c[:3] == ["chainlink", "locks", "release"] for c in calls) == 4
+            assert delays == [0.1, 0.2] * 5
+            assert sum(isinstance(c, list) and c[:3] == ["chainlink", "locks", "release"] for c in calls) == 5
+            assert claims.claim_issue(441, comments).attempts_exhausted
             logger.flush_sync()
             events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
-            assert all(not e["attempt_consumed"] for e in events if e["type"] == "worklink_run_failed")
-            assert all(e["status"] != "failed" for e in events if e["type"] == "worklink_transition")
+            assert [e["attempt_consumed"] for e in events if e["type"] == "worklink_run_failed"] == [False, False, True, True, True]
+            assert [e["status"] for e in events if e["type"] == "worklink_transition"] == ["refused", "refused", "failed", "failed", "failed"]
     finally:
         _reset_logger_for_tests()
 

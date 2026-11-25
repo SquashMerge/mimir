@@ -32,6 +32,7 @@ _AUTHORIZATION_FACTORY = object()
 _DIRTY_PATH_SAMPLE_LIMIT = 20
 _WRITABLE_PATH_SAMPLE_LIMIT = 5
 _BASE_FETCH_ATTEMPTS = 3
+_BASE_FETCH_STALE_LOCK_SECONDS = 10 * 60
 BASE_PERMISSIONS_REMEDIATION = (
     '(cd "$WORKLINK_REPO" && { printf \'.\\0\'; git ls-files -z; '
     'git ls-tree -r -d -z --name-only HEAD; find .git -print0; } | '
@@ -750,6 +751,28 @@ def _fetch_base_from_origin(
             stderr=_strip_for_event(result.stderr),
         )
     if result.returncode != 0 and ref_locked(result):
+        # Resolve only Git's reported ref, never a pathname from error text.
+        # --git-path handles linked worktrees and nonstandard Git directories.
+        refs = re.findall(r"cannot lock ref ['\"](refs/[^'\"]+)['\"]", result.stderr + result.stdout)
+        for ref in dict.fromkeys(refs):
+            if any(part in {"", ".", ".."} for part in ref.split("/")):
+                continue
+            resolved = runner(["git", "-C", str(repo), "rev-parse", "--git-path", ref + ".lock"])
+            if resolved.returncode != 0 or not resolved.stdout.strip():
+                raise RuntimeError(f"cannot inspect base fetch lock for {ref}")
+            lock = Path(resolved.stdout.strip())
+            if not lock.is_absolute():
+                lock = repo / lock
+            try:
+                metadata = lock.lstat()
+            except FileNotFoundError:
+                continue
+            if time.time() - metadata.st_mtime >= _BASE_FETCH_STALE_LOCK_SECONDS:
+                # Observation only: a non-Worklink Git process may own it.
+                raise RuntimeError(
+                    f"stale base fetch ref lock: {lock} (at least {_BASE_FETCH_STALE_LOCK_SECONDS}s old); "
+                    "operator inspection required; lock was not deleted"
+                )
         raise BaseFetchContentionError(
             f"base repo fetch contention for origin/{remote_base} after {_BASE_FETCH_ATTEMPTS} attempts"
         )
