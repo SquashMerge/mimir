@@ -1088,12 +1088,17 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         'base_branch': branch, 'test_command': entry['test_command'],
         'max_concurrent': 2, 'timeout_s': 5400, 'reaper_ttl_s': 86400,
     }}
+    script_arguments = False
     try:
         allowlist = list(_derive_bash_allowlist(entry['test_command']))
     except ValueError:
-        # Custom verification scripts cannot safely be widened to a runner
-        # wildcard; grant only the declared command and Git operations.
         allowlist = ['git *', entry['test_command']]
+        # A plain repository-relative script is editable by the builder already.
+        # Permit its arguments, not arbitrary runners, wrappers or shell syntax.
+        component = r"""[^\s\x00;&|`$<>\\(){}*?\[\]'"/]+"""
+        script_arguments = bool(re.fullmatch(
+            fr"\./(?:{component}/)*{component}", entry['test_command']
+        )) and '..' not in entry['test_command'].split('/')
     config['backends'] = {'opencode': {'bash_allowlist': allowlist,
                                      'test_env': toolchain_test_env(toolchain) if toolchain else {}}}
     if model_spec is not None and model_spec.startswith("claude-code:"):
@@ -1109,8 +1114,14 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
             'feature_factory': {'host': 'claude_code', 'model': model,
                                 'entrypoint': DEFAULT_ENTRYPOINT},
         }
-    def render(section: dict | None) -> str:
+    elif script_arguments:
+        allowlist.append(entry['test_command'] + ' *')
+
+    def render(section: dict | None, *, legacy_exact_script: bool = False) -> str:
         rendered = dict(config)
+        if legacy_exact_script and script_arguments:
+            rendered['backends'] = {'opencode': {
+                **config['backends']['opencode'], 'bash_allowlist': allowlist[:-1]}}
         if section:
             rendered['tracker'] = section
         return yaml.safe_dump(rendered, sort_keys=False)
@@ -1129,8 +1140,12 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         # Deployments that predate the digest are unedited when the file is
         # exactly the rendering of the previously saved tracker selection, or
         # the tracker-less rendering that setup wrote before trackers existed.
+        # Also recognize the old exact-only custom-script allowance, byte for
+        # byte; do not treat other digest-less edits as generated configuration.
         unedited = (hashlib.sha256(current).hexdigest() == recorded if recorded
-                    else current in (render(previous_tracker).encode(), render(None).encode()))
+                    else current in tuple(
+                        render(section, legacy_exact_script=legacy).encode()
+                        for section in (previous_tracker, None) for legacy in (False, True)))
         if not unedited:
             print(_WORKLINK_EDITED, flush=True)
             raise RuntimeError(f"Worklink config {path} differs; preserve operator edits or rerun with --force")
