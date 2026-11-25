@@ -1258,6 +1258,180 @@ def upgrade_setup(setup_environment):
     return deploy, args, state, calls, invoke
 
 
+def _deployment_snapshot(deploy):
+    return {
+        path.relative_to(deploy).as_posix(): (
+            hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mode & 0o777,
+        )
+        for path in deploy.rglob("*") if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("failure", [
+    "env", "worklink", "lease", "wheel", "resources", "previous-image", "previous-image-hash", "dockerignore",
+])
+def test_upgrade_preflight_failure_is_byte_identical_and_retryable(upgrade_setup, monkeypatch, failure):
+    deploy, args, state, calls, invoke = upgrade_setup
+    args.mimir_version = "1.0.1"
+    (deploy / "operator-marker").write_bytes(b"preserve operator data\n")
+    repair = lambda: None
+    if failure == "env":
+        args.bot_email = "different@example.com"
+        repair = lambda: setattr(args, "bot_email", "bot@example.com")
+        message = "conflicts on GH_USER_EMAIL"
+    elif failure == "worklink":
+        state["status"] = "ISSUE  STATE  ATTEMPT\n42 running 1"
+        repair = lambda: state.update(status="No Worklink leaf runs or labeled issues.")
+        message = "Agent is busy"
+    elif failure == "lease":
+        state["leases"] = '["org/repo#17"]'
+        repair = lambda: state.update(leases="[]")
+        message = "Agent is busy"
+    elif failure == "wheel":
+        # The second wheel must be checked before writing the missing first one.
+        release = installer.resolve_release("1.0.1")
+        path = deploy / "wheels" / release.cultivate.filename
+        path.write_bytes(b"tampered")
+        repair = path.unlink
+        message = "Deployment wheel differs"
+    elif failure == "resources":
+        import mimir.plugin_dockerfile as dockerfile
+        original = dockerfile.build_pypi_context
+        def invalid(*a, **kw):
+            raise ValueError("invalid wheel resources")
+        monkeypatch.setattr(dockerfile, "build_pypi_context", invalid)
+        repair = lambda: monkeypatch.setattr(dockerfile, "build_pypi_context", original)
+        message = "Cannot assemble verified wheel"
+    elif failure == "dockerignore":
+        path = deploy / ".dockerignore"
+        original = path.read_bytes()
+        path.write_text("operator-edited\n")
+        repair = lambda: path.write_bytes(original)
+        message = "already differs"
+    else:
+        path = deploy / "build.sh"
+        original = path.read_bytes()
+        if failure == "previous-image-hash":
+            manifest = json.loads((deploy / "manifest.json").read_text())
+            path.write_bytes(original.replace(manifest["wheels"]["mimir-agent"]["sha256"].encode(), b"0" * 64))
+        else:
+            path.write_text("unrecognized previous image\n")
+        repair = lambda: path.write_bytes(original)
+        message = "Cannot identify previous agent image"
+    before = _deployment_snapshot(deploy)
+    writes = []
+    original_write = installer._write
+    original_bytes = Path.write_bytes
+    def write(path, *a, **kw):
+        writes.append(path)
+        return original_write(path, *a, **kw)
+    def write_bytes(path, *a, **kw):
+        if path.is_relative_to(deploy):
+            writes.append(path)
+        return original_bytes(path, *a, **kw)
+    with monkeypatch.context() as guarded:
+        guarded.setattr(installer, "_write", write)
+        guarded.setattr(Path, "write_bytes", write_bytes)
+        with pytest.raises(installer.SetupError, match=message):
+            invoke()
+    assert _deployment_snapshot(deploy) == before
+    assert writes == [], "preflight refusal must not write, even temporarily"
+    assert not any(argv[:2] == ["docker", "build"] or argv[-2:] == ["stop", "agent"] for argv in calls)
+    repair()
+    calls.clear()
+    invoke()
+    assert not args.force
+    assert json.loads((deploy / "manifest.json").read_text())["mimir_version"] == "1.0.1"
+    assert sum(argv[:2] == ["docker", "build"] for argv in calls) == 2
+
+
+@pytest.mark.parametrize("stored,requested", [
+    ("org/repo", "Org/Repo"), ("Org/Repo", "org/repo"),
+    ("org/repo", "other/repo"),
+])
+def test_upgrade_repo_slug_comparison(upgrade_setup, stored, requested):
+    deploy, args, state, calls, invoke = upgrade_setup
+    path = deploy / "compose.env"
+    path.write_text(path.read_text().replace("GITHUB_REPOS=org/repo", "GITHUB_REPOS=" + stored))
+    before = _deployment_snapshot(deploy)
+    args.repo = requested
+    args.mimir_version = "1.0.1"
+    if stored.lower() != requested.lower():
+        with pytest.raises(installer.SetupError, match="conflicts on GITHUB_REPOS"):
+            invoke()
+        assert _deployment_snapshot(deploy) == before
+        args.repo = stored
+    invoke()
+    assert "GITHUB_REPOS=" + stored + "\n" in path.read_text()
+    assert json.loads((deploy / "manifest.json").read_text())["slug"] == stored.lower()
+
+
+@pytest.mark.parametrize("failure", ["build", "provision", "verification"])
+def test_upgrade_late_failure_restores_files_and_allows_corrected_retry(upgrade_setup, monkeypatch, failure):
+    deploy, args, state, calls, invoke = upgrade_setup
+    args.mimir_version = "1.0.1"
+    args.rotate_web_key = True
+    (deploy / "owner-web-key").write_bytes(b"original-owner-key\n")
+    before = _deployment_snapshot(deploy)
+    if failure == "provision":
+        state["provision_failure"] = "deliberate refusal"
+    elif failure == "build":
+        # The fixture's injected runner is called by docker_step after publication.
+        original_setup = installer._setup
+        def failing_setup(args, **kw):
+            run = kw["run"]
+            def fail_build(argv, **options):
+                if argv[:2] == ["docker", "build"]:
+                    raise installer.SetupError("deliberate build failure")
+                return run(argv, **options)
+            return original_setup(args, **(kw | {"run": fail_build}))
+        monkeypatch.setattr(installer, "_setup", failing_setup)
+    else:
+        original_setup = installer._setup
+        def failing_setup(args, **kw):
+            def fail_verify(*a, **options):
+                raise installer.SetupError("deliberate verification failure")
+            return original_setup(args, **(kw | {"verify": fail_verify}))
+        monkeypatch.setattr(installer, "_setup", failing_setup)
+    with pytest.raises(installer.SetupError):
+        invoke()
+    assert _deployment_snapshot(deploy) == before
+    assert installer._previous_image(deploy, json.loads((deploy / "manifest.json").read_text()))
+    state.pop("provision_failure", None)
+    if failure != "provision":
+        monkeypatch.setattr(installer, "_setup", original_setup)
+    invoke()
+    assert json.loads((deploy / "manifest.json").read_text())["mimir_version"] == "1.0.1"
+
+
+@pytest.mark.parametrize("name", [
+    "Dockerfile.toolchain", "compose.env", ".dockerignore", "manifest.json",
+    "owner-web-key", "wheels", "wheel",
+])
+def test_upgrade_refuses_symlink_before_writes(upgrade_setup, monkeypatch, name):
+    deploy, args, state, calls, invoke = upgrade_setup
+    args.mimir_version = "1.0.1"
+    if name == "wheel":
+        wheel = installer.resolve_release("1.0.1").cultivate
+        name = "wheels/" + wheel.filename
+        (deploy / name).write_bytes(wheel.data)
+    path = deploy / name
+    target = deploy.parent / ("saved-" + name.replace("/", "-"))
+    path.rename(target)
+    path.symlink_to(target)
+    before = _deployment_snapshot(deploy)
+    with monkeypatch.context() as guarded:
+        guarded.setattr(installer, "_write", lambda *a, **kw: pytest.fail("write before path rejection"))
+        with pytest.raises(installer.SetupError, match="regular file|non-regular|real directory"):
+            invoke()
+    assert _deployment_snapshot(deploy) == before
+    assert path.is_symlink()
+    path.unlink()
+    target.rename(path)
+    invoke()
+    assert json.loads((deploy / "manifest.json").read_text())["mimir_version"] == "1.0.1"
+
+
 def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrade_setup, capsys):
     deploy, args, state, calls, invoke = upgrade_setup
     old = SHA

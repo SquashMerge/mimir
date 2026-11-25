@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections.abc import Iterable
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import getpass
 import hashlib
@@ -21,9 +22,11 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -876,21 +879,57 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
         raise SetupError("Incompatible scaffold Compose template; expected agent build and environment mapping.") from None
 
 
+def _check_write(path: Path, text: str, *, replace: bool = False) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise SetupError(f"Refusing non-regular deployment file {path}; move it aside and retry.")
+    if path.exists() and not replace and path.read_text() != text:
+        raise SetupError(f"{path} already differs; reconcile it manually before retrying.")
+
+
 def _write(path: Path, text: str, *, mode: int = 0o644, replace: bool = False) -> bool:
+    _check_write(path, text, replace=replace)
     if path.exists():
-        if not path.is_file() or path.is_symlink():
-            raise SetupError(f"Refusing non-regular deployment file {path}; move it aside and retry.")
         if path.read_text() == text:
             path.chmod(mode)
             return False
-        if not replace:
-            raise SetupError(f"{path} already differs; reconcile it manually before retrying.")
         path.write_text(text)
     else:
         with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode), "w") as out:
             out.write(text)
     path.chmod(mode)
     return True
+
+
+@contextmanager
+def _deployment_update(deploy: Path, paths: list[Path], directories: list[Path]):
+    """Restore only setup-owned files on failure, never Docker volumes or state.
+
+    Backups live outside the deployment and retain secret-file permissions.
+    Keep this active through build, provisioning and live verification: those
+    checks cannot run until the new deployment files have been published.
+    """
+    with tempfile.TemporaryDirectory(prefix="cultivate-rollback-") as temporary:
+        backups = {}
+        for index, path in enumerate(paths):
+            backup = Path(temporary) / str(index) if path.exists() else None
+            if backup is not None:
+                shutil.copy2(path, backup)
+            backups[path] = backup
+        modes = {path: path.stat().st_mode & 0o777 for path in directories if path.exists()}
+        try:
+            yield
+        except Exception:
+            for path, backup in backups.items():
+                if backup is not None:
+                    shutil.copy2(backup, path)
+                elif path.exists():
+                    path.unlink()
+            for path in reversed(directories):
+                if path in modes:
+                    path.chmod(modes[path])
+                elif path.exists():
+                    path.rmdir()
+            raise
 
 
 def _digest(text: str) -> str:
@@ -1166,9 +1205,10 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
     return created
 
 
-def _env(deploy: Path, updates: dict[str, str], *, manage_alerts: bool = False,
-         managed_model: bool = False, manage_tracing: bool = False) -> str:
+def _plan_env(deploy: Path, updates: dict[str, str], *, manage_alerts: bool = False,
+              managed_model: bool = False, manage_tracing: bool = False) -> tuple[str, str]:
     path = deploy / "compose.env"
+    _check_write(path, "", replace=True)
     existing = path.read_text() if path.exists() else ""
     lines = existing.splitlines()
     current = dict(line.split("=", 1) for line in lines if re.match(r"^[A-Z_][A-Z0-9_]*=", line))
@@ -1190,10 +1230,19 @@ def _env(deploy: Path, updates: dict[str, str], *, manage_alerts: bool = False,
             lines.append(f"{key}={value}")
         elif current[key] != value and key == "MIMIR_MODEL_SPEC" and managed_model:
             lines = [f"{key}={value}" if line.startswith(key + "=") else line for line in lines]
+        elif key == "GITHUB_REPOS" and current[key].lower() == value.lower():
+            pass  # GitHub slugs are case-insensitive; retain the operator's spelling.
         elif current[key] != value and key != "MIMIR_API_KEY":
             raise SetupError(f"Existing compose.env conflicts on {key}; resolve the operator setting before retrying.")
-    _write(path, "\n".join(lines) + "\n", mode=0o600, replace=True)
-    return current.get("MIMIR_API_KEY") or updates["MIMIR_API_KEY"]
+    return "\n".join(lines) + "\n", current.get("MIMIR_API_KEY") or updates["MIMIR_API_KEY"]
+
+
+def _env(deploy: Path, updates: dict[str, str], *, manage_alerts: bool = False,
+         managed_model: bool = False, manage_tracing: bool = False) -> str:
+    text, api_key = _plan_env(deploy, updates, manage_alerts=manage_alerts,
+                             managed_model=managed_model, manage_tracing=manage_tracing)
+    _write(deploy / "compose.env", text, mode=0o600, replace=True)
+    return api_key
 
 
 _CODEX_LOGIN_COMMAND = "docker compose run --rm --no-deps --user 1001:1001 --entrypoint codex agent login --device-auth"
@@ -1203,15 +1252,20 @@ def _codex_login_command(deploy: Path) -> str:
     return "From " + str(deploy) + " run: " + _CODEX_LOGIN_COMMAND
 
 
-def _codex_directory(deploy: Path) -> Path:
+def _check_codex_directory(deploy: Path) -> Path:
     directory = deploy / "codex"
     if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
         raise SetupError("Deployment Codex directory must be a real directory; move it aside and retry.")
+    if directory.exists() and directory.stat().st_mode & 0o077:
+        raise SetupError("Deployment Codex directory must have owner-only permissions (chmod 700); retry after fixing it.")
+    return directory
+
+
+def _codex_directory(deploy: Path) -> Path:
+    directory = _check_codex_directory(deploy)
     if not directory.exists():
         directory.mkdir(mode=0o700)
         directory.chmod(0o700)
-    elif directory.stat().st_mode & 0o077:
-        raise SetupError("Deployment Codex directory must have owner-only permissions (chmod 700); retry after fixing it.")
     return directory
 
 
@@ -1779,6 +1833,11 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verify) -> None:
+    with ExitStack() as stack:
+        _setup(args, stack=stack, request=request, run=run, verify=verify)
+
+
+def _setup(args: argparse.Namespace, *, stack: ExitStack, request, run, verify) -> None:
     deploy, previous, preflight_spec = _route_preflight(args)
     requested_platform = getattr(args, "platform", None)
     if requested_platform is not None and requested_platform not in _DOCKER_ARCHITECTURES:
@@ -2007,31 +2066,17 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         _check_in_flight(deploy, run)
     if old_image and old_image[0] != identity:
         print(f"Upgrading {previous['mimir_version']} -> {mimir_version}")
-    deploy.mkdir(parents=True, exist_ok=True)
-    deploy.chmod(0o700)
     if codex:
-        _codex_directory(deploy)
-        print("Codex subscription login (use this deployment only): " + _codex_login_command(deploy))
+        _check_codex_directory(deploy)
     wheel_dir = deploy / "wheels"
-    wheel_dir.mkdir(exist_ok=True)
+    if wheel_dir.is_symlink() or (wheel_dir.exists() and not wheel_dir.is_dir()):
+        raise SetupError("Deployment wheels directory must be a real directory; move it aside and retry.")
     for wheel in (release.agent, release.cultivate):
         path = wheel_dir / wheel.filename
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise SetupError("Deployment wheel path is not a regular file; move it aside and retry.")
         if path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() != wheel.sha256 and not getattr(args, "force", False):
             raise SetupError("Deployment wheel differs from the verified PyPI release; reconcile it before retrying.")
-        if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != wheel.sha256:
-            path.write_bytes(wheel.data)
-        path.chmod(0o600)
-    # The layer and build script are wholly generated from setup inputs.
-    _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
-           nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages), replace=True)
-    _write(deploy / "build.sh", build_script, mode=0o755, replace=True)
-    for name, text in generated.items():
-        _write(deploy / name, text, replace=True)
-    # The toolchain layer has no COPY instructions. Docker still sends the
-    # context to the daemon: exclude compose.env and the web key by default.
-    _write(deploy / ".dockerignore", "*\n!Dockerfile.toolchain\n")
     env_updates = {
         "MIMIR_API_KEY": secrets.token_urlsafe(32), "GITHUB_TOKEN": token, "GH_TOKEN": token,
         "GH_USER_NAME": bot, "GH_USER_EMAIL": bot_email, "MIMIR_GITHUB_SELF_LOGIN": bot,
@@ -2042,9 +2087,9 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         env_updates[key_name] = model_key
     if claude_token is not None:
         env_updates["CLAUDE_CODE_OAUTH_TOKEN"] = claude_token
-    api_key = _env(deploy, env_updates,
-                   manage_alerts=alert_adapter != "none" or "operator_alert_adapter" in previous,
-                   managed_model=provider in {"codex-plus", "claude-code"}, manage_tracing=True)
+    env_text, api_key = _plan_env(deploy, env_updates,
+                                manage_alerts=alert_adapter != "none" or "operator_alert_adapter" in previous,
+                                managed_model=provider in {"codex-plus", "claude-code"}, manage_tracing=True)
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
@@ -2067,7 +2112,59 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                     **(tracing_manifest if tracing_env else {})}
     if claude:
         manifest["worklink_toolchain"] = _worklink_toolchain()
-    _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
+    # Plan and validate every host-side write before changing the deployment.
+    writes = {
+        "Dockerfile.toolchain": (render_layer(kind, version, tag, nextest_version=nextest_version,
+                                             uv_version=uv_version, system_packages=system_packages), 0o644),
+        "build.sh": (build_script, 0o755),
+        **{name: (text, 0o644) for name, text in generated.items()},
+        # The layer has no COPY instructions; never send secrets to the daemon.
+        ".dockerignore": ("*\n!Dockerfile.toolchain\n", 0o644),
+        "compose.env": (env_text, 0o600),
+        "manifest.json": (json.dumps(manifest, indent=2) + "\n", 0o644),
+    }
+    for name, (text, mode) in writes.items():
+        _check_write(deploy / name, text, replace=name != ".dockerignore")
+    key_path = deploy / "owner-web-key"
+    if not getattr(args, "no_start", False) and (key_path.is_symlink() or (key_path.exists() and not key_path.is_file())):
+        raise SetupError("Owner web key path must be a regular file; move it aside and retry.")
+
+    # Wheel resource validation can also reject a release. Assemble the context
+    # outside the deployment, before publishing even the first wheel.
+    from mimir.plugin_dockerfile import build_pypi_context
+    temporary = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="cultivate-build-")))
+    context = temporary / "context"
+    for wheel in (release.agent, release.cultivate):
+        (temporary / wheel.filename).write_bytes(wheel.data)
+    try:
+        build_pypi_context(context, agent_wheel=temporary / release.agent.filename,
+                           cultivate_wheel=temporary / release.cultivate.filename,
+                           version=mimir_version, agent_sha256=release.agent.sha256,
+                           cultivate_sha256=release.cultivate.sha256,
+                           **({"worklink_host": host} if claude else {}))
+    except (ValueError, OSError):
+        raise SetupError("Cannot assemble verified wheel Docker context; check released wheel resources.") from None
+
+    if old_image and not getattr(args, "force", False):
+        paths = [deploy / name for name in writes]
+        if not getattr(args, "no_start", False):
+            paths.append(key_path)
+        paths.extend(wheel_dir / wheel.filename for wheel in (release.agent, release.cultivate))
+        directories = [deploy, wheel_dir] + ([deploy / "codex"] if codex else [])
+        stack.enter_context(_deployment_update(deploy, paths, directories))
+    deploy.mkdir(parents=True, exist_ok=True)
+    deploy.chmod(0o700)
+    if codex:
+        _codex_directory(deploy)
+        print("Codex subscription login (use this deployment only): " + _codex_login_command(deploy))
+    wheel_dir.mkdir(exist_ok=True)
+    for wheel in (release.agent, release.cultivate):
+        path = wheel_dir / wheel.filename
+        if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != wheel.sha256:
+            path.write_bytes(wheel.data)
+        path.chmod(0o600)
+    for name, (text, mode) in writes.items():
+        _write(deploy / name, text, mode=mode, replace=name != ".dockerignore")
     # The provision script and manifest are mounted read-only for a one-shot
     # non-root container, never into the long-running agent.
     no_start = bool(getattr(args, "no_start", False))
@@ -2091,20 +2188,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
             raise SetupError(f"Docker {step} failed; inspect the deployment and docker compose logs.") from None
 
     print(f"Building verified PyPI Mimir {mimir_version}")
-    from mimir.plugin_dockerfile import build_pypi_context
-    import tempfile
-    with tempfile.TemporaryDirectory(prefix="cultivate-build-") as temporary:
-        context = Path(temporary) / "context"
-        try:
-            build_pypi_context(context, agent_wheel=wheel_dir / release.agent.filename,
-                               cultivate_wheel=wheel_dir / release.cultivate.filename,
-                               version=mimir_version, agent_sha256=release.agent.sha256,
-                               cultivate_sha256=release.cultivate.sha256,
-                               **({"worklink_host": host} if claude else {}))
-        except (ValueError, OSError) as exc:
-            raise SetupError("Cannot assemble verified wheel Docker context; check released wheel resources.") from None
-        docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", tag, *sum((["--build-arg", arg.removeprefix("--build-arg ")] for arg in build_args), []), str(context)],
-                    image="Mimir root image")
+    docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", tag, *sum((["--build-arg", arg.removeprefix("--build-arg ")] for arg in build_args), []), str(context)],
+                image="Mimir root image")
     docker_step("build", ["docker", "build", "--platform", docker_platform, "-t", layer_tag, "-f", "Dockerfile.toolchain", "."],
                 image="agent toolchain layer")
     docker_step("init", ["docker", "compose", "run", "--rm", "init"])

@@ -152,7 +152,8 @@ def test_repository_scan_discovers_new_script_workflow_and_doc(tmp_path):
 def test_operator_setup_build_invocations_are_closed_pypi_only():
     source = (ROOT / 'plugins/cultivate/mimir_cultivate/setup.py').read_text()
     tree = ast.parse(source)
-    setup = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'setup')
+    # setup() owns the ExitStack; _setup() plans and publishes the build.
+    setup = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_setup')
     literal_values = {node.value for node in ast.walk(setup)
                       if isinstance(node, ast.Constant) and isinstance(node.value, str)}
     assert '--build-arg MIMIR_INSTALL_MODE=pypi' in literal_values
