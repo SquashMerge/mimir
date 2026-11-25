@@ -241,13 +241,16 @@ def _issue_ids_from_records(data: object) -> list[int]:
     return ids
 
 
-def _issue_ids_from_ready_text(text: str) -> list[int]:
+def _issue_ids_from_ready_text(text: str) -> list[int] | None:
+    # Only the CLI's recognised empty response is a successful empty text read.
+    if text.strip() == "No ready issues.":
+        return []
     ids: list[int] = []
     for line in text.splitlines():
         match = re.match(r"^\s*#(\d+)\b", line)
         if match:
             ids.append(int(match.group(1)))
-    return ids
+    return ids or None
 
 
 def _actionable_issue_ids(home: Path) -> list[int] | None:
@@ -265,10 +268,10 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
     if proc.returncode != 0:
         return None
     try:
-        return _issue_ids_from_records(json.loads(proc.stdout or "[]"))
+        return _issue_ids_from_records(json.loads(proc.stdout or ""))
     except json.JSONDecodeError:
         parsed = _issue_ids_from_ready_text(proc.stdout or "")
-        return parsed or None
+        return parsed
 
 
 def _worklink_dispatch_plan(

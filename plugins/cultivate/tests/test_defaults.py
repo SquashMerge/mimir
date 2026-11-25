@@ -161,8 +161,8 @@ def test_current_chainlink_orchestrator_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "chainlink-orchestrator"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["2159-orphan-lock-reconciliation"]["chainlink-orchestrator"]
-    assert next(key for key in reversed(releases) if "chainlink-orchestrator" in releases[key]) == "2159-orphan-lock-reconciliation"
+    assert skill_inventory(skill) == releases["2216-empty-ready-queue"]["chainlink-orchestrator"]
+    assert next(key for key in reversed(releases) if "chainlink-orchestrator" in releases[key]) == "2216-empty-ready-queue"
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.

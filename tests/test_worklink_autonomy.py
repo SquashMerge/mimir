@@ -3707,6 +3707,77 @@ def test_poller_accepts_chainlink_ready_text_when_json_flag_is_ignored(tmp_path:
     assert scan["blocked_ready_count"] == 1
 
 
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "error", "expected"),
+    [
+        pytest.param("No ready issues.\n", 0, None, [], id="empty-text"),
+        pytest.param(" \n No ready issues. \n", 0, None, [], id="empty-text-whitespace"),
+        pytest.param(
+            "Ready issues (no blockers):\n  #201 high first\n  #203 medium second\n",
+            0, None, [201, 203], id="populated-text",
+        ),
+        pytest.param("[]", 0, None, [], id="empty-json"),
+        pytest.param('[{"id": 201}, {"id": 203}]', 0, None, [201, 203], id="populated-json"),
+        pytest.param("Tracker unavailable\n", 0, None, None, id="unrecognised-text"),
+        pytest.param("Error: No ready issues.\n", 0, None, None, id="embedded-empty-text"),
+        pytest.param("Ready issues (no blockers):\n", 0, None, None, id="header-only"),
+        pytest.param("", 0, None, None, id="no-output"),
+        pytest.param(" \n", 0, None, None, id="blank-output"),
+        pytest.param("No ready issues.\n", 1, None, None, id="nonzero-empty-text"),
+        pytest.param("#201 ready\n", 1, None, None, id="nonzero-populated-text"),
+        pytest.param("[]", 1, None, None, id="nonzero-json"),
+        pytest.param("", 0, subprocess.TimeoutExpired("chainlink", 5), None, id="timeout"),
+        pytest.param("", 0, OSError("chainlink unavailable"), None, id="oserror"),
+    ],
+)
+def test_poller_actionable_ready_read_and_degraded_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    stdout: str, returncode: int, error: Exception | None, expected: list[int] | None,
+) -> None:
+    """A failed actionable read degrades; a recognised empty queue does not."""
+    poller = _load_poller_module()
+    (tmp_path / "worklink.yaml").write_text("defaults:\n  max_concurrent: 3\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path / "repo"))
+    monkeypatch.setenv("STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("MIMIR_FACTORY_EPICS_ENABLED", raising=False)
+    events, launched = [], []
+    monkeypatch.setattr(poller, "_emit", events.append)
+    monkeypatch.setattr(poller, "launch_detached_worklink", lambda **kwargs: launched.append(kwargs))
+
+    def run(args, **kwargs):
+        assert kwargs["cwd"] == str(tmp_path)
+        assert kwargs["timeout"] == poller._CHAINLINK_READ_TIMEOUT_SECONDS
+        if args[1:] == ["issue", "ready", "--json"]:
+            if error is not None:
+                raise error
+            return cp(returncode=returncode, stdout=stdout)
+        if args[1:] == ["locks", "list", "--json"]:
+            return cp(stdout='{"locks": {}}')
+        assert args[1:3] == ["issue", "list"]
+        label = args[args.index("--label") + 1]
+        # Even labeled issues must not dispatch when the actionable queue is empty
+        # or unreadable; the populated response must still filter out issue 202.
+        ids = [201, 202, 203] if label == poller.READY_LABEL else []
+        return cp(stdout=json.dumps([{"id": issue_id} for issue_id in ids]))
+
+    monkeypatch.setattr(poller.subprocess, "run", run)
+    assert poller._actionable_issue_ids(tmp_path) == expected
+    assert poller.main() == 0
+    degraded = [event for event in events if event.get("signal") == "worklink_poller_degraded"]
+    scans = [event for event in events if event.get("signal") == "worklink_ready_scan"]
+    dispatched = [event["issue_id"] for event in events if event.get("signal") == "worklink_dispatched"]
+    if expected is None:
+        assert len(degraded) == 1
+        assert not scans
+    else:
+        assert not degraded
+        assert len(scans) == 1
+        assert scans[0]["ready_count"] == len(expected)
+    assert dispatched == (expected or [])
+    assert [call["issue_id"] for call in launched] == (expected or [])
+
+
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
 def test_poller_fails_closed_when_chainlink_errors(tmp_path: Path) -> None:
     home = tmp_path / "home"

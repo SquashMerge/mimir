@@ -1200,5 +1200,12 @@
       "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
       "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
     }
+  },
+  "2216-empty-ready-queue": {
+    "chainlink-orchestrator": {
+      "SKILL.md": "c87f1a120534a120e6124038450809600f0ebeaa221ad82c49b91dbc5c71ca0b",
+      "pollers.json": "7771c3d953de5a4a299053d523a34695205888a5bb83e7e9f7fc250125ba407d",
+      "scripts/poller.py": "74cc9b90e4eac061fcd758f3facf1e9deb40150917fa8560be4540639253452e"
+    }
   }
 }
