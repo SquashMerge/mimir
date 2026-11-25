@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import errno
 import inspect
 import json
+import multiprocessing
 import os
 import shlex
 import shutil
@@ -903,6 +904,136 @@ def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> 
             },
         )
     ]
+
+
+@pytest.mark.parametrize("shared_repo", [True, False])
+def test_fresh_base_fetch_serialized_across_processes(tmp_path: Path, shared_repo: bool) -> None:
+    """Force overlap without sleeping: the second fetch must wait on the real flock."""
+    _origin, repo, stale_sha, fresh_sha = _repo_with_stale_local_main(tmp_path)
+    if shared_repo:
+        other_repo = tmp_path / "alias"
+        other_repo.symlink_to(repo, target_is_directory=True)
+        other_tip = fresh_sha
+    else:
+        other_root = tmp_path / "independent"
+        other_root.mkdir()
+        _, other_repo, _, other_tip = _repo_with_stale_local_main(other_root)
+    context = multiprocessing.get_context("fork")
+    events = context.Queue()
+    release_fetch = context.Event()
+    release_verify = context.Event()
+
+    def prepare(number: int, path: Path) -> None:
+        real_flock = checkout_module.fcntl.flock
+
+        def observed_flock(fd: int, operation: int) -> None:
+            if operation == checkout_module.fcntl.LOCK_EX:
+                try:
+                    real_flock(fd, operation | checkout_module.fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    events.put(("waiting", number))
+            real_flock(fd, operation)
+
+        checkout_module.fcntl.flock = observed_flock
+
+        def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            if args[3] == "fetch":
+                events.put(("fetch", number))
+                if number == 1:
+                    assert release_fetch.wait(20)
+            if number == 1 and args[3:] == ["rev-parse", "--verify", "origin/main"]:
+                events.put(("verify", number))
+                assert release_verify.wait(20)
+            return subprocess.run(args, capture_output=True, text=True, check=False)
+
+        try:
+            start = checkout_module._prepare_fresh_base(
+                path, "main", base_fetch=True, runner=runner, event_logger=None,
+            )
+            events.put(("done", number, start, _git(path, "rev-parse", start)))
+        except BaseException as exc:
+            events.put(("error", number, repr(exc)))
+            raise
+
+    first = context.Process(target=prepare, args=(1, repo))
+    second = context.Process(target=prepare, args=(2, other_repo))
+    first.start()
+    try:
+        assert events.get(timeout=20) == ("fetch", 1)
+        second.start()
+        if shared_repo:
+            # Deleting the production lock deterministically yields ("fetch", 2)
+            # here instead, even if Git itself happens not to lose the ref race.
+            assert events.get(timeout=20) == ("waiting", 2)
+        else:
+            assert events.get(timeout=20) == ("fetch", 2)
+            assert events.get(timeout=20) == ("done", 2, "origin/main", other_tip)
+        release_fetch.set()
+        assert events.get(timeout=20) == ("verify", 1)
+        lock = repo / ".git" / "worklink-base-fetch.lock"
+        with lock.open() as handle:
+            with pytest.raises(BlockingIOError):
+                checkout_module.fcntl.flock(
+                    handle.fileno(), checkout_module.fcntl.LOCK_EX | checkout_module.fcntl.LOCK_NB,
+                )
+        release_verify.set()
+        remaining = [events.get(timeout=20) for _ in range(3 if shared_repo else 1)]
+        assert ("done", 1, "origin/main", fresh_sha) in remaining
+        if shared_repo:
+            assert ("fetch", 2) in remaining
+            assert ("done", 2, "origin/main", fresh_sha) in remaining
+    finally:
+        release_fetch.set()
+        release_verify.set()
+        first.join(timeout=20)
+        if second.pid is not None:
+            second.join(timeout=20)
+        for process in (first, second):
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=20)
+        events.close()
+    assert first.exitcode == second.exitcode == 0
+    assert _git(repo, "rev-parse", "HEAD") == stale_sha
+    assert _git(repo, "status", "--porcelain") == ""
+    # The persistent lock is released, not removed, when preparation returns.
+    with lock.open() as handle:
+        checkout_module.fcntl.flock(handle.fileno(), checkout_module.fcntl.LOCK_EX | checkout_module.fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("failures", [1, 2, 3])
+def test_base_fetch_ref_lock_retries_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failures: int,
+) -> None:
+    _, repo, _, fresh_sha = _repo_with_stale_local_main(tmp_path)
+    fetches = []
+    delays = []
+    monkeypatch.setattr(checkout_module.time, "sleep", delays.append)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if args[3] == "fetch":
+            fetches.append(list(args))
+            if len(fetches) <= failures:
+                return subprocess.CompletedProcess(args, 1, "", "error: cannot lock ref 'refs/remotes/origin/main'")
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    def prepare() -> str:
+        return checkout_module._prepare_fresh_base(
+            repo, "main", base_fetch=True, runner=runner, event_logger=None,
+        )
+
+    if failures == 3:
+        with pytest.raises(checkout_module.BaseFetchContentionError, match="after 3 attempts"):
+            prepare()
+        # An exhausted fetch must release its lock, too.
+        lock = repo / ".git" / "worklink-base-fetch.lock"
+        with lock.open() as handle:
+            checkout_module.fcntl.flock(handle.fileno(), checkout_module.fcntl.LOCK_EX | checkout_module.fcntl.LOCK_NB)
+    else:
+        assert _git(repo, "rev-parse", prepare()) == fresh_sha
+    assert len(fetches) == min(failures + 1, 3)
+    assert delays == [0.1, 0.2][:min(failures, 2)]
 
 
 def test_base_with_no_origin_counterpart_fails_closed(tmp_path: Path) -> None:

@@ -4751,6 +4751,112 @@ def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path
     _reset_logger_for_tests()
 
 
+@pytest.mark.parametrize("failure", ["ref_lock", "network", "after_checkout", "credit_write"])
+def test_base_fetch_contention_defers_without_consuming_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    import mimir_cultivate.worklink.checkout as checkout
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.claims import BASE_FETCH_DEFERRED_PREFIX
+    from mimir_cultivate.worklink.dispatch_failures import (
+        autonomous_dispatch_block_reason, dispatch_failure_state_dir, load_failure_state,
+    )
+
+    _reset_logger_for_tests()
+    logger = init_logger(tmp_path / "events.jsonl", session_id="base-fetch")
+    repo = tmp_path / "repo"
+    worktree = tmp_path / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    comments: list[str] = []
+    fetches: list[Sequence[str]] = []
+    delays = []
+    labels = {"worklink:ready"}
+    monkeypatch.setattr(checkout.time, "sleep", delays.append)
+    config = WorklinkConfig(defaults=WorklinkDefaults(allow_autonomous_local_subprocess=True))
+    monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
+
+    def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if isinstance(args, list):
+            if args[:4] == ["chainlink", "issue", "show", "441"]:
+                calls.append(args)
+                issue = json.loads(ISSUE_JSON)
+                issue["comments"] = [{"body": comment} for comment in comments]
+                issue["labels"] = sorted(labels)
+                return cp(args, stdout=json.dumps(issue))
+            if args[:4] == ["git", "-C", str(repo), "fetch"]:
+                calls.append(args)
+                fetches.append(args)
+                if failure != "after_checkout":
+                    return cp(args, returncode=1, stderr=(
+                        "network down" if failure == "network" else
+                        "error: cannot lock ref 'refs/remotes/origin/main': is at abc but expected def"
+                    ))
+            if args[:3] == ["chainlink", "issue", "comment"]:
+                if args[-1].startswith(BASE_FETCH_DEFERRED_PREFIX) and failure == "credit_write":
+                    calls.append(args)
+                    return cp(args, returncode=1, stderr="credit persistence failed")
+                comments.append(args[-1])
+            if args[:3] == ["chainlink", "issue", "label"]:
+                labels.add(args[-1])
+            if args[:3] == ["chainlink", "issue", "unlabel"]:
+                labels.discard(args[-1])
+        return base_runner(args, **kwargs)
+
+    class Backend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            # A similarly typed exception after checkout must NOT grant credit.
+            raise checkout.BaseFetchContentionError("backend failure, not prework")
+
+    registry = BackendRegistry(config)
+    registry.register(Backend())
+    compute = FakeCompute(shared_filesystem=True)
+    registry.register_compute(compute)
+    registry.select_compute = lambda **_: compute
+    claims = ChainlinkClaims(agent_id="test", runner=runner, home_path=tmp_path)
+    try:
+        # Exceed the shutdown-abort forgiveness cap: every infrastructure-only
+        # deferral remains eligible, but its attempt ordinal must keep advancing.
+        for ordinal in range(1, 5 if failure == "ref_lock" else 2):
+            result = asyncio.run(WorklinkRunner(
+                home=tmp_path, repo=repo, runner=runner, registry=registry,
+            ).run(441, backend_name="fake", test_command="echo ok", autonomous=True))
+            assert result.attempt == ordinal, result.reason
+            incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["441"]
+            if failure in {"network", "after_checkout"}:
+                assert result.status == "failed"
+                assert incident["attempt_consumed"] is True
+                assert incident["active"] is True
+                assert claims.attempts_used(comments) == 1
+                assert not any(c.startswith(BASE_FETCH_DEFERRED_PREFIX) for c in comments)
+                break
+            assert result.status == "refused"
+            assert incident["attempt_consumed"] is False
+            assert incident["active"] is False
+            if failure == "credit_write":
+                # No durable budget credit means no rearm or lock release.
+                assert load_run_state(tmp_path, 441) is not None
+                assert "worklink:in-progress" in labels
+                assert not any(isinstance(c, list) and c[:3] == ["chainlink", "locks", "release"] for c in calls)
+                break
+            assert labels == {"worklink:ready"}
+            assert claims.attempts_used(comments) == 0
+            assert claims.next_attempt(comments) == ordinal + 1
+            assert load_run_state(tmp_path, 441) is None
+            assert autonomous_dispatch_block_reason(dispatch_failure_state_dir(tmp_path), 441) is None
+        if failure != "after_checkout":
+            assert compute.specs == []
+        assert len(fetches) == (1 if failure in {"network", "after_checkout"} else 3 * (4 if failure == "ref_lock" else 1))
+        if failure == "ref_lock":
+            assert delays == [0.1, 0.2] * 4
+            assert sum(isinstance(c, list) and c[:3] == ["chainlink", "locks", "release"] for c in calls) == 4
+            logger.flush_sync()
+            events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+            assert all(not e["attempt_consumed"] for e in events if e["type"] == "worklink_run_failed")
+            assert all(e["status"] != "failed" for e in events if e["type"] == "worklink_transition")
+    finally:
+        _reset_logger_for_tests()
+
+
 def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events_path = tmp_path / "logs" / "events.jsonl"

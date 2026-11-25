@@ -50,7 +50,8 @@ from .compute import (
 )
 from .claims import (
     ChainlinkClaims, ClaimRecord, ShutdownAbortRecord, OPERATOR_STOP_PREFIX,
-    SHUTDOWN_ABORT_PREFIX, QUOTA_HOLD_PREFIX, WORKLINK_EPIC_LABEL, record_clean_park,
+    SHUTDOWN_ABORT_PREFIX, QUOTA_HOLD_PREFIX, BASE_FETCH_DEFERRED_PREFIX,
+    WORKLINK_EPIC_LABEL, record_clean_park,
     claim_records_from_comments,
 )
 from .control import operator_stop_requested
@@ -84,7 +85,7 @@ from .run_state import (
     save_run_state,
 )
 from .checkout import (
-    CheckoutLease, cleanup_checkout, _cultivate_selected, create_isolated_checkout,
+    BaseFetchContentionError, CheckoutLease, cleanup_checkout, _cultivate_selected, create_isolated_checkout,
     assert_base_repo_not_worker_writable,
 )
 from .worker_client import worklink_checkout_root
@@ -1658,6 +1659,8 @@ class WorklinkRunner:
             if _exception_incident_handled(exc) or incident_owner.owns_terminal_failure:
                 incident_owner.bind(exc)
                 raise
+            base_fetch_deferred = isinstance(exc, BaseFetchContentionError) and lease is None
+            failure_status = "refused" if base_fetch_deferred else "failed"
             transition_applied = False
             transition_error = None
             from .compute import ComputeCleanupError
@@ -1683,16 +1686,30 @@ class WorklinkRunner:
                         autonomous=autonomous,
                         preserved_ref=lease.branch if lease else None,
                         work_path=str(lease.path) if lease else None,
+                        work_started=False if base_fetch_deferred else None,
                     )
                 except OSError as write_exc:
                     incident_owner.bind(write_exc)
                     raise
+                if base_fetch_deferred:
+                    deferred = ShutdownAbortRecord(
+                        issue_id=issue.issue_id, attempt=record.attempt,
+                        agent_id=record.agent_id, claimed_at=record.claimed_at,
+                        aborted_at=datetime.now(UTC),
+                    )
+                    # Persist credit before rearming/releasing. Relabelling alone
+                    # cannot undo a claim charged by the history-based budget.
+                    claims._run(
+                        "issue", "comment", str(issue.issue_id),
+                        BASE_FETCH_DEFERRED_PREFIX
+                        + deferred.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX),
+                    )
                 claims.transition_issue(
                     issue.issue_id,
-                    status="failed",
+                    status=failure_status,
                     review_ready=False,
-                    attempt=record.budget_attempt or record.attempt,
-                    reason=str(exc),
+                    attempt=None if base_fetch_deferred else record.budget_attempt or record.attempt,
+                    reason=None if base_fetch_deferred else str(exc),
                 )
                 transition_applied = True
                 terminal_release.label_transition_applied = True
@@ -1710,7 +1727,7 @@ class WorklinkRunner:
                 "worklink_transition",
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
-                status="failed",
+                status=failure_status,
                 review_ready=False,
                 pr_url=None,
                 reason=str(exc),
@@ -1720,7 +1737,7 @@ class WorklinkRunner:
             return WorklinkRunResult(
                 issue.issue_id,
                 record.attempt,
-                "failed",
+                failure_status,
                 reason=str(exc),
                 checkout=lease.path if lease else None,
                 branch=lease.branch if lease else None,

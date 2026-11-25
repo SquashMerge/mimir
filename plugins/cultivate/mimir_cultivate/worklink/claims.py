@@ -60,6 +60,8 @@ MAX_CLAIM_RESETS = 2
 SHUTDOWN_ABORT_PREFIX = "WORKLINK_SHUTDOWN_ABORT "
 OPERATOR_STOP_PREFIX = "WORKLINK_STOPPED "
 QUOTA_HOLD_PREFIX = "WORKLINK_QUOTA_HOLD "
+# Credit only the matching pre-checkout claim; ordinals still advance.
+BASE_FETCH_DEFERRED_PREFIX = "WORKLINK_BASE_FETCH_DEFERRED "
 # A planned restart must not consume the ordinary retry budget, but repeated
 # restarts must not turn max_attempts into an infinite-retry loophole.
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
@@ -282,7 +284,10 @@ def _scan_claim_history(
                     generation += 1
                 continue
             if not line.startswith(CLAIM_PREFIX):
-                prefix = next((p for p in (SHUTDOWN_ABORT_PREFIX, OPERATOR_STOP_PREFIX, QUOTA_HOLD_PREFIX) if line.startswith(p)), None)
+                prefix = next((p for p in (
+                    SHUTDOWN_ABORT_PREFIX, OPERATOR_STOP_PREFIX, QUOTA_HOLD_PREFIX,
+                    BASE_FETCH_DEFERRED_PREFIX,
+                ) if line.startswith(p)), None)
                 if prefix is None:
                     continue
                 try:
@@ -299,7 +304,7 @@ def _scan_claim_history(
                 )
                 if abort_key not in seen_claims:
                     continue
-                (stops if prefix in {OPERATOR_STOP_PREFIX, QUOTA_HOLD_PREFIX} else aborts).append(
+                (aborts if prefix == SHUTDOWN_ABORT_PREFIX else stops).append(
                     replace(abort, generation=generation)
                 )
                 continue

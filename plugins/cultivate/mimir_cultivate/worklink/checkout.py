@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from typing import Any, Callable, Sequence
 
 from mimir._rmtree import rmtree_missing_ok
@@ -30,6 +31,7 @@ _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 _AUTHORIZATION_FACTORY = object()
 _DIRTY_PATH_SAMPLE_LIMIT = 20
 _WRITABLE_PATH_SAMPLE_LIMIT = 5
+_BASE_FETCH_ATTEMPTS = 3
 BASE_PERMISSIONS_REMEDIATION = (
     '(cd "$WORKLINK_REPO" && { printf \'.\\0\'; git ls-files -z; '
     'git ls-tree -r -d -z --name-only HEAD; find .git -print0; } | '
@@ -687,6 +689,10 @@ def create_isolated_checkout(
     )
 
 
+class BaseFetchContentionError(RuntimeError):
+    """Base fetch exhausted its bounded ref-lock retries before checkout creation."""
+
+
 def _fetch_base_from_origin(
     repo: Path,
     base: str,
@@ -696,14 +702,27 @@ def _fetch_base_from_origin(
 ) -> bool:
     """Refresh the base, repairing reconstructible dangling refs once on failure."""
     remote_base = base.removeprefix("origin/")
-    result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
+
+    def fetch() -> subprocess.CompletedProcess[str]:
+        for attempt in range(_BASE_FETCH_ATTEMPTS):
+            result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
+            if result.returncode == 0 or not ref_locked(result):
+                return result
+            if attempt + 1 < _BASE_FETCH_ATTEMPTS:
+                time.sleep(0.1 * (2 ** attempt))
+        return result
+
+    def ref_locked(result: subprocess.CompletedProcess[str]) -> bool:
+        return "cannot lock ref" in (result.stderr + result.stdout).casefold()
+
+    result = fetch()
     # A reclaimed alternate leaves refs behind. Pruning the alternates file removes
     # the pointer but not the refs that resolved only through it, and git refuses
     # the whole fetch on the first such ref ("fatal: bad object <ref>"). Repair that
     # residue once too, otherwise a single stale remote-tracking ref permanently
     # fails every base fetch — which consumed six worklink attempts across three
     # leaves before it was diagnosed by hand.
-    if result.returncode != 0:
+    if result.returncode != 0 and not ref_locked(result):
         repaired_refs, retained_refs = _prune_dangling_refs(repo, runner=runner)
         if repaired_refs or retained_refs:
             if event_logger is not None:
@@ -718,7 +737,7 @@ def _fetch_base_from_origin(
                     retained=[f"{name}@{sha}" for name, sha in retained_refs],
                 )
         if repaired_refs:
-            result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
+            result = fetch()
     if result.returncode == 0 and not _dangling_alternates(repo):
         return True
     if event_logger is not None:
@@ -729,6 +748,10 @@ def _fetch_base_from_origin(
             returncode=result.returncode,
             stdout=_strip_for_event(result.stdout),
             stderr=_strip_for_event(result.stderr),
+        )
+    if result.returncode != 0 and ref_locked(result):
+        raise BaseFetchContentionError(
+            f"base repo fetch contention for origin/{remote_base} after {_BASE_FETCH_ATTEMPTS} attempts"
         )
     return False
 
@@ -746,6 +769,25 @@ def _prepare_fresh_base(
         raise RuntimeError("base repo fetch is disabled; refusing to build on an unverified base")
     _assert_base_repo_clean(repo, runner=runner, event_logger=event_logger)
     assert_base_repo_not_worker_writable(repo, runner=runner, event_logger=event_logger)
+    # Keep the persistent inode in permission-checked Git metadata, not beside
+    # the repo: a sticky parent (e.g. /tmp) may allow a worker to plant a sibling
+    # lock. Resolving the metadata directory also canonicalizes repository aliases.
+    # Never unlink the lock, which would let waiters lock different inodes.
+    objects = _git_objects_dir(repo)
+    lock_dir = (objects.parent if objects is not None else repo / ".git").resolve()
+    lock = lock_dir / "worklink-base-fetch.lock"
+    with _FileLock(lock):
+        return _fetch_and_verify_base(repo, base, runner=runner, event_logger=event_logger)
+
+
+def _fetch_and_verify_base(
+    repo: Path,
+    base: str,
+    *,
+    runner: Runner,
+    event_logger: EventLogger | None,
+) -> str:
+    """Repair, fetch and verify while holding the repository's base-fetch lock."""
     _repair_base_alternates(repo, base=base, runner=runner, event_logger=event_logger)
     if not _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger):
         raise RuntimeError(f"base repo fetch failed for origin/{base.removeprefix('origin/')}")
