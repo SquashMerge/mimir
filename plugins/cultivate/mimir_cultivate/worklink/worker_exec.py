@@ -1651,6 +1651,7 @@ def _helper_failure(stdout: bytes) -> str:
 
 
 def _handle_session(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
+    from ..contained_execution import heavy_lock_environment
     from .daemon_config import SESSION_HELPER_TIMEOUT_S, PublishingCredentials, parse_launch_snapshot
     from .daemon_service import PYTHON, UID_HELPER, RuntimePaths, read_json
 
@@ -1699,7 +1700,13 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
     snapshot = parse_launch_snapshot(read_json(paths.snapshot, uid=identities.mimir_uid, mode=0o600))
     if create and snapshot.launch_generation != request["generation"]:
         raise RuntimeError("session launch generation is stale")
-    environment = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+    environment = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
+        # The helper builds shell environments from its own env, not ours.
+        # Forward only validated lease settings, never ambient credentials or
+        # MIMIR_HEAVY_LOCK_HELD (a builder must acquire its own lease).
+        **heavy_lock_environment(),
+    }
     environment.update(PublishingCredentials(snapshot.bot_token, snapshot.publishing_identity).environment())
     if create:
         # Only the launch snapshot, never ambient aliases or caller pass_env,

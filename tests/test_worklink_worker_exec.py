@@ -276,7 +276,50 @@ async def test_session_rpc_carries_checkout_fd_and_bound_handle(tmp_path, monkey
     }]
 
 
-def test_session_executor_clean_exec_uses_only_launch_snapshot(tmp_path, monkeypatch):
+@pytest.fixture(params=[
+    pytest.param(({}, None), id="unset"),
+    pytest.param(({"MIMIR_HEAVY_LOCK_FILE": ""}, None), id="empty"),
+    pytest.param(({"MIMIR_HEAVY_LOCK_TIMEOUT": "bad", "MIMIR_HEAVY_TIER": "bad"}, None),
+                 id="options-without-lock"),
+    pytest.param(({"MIMIR_HEAVY_LOCK_FILE": "/locks/heavy.lock"}, None), id="lock-only"),
+    pytest.param(({"MIMIR_HEAVY_LOCK_FILE": "/locks/heavy.lock",
+                   "MIMIR_HEAVY_LOCK_TIMEOUT": "00060", "MIMIR_HEAVY_TIER": "medium"}, None),
+                 id="full-medium"),
+    pytest.param(({"MIMIR_HEAVY_LOCK_FILE": "/locks/heavy.lock", "MIMIR_HEAVY_TIER": "large"}, None),
+                 id="large"),
+    *[
+        pytest.param(({"MIMIR_HEAVY_LOCK_FILE": value}, "MIMIR_HEAVY_LOCK_FILE"), id=name)
+        for name, value in (
+            ("relative", "heavy.lock"), ("unnormalized", "/locks/../heavy.lock"),
+            ("controller-home", "/home/mimir"), ("controller-child", "/home/mimir/heavy.lock"),
+        )
+    ],
+    *[
+        pytest.param(({"MIMIR_HEAVY_LOCK_FILE": "/locks/heavy.lock", name: value}, name), id=label)
+        for label, name, value in (
+            ("timeout-syntax", "MIMIR_HEAVY_LOCK_TIMEOUT", "60.0"),
+            ("timeout-range", "MIMIR_HEAVY_LOCK_TIMEOUT", "59"),
+            ("timeout-length", "MIMIR_HEAVY_LOCK_TIMEOUT", "100000"),
+            ("tier", "MIMIR_HEAVY_TIER", "small"),
+        )
+    ],
+])
+def session_lease(request, monkeypatch):
+    for name in tuple(os.environ):
+        if name.startswith("MIMIR_HEAVY_"):
+            monkeypatch.delenv(name)
+    lease, invalid = request.param
+    for name, value in lease.items():
+        monkeypatch.setenv(name, value)
+    # Neither lease-bypass hints nor unrelated ambient values may cross exec.
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_HELD", "1")
+    monkeypatch.setenv("MIMIR_HEAVY_UNKNOWN", "not-allowlisted")
+    monkeypatch.setenv("MIMIR_API_KEY", "fixture-controller-secret")
+    monkeypatch.setenv("UNRELATED_CONTROLLER_SETTING", "private")
+    return (lease if lease.get("MIMIR_HEAVY_LOCK_FILE") else {}), invalid
+
+
+def test_session_executor_clean_exec_uses_only_launch_snapshot(tmp_path, monkeypatch, session_lease):
     from mimir_cultivate.worklink import daemon_service
 
     checkout = tmp_path / "checkout"
@@ -299,14 +342,24 @@ def test_session_executor_clean_exec_uses_only_launch_snapshot(tmp_path, monkeyp
                "issue": 41, "attempt": 2, "device": checkout.stat().st_dev, "inode": checkout.stat().st_ino,
                "path": str(checkout), "generation": generation, "request": {}, "timeout_s": 60,
                "pass_env": {}, "git_settings": []}
+    lease, invalid = session_lease
     try:
-        worker_exec._handle_session(connection, request, [fd])
+        if invalid:
+            with pytest.raises(ValueError, match=invalid):
+                worker_exec._handle_session(connection, request, [fd])
+        else:
+            worker_exec._handle_session(connection, request, [fd])
     finally:
         os.close(fd)
+    if invalid:
+        run.assert_not_called()
+        connection.send.assert_not_called()
+        return
     assert run.call_args.args[0] == [daemon_service.UID_HELPER, "worklink", daemon_service.PYTHON,
                                      "-I", "-m", "mimir_cultivate.worklink.daemon_sessions"]
     assert run.call_args.kwargs["env"] == {
         "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "GH_TOKEN": token, "GITHUB_TOKEN": token,
+        **lease,
     }
     assert json.loads(run.call_args.kwargs["input"]) == request
     assert run.call_args.kwargs["cwd"] == "/"
@@ -411,6 +464,28 @@ async def _boundary_create(boundary):
     })
     sid = response["opencode_session_id"]
     return LaunchHandle("opencode_daemon", sid, opencode_session_id=sid, launch_generation=boundary.generation)
+
+
+async def test_session_executor_lease_reaches_builder_environment(session_boundary, session_lease):
+    """Cross worker_exec -> clean helper subprocess -> daemon environment RPC."""
+    boundary = session_boundary
+    lease, invalid = session_lease
+    if invalid:
+        with pytest.raises(RuntimeError, match=invalid):
+            await _boundary_create(boundary)
+        assert not boundary.daemon.sessions
+        assert not list(boundary.records.iterdir())
+        return
+
+    handle = await _boundary_create(boundary)
+    try:
+        environment = boundary.daemon.sessions[handle.identifier].environment
+        assert {key: value for key, value in environment.items() if key.startswith("MIMIR_HEAVY_")} == lease
+        for name in ("MIMIR_API_KEY", "UNRELATED_CONTROLLER_SETTING"):
+            assert name not in environment
+    finally:
+        await boundary.client.session_cancel(handle)
+        await boundary.client.session_release(handle)
 
 
 async def test_spawn_factory_crosses_executor_and_retires_before_checkout_cleanup(
