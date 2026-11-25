@@ -111,8 +111,11 @@ def _build_context_helper(host: str = "opencode") -> str:
 
 
 # Tool defaults are explicit; repository declarations take precedence.
-DEFAULT_NEXTEST_VERSION = "0.9.148"
+# GHSA-vc25-qg58-w57c affects cargo-nextest 0.9.125 through 0.9.149.
+DEFAULT_NEXTEST_VERSION = "0.9.150"
 DEFAULT_UV_VERSION = "0.11.0"
+_MAX_TOOL_PIN_FILES = 64
+_MAX_TOOL_PIN_FILE_BYTES = 64 * 1024
 DEFAULT_SAGA_MODELS = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5",
                        "codex-plus": "gpt-5.6-luna", "claude-code": "sonnet"}
 DEFAULT_SAGA_EFFORT = "low"
@@ -661,14 +664,22 @@ def validate_token(token: str, bot: str, slug: str, request=_request) -> None:
             raise SetupError(f"Bot cannot read {label}; enable that fine-grained PAT permission and retry. " + PAT_HELP)
 
 
-def _content(slug: str, branch: str, path: str, token: str, request=_request) -> str | None:
-    status, data = request(f"https://api.github.com/repos/{slug}/contents/{path}?ref={branch}", token)
+def _content(slug: str, branch: str, path: str, token: str, request=_request, *,
+             max_bytes: int | None = None) -> str | None:
+    status, data = request(f"https://api.github.com/repos/{slug}/contents/{quote(path, safe='/')}?ref={quote(branch, safe='')}", token)
     if status == 404:
         return None
     if status != 200 or not isinstance(data, dict) or data.get("encoding") != "base64":
         raise SetupError(f"Cannot read {path} on {branch}; check branch and Contents: Read and write.")
     try:
-        return base64.b64decode(data["content"]).decode("utf-8")
+        # Bound encoded input too, before allocating the decoded file. GitHub
+        # wraps base64 at 60 columns; twice the byte limit allows that overhead.
+        if max_bytes is not None and len(data["content"]) > max_bytes * 2:
+            raise SetupError(f"Tool pin file {path} exceeds the setup size limit.")
+        content = base64.b64decode(data["content"])
+        if max_bytes is not None and len(content) > max_bytes:
+            raise SetupError(f"Tool pin file {path} exceeds the setup size limit.")
+        return content.decode("utf-8")
     except (ValueError, KeyError, UnicodeError):
         raise SetupError(f"Cannot decode {path} from GitHub; check the repository contents.") from None
 
@@ -699,11 +710,41 @@ def detect_toolchain(files: dict[str, str | None]) -> tuple[str, str, str]:
     raise SetupError("No supported toolchain found; add rust-toolchain.toml, package.json or pyproject.toml.")
 
 
-def _verify_script(slug: str, branch: str, token: str, request=_request) -> str | None:
+def _repository_tree(slug: str, branch: str, token: str, request=_request) -> list[dict]:
     status, tree = request(f"https://api.github.com/repos/{slug}/git/trees/{quote(branch, safe='')}?recursive=1", token)
-    if status != 200 or not isinstance(tree, dict) or tree.get("truncated"):
-        raise SetupError("Cannot inspect executable verification scripts; check Contents permission and repository tree size.")
-    executable = {row.get("path") for row in tree.get("tree", [])
+    if (status != 200 or not isinstance(tree, dict) or tree.get("truncated")
+            or not isinstance(tree.get("tree"), list)):
+        raise SetupError("Cannot inspect repository tool pins and executable verification scripts; check Contents permission and repository tree size.")
+    return tree["tree"]
+
+
+def _tool_pin_files(slug: str, branch: str, token: str, tree: list[dict], request=_request) -> dict[str, str]:
+    """Discover CI declarations from one tree listing, never a per-file directory walk."""
+    rows = [row for row in tree if re.fullmatch(
+        r"\.github/(?:workflows/[^/]+\.ya?ml|actions/[^/]+/action\.ya?ml)", row.get("path", ""))]
+    if len(rows) > _MAX_TOOL_PIN_FILES:
+        raise SetupError("Too many workflow/action tool pin files; reduce their count before setup.")
+    # Check all metadata before fetching any file; do not silently skip pins
+    # when the inventory is too large or contains non-regular files.
+    for row in rows:
+        if (row.get("type") != "blob" or row.get("mode") not in {"100644", "100755"}
+                or type(row.get("size")) is not int or not 0 <= row["size"] <= _MAX_TOOL_PIN_FILE_BYTES):
+            raise SetupError("Cannot inspect workflow/action tool pin file; expected a regular file within the setup size limit.")
+    files = {}
+    for row in rows:
+        path = row["path"]
+        text = _content(slug, branch, path, token, request, max_bytes=_MAX_TOOL_PIN_FILE_BYTES)
+        if text is None:
+            raise SetupError(f"Tool pin file {path} disappeared; retry setup.")
+        files[path] = text
+    return files
+
+
+def _verify_script(slug: str, branch: str, token: str, request=_request,
+                   tree: list[dict] | None = None) -> str | None:
+    if tree is None:
+        tree = _repository_tree(slug, branch, token, request)
+    executable = {row.get("path") for row in tree
                   if row.get("type") == "blob" and row.get("mode") == "100755"}
     for path in ("tools/verify", "scripts/verify", "tools/verify.sh", "scripts/verify.sh", "verify", "verify.sh"):
         if path in executable:
@@ -1933,10 +1974,11 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         raise SetupError("Resolved wheels differ from manifest.json for the saved Mimir version; refusing changed release files.")
     identity = _image_identity(mimir_version, wheels, architecture, worklink_host=host)
     files = {name: _content(repo, branch, name, token, request) for name in
-             ("rust-toolchain.toml", "Cargo.toml", "package.json", "pyproject.toml", "uv.lock", ".python-version",
-              ".github/workflows/rust.yml", ".github/workflows/ci.yml")}
+             ("rust-toolchain.toml", "Cargo.toml", "package.json", "pyproject.toml", "uv.lock", ".python-version")}
+    tree = _repository_tree(repo, branch, token, request)
+    files.update(_tool_pin_files(repo, branch, token, tree, request))
     kind, version, suggestion = detect_toolchain(files)
-    suggestion = _verify_script(repo, branch, token, request) or suggestion
+    suggestion = _verify_script(repo, branch, token, request, tree) or suggestion
     nextest_version = _tool_pin(files, "nextest", DEFAULT_NEXTEST_VERSION)
     uv_version = _tool_pin(files, "uv", DEFAULT_UV_VERSION)
     print(f"Detected {kind} {version}; suggested test command: {suggestion}")

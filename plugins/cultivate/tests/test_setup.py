@@ -18,6 +18,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from urllib.parse import unquote, urlsplit
 
 import pytest
 import yaml
@@ -1168,13 +1169,13 @@ def setup_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret')
     monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
     monkeypatch.setattr(installer, '_alert_settings', lambda *a: ('none', None, {}))
-    monkeypatch.setattr(installer, '_content', lambda *a: '{"engines":{"node":"22.16.0"}}' if a[2] == 'package.json' else None)
-    monkeypatch.setattr(installer, '_verify_script', lambda *a: None)
     def docker_exec(argv, **kw):
         kw['stdout'].write(b'owner-key\n')
         return subprocess.CompletedProcess(argv, 0)
     monkeypatch.setattr(installer.subprocess, 'run', docker_exec)
-    state = {'sha': SHA, 'running': False, 'status': 'No Worklink leaf runs or labeled issues.', 'leases': '[]'}
+    state = {'sha': SHA, 'running': False, 'status': 'No Worklink leaf runs or labeled issues.', 'leases': '[]',
+             'repository_files': {'package.json': '{"engines":{"node":"22.16.0"}}'},
+             'requests': [], 'toolchain_builds': []}
     from mimir_cultivate.release_resolver import ReleasePair, Wheel
     def release(version=None, *, architecture="x86_64"):
         selected = version or (VERSION if state['sha'] == SHA else '1.0.1')
@@ -1187,11 +1188,25 @@ def setup_environment(tmp_path, monkeypatch):
     calls = []
 
     def request(url, token):
+        state['requests'].append(url)
+        if '/git/trees/' in url:
+            return 200, {'tree': [
+                {'path': path, 'type': 'blob', 'mode': '100644', 'size': len(text.encode())}
+                for path, text in state['repository_files'].items()
+            ]}
+        if '/contents/' in url:
+            path = unquote(urlsplit(url).path.split('/contents/', 1)[1])
+            text = state['repository_files'].get(path)
+            if text is None:
+                return 404, {}
+            return 200, {'encoding': 'base64', 'content': base64.b64encode(text.encode()).decode()}
         return 200, {'object': {'sha': state['sha']}}
 
     def run(argv, *, cwd):
         assert cwd == deploy
         calls.append(argv)
+        if argv[:2] == ['docker', 'build'] and 'Dockerfile.toolchain' in argv:
+            state['toolchain_builds'].append((deploy / 'Dockerfile.toolchain').read_text())
         if argv[-1] == installer._OPENCODE_DAEMON_PROBE:
             return json.dumps(state.get('daemon_health', {'ok': True, 'daemon_enabled': True}))
         if argv[-1] == installer._CODEX_LOGIN_PROBE:
@@ -2156,7 +2171,7 @@ def test_docker_failure_names_step_without_secrets(tmp_path, monkeypatch, step):
     monkeypatch.setattr(installer, '_verify_script', lambda *a: None)
 
     def request(url, token):
-        return 200, {'object': {'sha': SHA}}
+        return 200, {'tree': []}
 
     def run(argv, *, cwd):
         if argv[-3:] == ['ps', '-q', 'agent']:
@@ -2190,7 +2205,7 @@ def test_image_build_failure_shows_redacted_build_output(tmp_path, monkeypatch, 
     monkeypatch.setattr(installer, '_verify_script', lambda *a: None)
 
     def request(url, token):
-        return 200, {'object': {'sha': SHA}}
+        return 200, {'tree': []}
 
     def run(argv, *, cwd):
         if argv[-3:] == ['ps', '-q', 'agent']:
@@ -2218,19 +2233,166 @@ def test_image_build_failure_shows_redacted_build_output(tmp_path, monkeypatch, 
 
 
 def test_pinned_auxiliary_tools_and_repo_override():
-    files = {".github/workflows/rust.yml": "uses: taiki-e/install-action@v2\nwith:\n  tool: cargo-nextest@0.9.147"}
+    files = {".github/workflows/rust.yml": "uses: taiki-e/install-action@v2\nwith:\n  tool: cargo-nextest@0.9.151"}
     pin = installer._tool_pin(files, "nextest", installer.DEFAULT_NEXTEST_VERSION)
-    assert pin == "0.9.147"
+    assert pin == "0.9.151"
     layer = installer.render_layer("rust", "1.99.1", "root:sha", nextest_version=pin)
-    assert "https://get.nexte.st/0.9.147/$platform" in layer
+    assert "https://get.nexte.st/0.9.151/$platform" in layer
     assert "platform=linux-arm" in layer and "platform=linux" in layer
     assert "cargo install" not in layer and "sh.rustup.rs" not in layer
     assert "/rustup/archive/1.28.2/" in layer
-    assert installer._tool_pin({}, "nextest", installer.DEFAULT_NEXTEST_VERSION) == "0.9.148"
+    assert installer._tool_pin({}, "nextest", installer.DEFAULT_NEXTEST_VERSION) == installer.DEFAULT_NEXTEST_VERSION
     assert "https://astral.sh/uv/" + installer.DEFAULT_UV_VERSION + "/install.sh" in installer.render_layer("python", "3.11.11", "root:sha")
-    files["another"] = "cargo-nextest@0.9.146"
+    files["another"] = "cargo-nextest@0.9.150"
     with pytest.raises(installer.SetupError, match="Conflicting"):
         installer._tool_pin(files, "nextest", installer.DEFAULT_NEXTEST_VERSION)
+
+
+def test_nextest_default_outside_advisory_range():
+    version = tuple(map(int, installer.DEFAULT_NEXTEST_VERSION.split(".")))
+    assert not (0, 9, 125) <= version <= (0, 9, 149), "GHSA-vc25-qg58-w57c"
+    assert version >= (0, 9, 150)
+    assert f"https://get.nexte.st/{installer.DEFAULT_NEXTEST_VERSION}/$platform" in installer.render_layer(
+        "rust", "1.99.1", "root:sha")
+
+
+@pytest.mark.parametrize("path", [
+    ".github/actions/install-nextest/action.yml",
+    ".github/actions/install-nextest/action.yaml",
+    ".github/workflows/release.yml",
+    ".github/workflows/checks.yaml",
+])
+@pytest.mark.parametrize("tool,declaration,pin", [
+    ("nextest", "tool: cargo-nextest@0.9.151", "0.9.151"),
+    ("uv", "uv-version: '0.11.1'", "0.11.1"),
+])
+def test_setup_discovers_tool_pins(setup_environment, path, tool, declaration, pin):
+    deploy, args, state, calls, invoke = setup_environment
+    state["repository_files"] = {
+        "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.1"',
+        path: declaration,
+        # These are not workflow/composite-action declarations.
+        ".github/workflows/nested/ignored.yml": "tool: cargo-nextest@0.9.152",
+        ".github/actions/install-nextest/README.md": "tool: cargo-nextest@0.9.152",
+    }
+    if tool == "uv":
+        state["repository_files"].pop("rust-toolchain.toml")
+        state["repository_files"].update({"pyproject.toml": "[project]", ".python-version": "3.11.11"})
+    invoke()
+    layer = (deploy / "Dockerfile.toolchain").read_text()
+    assert (f"https://get.nexte.st/{pin}/$platform" if tool == "nextest"
+            else f"https://astral.sh/uv/{pin}/install.sh") in layer
+    requests = state["requests"]
+    assert sum("/git/trees/" in url for url in requests) == 1
+    assert sum(f"/contents/{path}?" in url for url in requests) == 1
+    assert not any("/contents/" in url and ("ignored.yml" in url or "README.md" in url) for url in requests)
+
+
+@pytest.mark.parametrize("tool,declarations", [
+    ("nextest", ["cargo-nextest@0.9.150", "cargo-nextest@0.9.151"]),
+    ("uv", ["uv-version: 0.11.0", 'uv-version: "0.11.1"']),
+])
+def test_setup_conflicting_action_workflow_pins_fail_before_build(setup_environment, tool, declarations):
+    deploy, args, state, calls, invoke = setup_environment
+    state["repository_files"].update(dict(zip(
+        [".github/actions/install/action.yml", ".github/workflows/release.yaml"], declarations)))
+    with pytest.raises(installer.SetupError, match=f"Conflicting {tool} version pins"):
+        invoke()
+    assert not calls
+    assert not deploy.exists()
+
+
+@pytest.mark.parametrize("source", ["default", "composite"])
+def test_re_setup_replaces_vulnerable_nextest_layer_and_rebuilds(setup_environment, source):
+    deploy, args, state, calls, invoke = setup_environment
+    action = ".github/actions/install-nextest/action.yml"
+    state["repository_files"] = {
+        "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.1"',
+        action: "tool: cargo-nextest@0.9.148",
+    }
+    invoke()
+    old_layer = (deploy / "Dockerfile.toolchain").read_text()
+    assert "https://get.nexte.st/0.9.148/$platform" in old_layer
+    old_manifest = json.loads((deploy / "manifest.json").read_text())
+    if source == "default":
+        del state["repository_files"][action]
+        pin = installer.DEFAULT_NEXTEST_VERSION
+    else:
+        state["repository_files"][action] = "tool: cargo-nextest@0.9.151"
+        pin = "0.9.151"
+    calls.clear()
+    invoke()
+    new_layer = (deploy / "Dockerfile.toolchain").read_text()
+    assert f"https://get.nexte.st/{pin}/$platform" in new_layer
+    assert "0.9.148" not in new_layer
+    assert state["toolchain_builds"] == [old_layer, new_layer]
+    assert sum(argv[:2] == ["docker", "build"] and "Dockerfile.toolchain" in argv for argv in calls) == 1
+    # Tool pin changes must rebuild even without a Mimir/Rust version change.
+    assert json.loads((deploy / "manifest.json").read_text())["layer_tag"] == old_manifest["layer_tag"]
+
+
+def test_tool_pin_scan_bounds_file_count_before_fetch():
+    def request(*args):
+        pytest.fail("must reject an oversized inventory before fetching files")
+
+    rows = [{"path": f".github/workflows/check-{i}.yml", "type": "blob", "mode": "100644", "size": 0}
+            for i in range(installer._MAX_TOOL_PIN_FILES + 1)]
+    with pytest.raises(installer.SetupError, match="Too many"):
+        installer._tool_pin_files("org/repo", "main", "secret", rows, request)
+
+
+@pytest.mark.parametrize("metadata", [
+    pytest.param({"size": installer._MAX_TOOL_PIN_FILE_BYTES + 1}, id="oversized"),
+    pytest.param({"size": -1}, id="negative-size"),
+    pytest.param({"size": "100"}, id="string-size"),
+    pytest.param({"size": None}, id="missing-size"),
+    pytest.param({"size": True}, id="boolean-size"),
+    pytest.param({"type": "tree"}, id="directory"),
+    pytest.param({"mode": "120000"}, id="symlink"),
+])
+def test_tool_pin_scan_rejects_unsafe_metadata_before_fetch(metadata):
+    row = {"path": ".github/actions/install/action.yml", "type": "blob", "mode": "100644", "size": 0}
+    row.update(metadata)
+    with pytest.raises(installer.SetupError, match="regular file within the setup size limit"):
+        installer._tool_pin_files("org/repo", "main", "secret", [row],
+                                 lambda *args: pytest.fail("unsafe file fetched"))
+
+
+def test_tool_pin_scan_accepts_count_and_size_boundaries():
+    text = "#" * installer._MAX_TOOL_PIN_FILE_BYTES
+    rows = [{"path": f".github/workflows/check-{i}.yaml", "type": "blob", "mode": "100755", "size": len(text)}
+            for i in range(installer._MAX_TOOL_PIN_FILES)]
+    urls = []
+
+    def request(url, token):
+        urls.append(url)
+        return 200, {"encoding": "base64", "content": base64.encodebytes(text.encode()).decode()}
+
+    files = installer._tool_pin_files("org/repo", "feature/test", "secret", rows, request)
+    assert len(files) == len(urls) == installer._MAX_TOOL_PIN_FILES
+    assert set(files.values()) == {text}
+    assert all(url.endswith("?ref=feature%2Ftest") for url in urls)
+
+
+@pytest.mark.parametrize("response", ["missing", "oversized", "encoded-oversized"])
+def test_tool_pin_scan_refuses_changed_file_instead_of_default(response):
+    row = {"path": ".github/actions/install/action.yaml", "type": "blob", "mode": "100644", "size": 1}
+    if response == "missing":
+        result = (404, {})
+    else:
+        content = (base64.b64encode(b"x" * (installer._MAX_TOOL_PIN_FILE_BYTES + 1)).decode()
+                   if response == "oversized" else " " * (installer._MAX_TOOL_PIN_FILE_BYTES * 2 + 1))
+        result = (200, {"encoding": "base64", "content": content})
+    with pytest.raises(installer.SetupError, match="disappeared|size limit"):
+        installer._tool_pin_files("org/repo", "main", "secret", [row], lambda *args: result)
+
+
+@pytest.mark.parametrize("status,tree", [
+    (403, {"tree": []}), (200, []), (200, {"tree": [], "truncated": True}), (200, {}), (200, {"tree": {}}),
+])
+def test_tool_pin_inventory_fails_closed(status, tree):
+    with pytest.raises(installer.SetupError, match="Cannot inspect repository tool pins"):
+        installer._repository_tree("org/repo", "main", "secret", lambda *args: (status, tree))
 
 
 @pytest.mark.parametrize("path", ["tools/verify", "scripts/verify", "tools/verify.sh", "scripts/verify.sh"])
