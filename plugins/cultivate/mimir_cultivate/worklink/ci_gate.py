@@ -143,14 +143,28 @@ def _actions_job(run: Runner, repo: str, sha: str, check: Mapping) -> int:
     return job_id
 
 
-def _snapshot(run: Runner, repo: str, pr_url: str, sha: str) -> CIResult:
+def _snapshot(
+    run: Runner, repo: str, pr_url: str, sha: str, *,
+    previous_sha: str | None = None, settle_deadline: float = 0,
+) -> CIResult:
     if not _SHA.fullmatch(sha) or not _SLUG.fullmatch(repo):
         raise RuntimeError("invalid CI repository or pushed head")
     match = _PR.fullmatch(pr_url)
     if match is None or match[1].casefold() != repo.casefold():
         raise RuntimeError("CI PR repository does not match pushed head repository")
-    if _head(run, pr_url) != sha:
+
+    def head_change() -> CIResult | None:
+        head = _head(run, pr_url)
+        if head == sha:
+            return None
+        # Only the head replaced by our own push can be propagation lag.
+        # Check the absolute deadline on every read, including within a poll.
+        if head == previous_sha and time.monotonic() < settle_deadline:
+            return CIResult("pending", "PR head push has not yet propagated")
         return CIResult("moved", "PR head moved by another actor")
+
+    if changed := head_change():
+        return changed
     pages = _json(run, ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"])
     status_pages = _json(run, ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/commits/{sha}/statuses?per_page=100"])
     if not isinstance(pages, list) or not pages or not isinstance(status_pages, list) or not status_pages:
@@ -175,8 +189,8 @@ def _snapshot(run: Runner, repo: str, pr_url: str, sha: str) -> CIResult:
             if row["context"] not in seen:
                 statuses.append(row)
                 seen.add(row["context"])
-    if _head(run, pr_url) != sha:
-        return CIResult("moved", "PR head moved by another actor")
+    if changed := head_change():
+        return changed
     blocker = approval_blocker({"check_runs": checks, "total_count": len(checks)}, {"statuses": statuses})
     if blocker and not blocker.startswith("CI checks not green:") and blocker != "no CI checks or commit statuses exist on this head":
         raise RuntimeError(blocker)
@@ -211,8 +225,8 @@ def _snapshot(run: Runner, repo: str, pr_url: str, sha: str) -> CIResult:
             excerpts.append(f"{label}: CI log limitation: verified Actions job evidence unavailable")
     if len(failed) > 3:
         excerpts.append("CI log limitation: additional failed jobs omitted")
-    if _head(run, pr_url) != sha:
-        return CIResult("moved", "PR head moved by another actor")
+    if changed := head_change():
+        return changed
     # Keep these explicitly delimited as data when inserted into a repair prompt.
     excerpt = json.dumps("\n".join(excerpts)[:3800], ensure_ascii=False)[:4000]
     return CIResult("infrastructure" if infrastructure else "red", blocker, names, excerpt, tuple(dict.fromkeys(ids)))
@@ -220,9 +234,11 @@ def _snapshot(run: Runner, repo: str, pr_url: str, sha: str) -> CIResult:
 
 async def wait_for_ci(
     run: Runner, repo: str, pr_url: str, sha: str, *, timeout_s: int,
-    stopped: Callable[[], bool], poll_s: float = 10,
+    stopped: Callable[[], bool], poll_s: float = 10, previous_sha: str | None = None,
 ) -> CIResult:
-    deadline = time.monotonic() + timeout_s
+    started = time.monotonic()
+    deadline = started + timeout_s
+    settle_deadline = started + 120 if previous_sha is not None else 0
     latest = CIResult("pending", "CI checks have not appeared")
     transient_failures = 0
     unobserved = f"CI was not observed for {pr_url} at head {sha}: "
@@ -230,7 +246,10 @@ async def wait_for_ci(
         if stopped():
             return CIResult("stopped", "stopped by operator", latest.checks)
         try:
-            latest = await asyncio.to_thread(_snapshot, run, repo, pr_url, sha)
+            latest = await asyncio.to_thread(
+                _snapshot, run, repo, pr_url, sha,
+                previous_sha=previous_sha, settle_deadline=settle_deadline,
+            )
         except _TransientForgeReadError as exc:
             transient_failures += 1
             reason = (
