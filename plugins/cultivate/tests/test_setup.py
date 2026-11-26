@@ -1274,6 +1274,313 @@ def upgrade_setup(setup_environment):
     return deploy, args, state, calls, invoke
 
 
+def _deployment_snapshot(deploy):
+    return {
+        path.relative_to(deploy).as_posix(): (
+            hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mode & 0o777,
+        )
+        for path in deploy.rglob("*") if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("failure", [
+    "env", "worklink", "lease", "wheel", "resources", "previous-image", "previous-image-hash", "dockerignore",
+])
+def test_upgrade_preflight_failure_is_byte_identical_and_retryable(upgrade_setup, monkeypatch, failure):
+    deploy, args, state, calls, invoke = upgrade_setup
+    args.mimir_version = "1.0.1"
+    (deploy / "operator-marker").write_bytes(b"preserve operator data\n")
+    repair = lambda: None
+    if failure == "env":
+        args.bot_email = "different@example.com"
+        repair = lambda: setattr(args, "bot_email", "bot@example.com")
+        message = "conflicts on GH_USER_EMAIL"
+    elif failure == "worklink":
+        state["status"] = "ISSUE  STATE  ATTEMPT\n42 running 1"
+        repair = lambda: state.update(status="No Worklink leaf runs or labeled issues.")
+        message = "Agent is busy"
+    elif failure == "lease":
+        state["leases"] = '["org/repo#17"]'
+        repair = lambda: state.update(leases="[]")
+        message = "Agent is busy"
+    elif failure == "wheel":
+        # The second wheel must be checked before writing the missing first one.
+        release = installer.resolve_release("1.0.1")
+        path = deploy / "wheels" / release.cultivate.filename
+        path.write_bytes(b"tampered")
+        repair = path.unlink
+        message = "Deployment wheel differs"
+    elif failure == "resources":
+        import mimir.plugin_dockerfile as dockerfile
+        original = dockerfile.build_pypi_context
+        def invalid(*a, **kw):
+            raise ValueError("invalid wheel resources")
+        monkeypatch.setattr(dockerfile, "build_pypi_context", invalid)
+        repair = lambda: monkeypatch.setattr(dockerfile, "build_pypi_context", original)
+        message = "Cannot assemble verified wheel"
+    elif failure == "dockerignore":
+        path = deploy / ".dockerignore"
+        original = path.read_bytes()
+        path.write_text("operator-edited\n")
+        repair = lambda: path.write_bytes(original)
+        message = "already differs"
+    else:
+        path = deploy / "build.sh"
+        original = path.read_bytes()
+        if failure == "previous-image-hash":
+            manifest = json.loads((deploy / "manifest.json").read_text())
+            path.write_bytes(original.replace(manifest["wheels"]["mimir-agent"]["sha256"].encode(), b"0" * 64))
+        else:
+            path.write_text("unrecognized previous image\n")
+        repair = lambda: path.write_bytes(original)
+        message = "Cannot identify previous agent image"
+    before = _deployment_snapshot(deploy)
+    writes = []
+    original_write = installer._write
+    original_bytes = Path.write_bytes
+    def write(path, *a, **kw):
+        writes.append(path)
+        return original_write(path, *a, **kw)
+    def write_bytes(path, *a, **kw):
+        if path.is_relative_to(deploy):
+            writes.append(path)
+        return original_bytes(path, *a, **kw)
+    with monkeypatch.context() as guarded:
+        guarded.setattr(installer, "_write", write)
+        guarded.setattr(Path, "write_bytes", write_bytes)
+        with pytest.raises(installer.SetupError, match=message):
+            invoke()
+    assert _deployment_snapshot(deploy) == before
+    assert writes == [], "preflight refusal must not write, even temporarily"
+    assert not any(argv[:2] == ["docker", "build"] or argv[-2:] == ["stop", "agent"] for argv in calls)
+    repair()
+    calls.clear()
+    invoke()
+    assert not args.force
+    assert json.loads((deploy / "manifest.json").read_text())["mimir_version"] == "1.0.1"
+    assert sum(argv[:2] == ["docker", "build"] for argv in calls) == 2
+
+
+@pytest.mark.parametrize("stored,requested", [
+    ("org/repo", "Org/Repo"), ("Org/Repo", "org/repo"),
+    ("org/repo", "other/repo"),
+])
+def test_upgrade_repo_slug_comparison(upgrade_setup, stored, requested):
+    deploy, args, state, calls, invoke = upgrade_setup
+    path = deploy / "compose.env"
+    path.write_text(path.read_text().replace("GITHUB_REPOS=org/repo", "GITHUB_REPOS=" + stored))
+    before = _deployment_snapshot(deploy)
+    args.repo = requested
+    args.mimir_version = "1.0.1"
+    if stored.lower() != requested.lower():
+        with pytest.raises(installer.SetupError, match="conflicts on GITHUB_REPOS"):
+            invoke()
+        assert _deployment_snapshot(deploy) == before
+        args.repo = stored
+    invoke()
+    assert "GITHUB_REPOS=" + stored + "\n" in path.read_text()
+    assert json.loads((deploy / "manifest.json").read_text())["slug"] == stored.lower()
+
+
+@pytest.mark.parametrize("failure", ["build", "init", "provision", "up"])
+def test_upgrade_late_failure_restores_files_and_allows_corrected_retry(upgrade_setup, monkeypatch, failure):
+    deploy, args, state, calls, invoke = upgrade_setup
+    args.mimir_version = "1.0.1"
+    args.rotate_web_key = True
+    (deploy / "owner-web-key").write_bytes(b"original-owner-key\n")
+    before = _deployment_snapshot(deploy)
+    directory_modes = {path: path.stat().st_mode & 0o777 for path in (deploy, deploy / "wheels")}
+    original_setup = installer._setup
+    def failing_setup(args, **kw):
+        run = kw["run"]
+        def fail_step(argv, **options):
+            matches = {
+                "build": argv[:2] == ["docker", "build"],
+                "init": argv[-2:] == ["--rm", "init"],
+                "provision": "compose.provision.yml" in argv,
+                "up": argv[-3:] == ["up", "-d", "agent"],
+            }
+            if matches[failure]:
+                raise installer.SetupError("deliberate failure")
+            return run(argv, **options)
+        return original_setup(args, **(kw | {"run": fail_step}))
+    with monkeypatch.context() as guarded:
+        guarded.setattr(installer, "_setup", failing_setup)
+        with pytest.raises(installer.SetupError, match="Docker .* failed"):
+            invoke()
+    assert _deployment_snapshot(deploy) == before
+    assert {path: path.stat().st_mode & 0o777 for path in directory_modes} == directory_modes
+    assert installer._previous_image(deploy, json.loads((deploy / "manifest.json").read_text()))
+    if failure == "provision":
+        assert state["running"]
+        stop = calls.index(["docker", "compose", "stop", "agent"])
+        start = calls.index(["docker", "compose", "start", "agent"])
+        assert stop < start
+        assert not any(argv[-3:] == ["up", "-d", "agent"] for argv in calls)
+    invoke()
+    assert json.loads((deploy / "manifest.json").read_text())["mimir_version"] == "1.0.1"
+
+
+@pytest.mark.parametrize("failure", ["daemon", "container", "key", "verification"])
+def test_upgrade_post_replacement_failure_keeps_new_files(upgrade_setup, monkeypatch, capsys, failure):
+    deploy, args, state, calls, invoke = upgrade_setup
+    old_manifest = json.loads((deploy / "manifest.json").read_text())
+    verified_before = len(state["verified"])
+    args.mimir_version = "1.0.1"
+    args.rotate_web_key = failure in {"container", "key"}
+    capsys.readouterr()
+    original_setup = installer._setup
+    original_copy = installer.shutil.copy2
+    restored = []
+    at_failure = {}
+    def copy(source, destination, *a, **kw):
+        if Path(destination).is_relative_to(deploy):
+            restored.append(Path(destination))
+        return original_copy(source, destination, *a, **kw)
+    def refuse(message):
+        at_failure.update(_deployment_snapshot(deploy))
+        # The hint must precede readiness, key retrieval, and verification.
+        assert "image: " + old_manifest["layer_tag"] in capsys.readouterr().out
+        raise installer.SetupError(message)
+    def failing_setup(args, **kw):
+        run = kw["run"]
+        def fail_after_up(argv, **options):
+            if failure == "daemon" and argv[-1] == installer._OPENCODE_DAEMON_PROBE:
+                refuse("deliberate daemon failure")
+            if failure == "container" and argv[-3:] == ["ps", "-q", "agent"] and any(
+                    call[-3:] == ["up", "-d", "agent"] for call in calls):
+                # Return an invalid id to exercise the production refusal.
+                at_failure.update(_deployment_snapshot(deploy))
+                assert "image: " + old_manifest["layer_tag"] in capsys.readouterr().out
+                return ""
+            return run(argv, **options)
+        def fail_verify(*a, **options):
+            refuse("deliberate verification failure")
+        return original_setup(args, **(kw | {"run": fail_after_up,
+                                             **({"verify": fail_verify} if failure == "verification" else {})}))
+    def fail_key(argv, **kw):
+        kw["stdout"].write(b"partial-new-key\n")
+        at_failure.update(_deployment_snapshot(deploy))
+        assert "image: " + old_manifest["layer_tag"] in capsys.readouterr().out
+        return subprocess.CompletedProcess(argv, 1)
+    with monkeypatch.context() as guarded:
+        guarded.setattr(installer, "_setup", failing_setup)
+        guarded.setattr(installer.shutil, "copy2", copy)
+        if failure == "key":
+            guarded.setattr(installer.subprocess, "run", fail_key)
+        with pytest.raises(installer.SetupError, match={
+            "daemon": "deliberate daemon failure", "container": "Cannot locate running agent",
+            "key": "Could not retrieve owner web key", "verification": "deliberate verification failure",
+        }[failure]):
+            invoke()
+    assert state["running"]
+    assert any(argv[-3:] == ["up", "-d", "agent"] for argv in calls)
+    assert restored == []
+    after = _deployment_snapshot(deploy)
+    # Key IO is buffered until the fake subprocess returns; it is deliberately
+    # incomplete here, but must not be restored to the previous key either.
+    if failure == "key":
+        assert (deploy / "owner-web-key").read_bytes() == b"partial-new-key\n"
+        at_failure.pop("owner-web-key")
+        after.pop("owner-web-key")
+    assert after == at_failure
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["mimir_version"] == "1.0.1"
+    assert manifest["layer_tag"] != old_manifest["layer_tag"]
+    assert yaml.safe_load((deploy / "compose.yml").read_text())["services"]["agent"]["image"] == manifest["layer_tag"]
+    assert len(state["verified"]) == verified_before
+
+
+@pytest.mark.parametrize("failure", ["copy", "unlink", "chmod", "rmdir"])
+def test_deployment_restore_is_best_effort_and_preserves_original(tmp_path, monkeypatch, failure):
+    deploy = tmp_path / "deploy"
+    deploy.mkdir(mode=0o700)
+    first = deploy / "first"
+    last = deploy / "last"
+    first.write_bytes(b"old-first")
+    last.write_bytes(b"old-last")
+    first.chmod(0o640)
+    last.chmod(0o600)
+    missing = deploy / "created"
+    directory = deploy / "created-directory"
+    paths = [first, missing, last]
+    directories = [deploy, directory]
+    error = installer.SetupError("original setup failure")
+    original_copy = installer.shutil.copy2
+    original_unlink = Path.unlink
+    original_chmod = Path.chmod
+    def copy(source, destination, *a, **kw):
+        if failure == "copy" and Path(destination) == first:
+            raise OSError("restore copy failed")
+        return original_copy(source, destination, *a, **kw)
+    def unlink(path, *a, **kw):
+        if failure == "unlink" and path == missing:
+            raise OSError("restore unlink failed")
+        return original_unlink(path, *a, **kw)
+    def chmod(path, *a, **kw):
+        if failure == "chmod" and path == directory:
+            raise OSError("restore chmod failed")
+        return original_chmod(path, *a, **kw)
+    if failure == "chmod":
+        directory.mkdir(mode=0o700)
+    with pytest.raises(installer.SetupError, match="original setup failure.*File rollback incomplete") as caught:
+        with installer._deployment_update(deploy, paths, directories):
+            first.write_bytes(b"new-first")
+            last.write_bytes(b"new-last")
+            first.chmod(0o600)
+            last.chmod(0o644)
+            missing.write_bytes(b"new-file")
+            deploy.chmod(0o755)
+            if failure == "rmdir":
+                directory.mkdir()
+                (directory / "external-data").write_bytes(b"preserve")
+            monkeypatch.setattr(installer.shutil, "copy2", copy)
+            monkeypatch.setattr(Path, "unlink", unlink)
+            monkeypatch.setattr(Path, "chmod", chmod)
+            raise error
+    assert caught.value is error
+    failed_path = {"copy": first, "unlink": missing, "chmod": directory, "rmdir": directory}[failure]
+    assert str(failed_path) in str(error)
+    assert last.read_bytes() == b"old-last"
+    assert last.stat().st_mode & 0o777 == 0o600
+    assert deploy.stat().st_mode & 0o777 == 0o700
+    if failure != "copy":
+        assert first.read_bytes() == b"old-first"
+        assert first.stat().st_mode & 0o777 == 0o640
+    if failure != "unlink":
+        assert not missing.exists()
+    if failure == "rmdir":
+        assert (directory / "external-data").read_bytes() == b"preserve"
+
+
+@pytest.mark.parametrize("name", [
+    "Dockerfile.toolchain", "compose.env", ".dockerignore", "manifest.json",
+    "owner-web-key", "wheels", "wheel",
+])
+def test_upgrade_refuses_symlink_before_writes(upgrade_setup, monkeypatch, name):
+    deploy, args, state, calls, invoke = upgrade_setup
+    args.mimir_version = "1.0.1"
+    if name == "wheel":
+        wheel = installer.resolve_release("1.0.1").cultivate
+        name = "wheels/" + wheel.filename
+        (deploy / name).write_bytes(wheel.data)
+    path = deploy / name
+    target = deploy.parent / ("saved-" + name.replace("/", "-"))
+    path.rename(target)
+    path.symlink_to(target)
+    before = _deployment_snapshot(deploy)
+    with monkeypatch.context() as guarded:
+        guarded.setattr(installer, "_write", lambda *a, **kw: pytest.fail("write before path rejection"))
+        with pytest.raises(installer.SetupError, match="regular file|non-regular|real directory"):
+            invoke()
+    assert _deployment_snapshot(deploy) == before
+    assert path.is_symlink()
+    path.unlink()
+    target.rename(path)
+    invoke()
+    assert json.loads((deploy / "manifest.json").read_text())["mimir_version"] == "1.0.1"
+
+
 def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrade_setup, capsys):
     deploy, args, state, calls, invoke = upgrade_setup
     old = SHA
