@@ -2218,6 +2218,7 @@ class WorklinkRunner:
             else:
                 ci_reason = ""
                 rerun_heads: set[str] = set()
+                previous_sha: str | None = None
                 while True:
                     save_run_state(self.home, WorklinkRunState(
                         issue_id=issue.issue_id, attempt=attempt, backend=selected_name,
@@ -2233,7 +2234,10 @@ class WorklinkRunner:
                         runner, repo_slug, pr_url, sha,
                         timeout_s=config.defaults.ci_wait_timeout_s,
                         stopped=lambda: operator_stop_requested(self.home, issue.issue_id, attempt),
+                        previous_sha=previous_sha,
                     )
+                    # A rerun on this head must not restart the propagation window.
+                    previous_sha = None
                     if ci_result.outcome == "infrastructure":
                         if sha not in rerun_heads:
                             rerun_heads.add(sha)
@@ -2349,6 +2353,7 @@ class WorklinkRunner:
                             break
                         _git_push(lease.path, lease.branch, runner=runner, publication=publication)
                         validation = _with_head_sha(validation, lease.path, runner=runner, publication=publication)
+                        previous_sha = sha
                         sha = validation.evidence.head_sha
                         if not sha:
                             ci_reason = "repair pushed head could not be resolved"
