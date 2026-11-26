@@ -44,6 +44,14 @@ def add_argparse(
     status_p.add_argument("issue_ids", type=int, nargs="*", help="Optional issue ids to inspect.")
     status_p.add_argument("--home", type=Path, default=None, help="Agent home.")
 
+    describe_p = worklink_sub.add_parser("config-describe", help="Show effective operator overrides.")
+    describe_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
+    grant_p = worklink_sub.add_parser("grant-attempt", help="Grant one extra attempt to an exhausted leaf.")
+    grant_p.add_argument("issue_id", type=int)
+    grant_p.add_argument("--reason", required=True, help="Why the operator is granting another attempt.")
+    grant_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
     stop_p = worklink_sub.add_parser("stop", help="Safely stop one live leaf Worklink run.")
     stop_p.add_argument("issue_id", type=int, help="Chainlink issue id to stop.")
     stop_p.add_argument("--home", type=Path, default=None, help="Agent home.")
@@ -185,6 +193,12 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.worklink_action == "status":
         return _status(args)
 
+    if args.worklink_action == "config-describe":
+        return _config_describe(args)
+
+    if args.worklink_action == "grant-attempt":
+        return _grant_attempt(args)
+
     if args.worklink_action == "stop":
         return _stop(args)
 
@@ -312,6 +326,57 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if result.evidence_path:
         print(f"evidence: {result.evidence_path}")
     return 0 if result.status in {"completed", "blocked"} else 1
+
+
+def _config_describe(args: argparse.Namespace) -> int:
+    from .worklink.backends.registry import WorklinkConfig
+
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    try:
+        config = WorklinkConfig.load(home / "worklink.yaml")
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not config.operator_overrides:
+        print("No worklink.local.yaml overrides.")
+    for key, value in sorted(config.operator_overrides.items()):
+        print(f"{key} = {json.dumps(value)} (from worklink.local.yaml)")
+    return 0
+
+
+def _grant_attempt(args: argparse.Namespace) -> int:
+    from mimir.event_logger import init_logger
+    from .worklink.autonomy import chainlink_bin
+    from .worklink.backends.registry import WorklinkConfig
+    from .worklink.claims import ChainlinkClaims, _CLAIM_CRITICAL_SECTION
+    from .worklink.control import _claim_mutex, _runner
+    from .worklink.factory_state import factory_issue_resource_lock
+
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    run, binary = _runner(home), chainlink_bin()
+    try:
+        config = WorklinkConfig.load(home / "worklink.yaml")
+        init_logger(home / "logs/events.jsonl", session_id=f"worklink-grant-{args.issue_id}")
+        with factory_issue_resource_lock(home, args.issue_id) as acquired:
+            if not acquired:
+                raise ValueError("issue has a live controller")
+            with _claim_mutex(home):
+                _require_incident_quiescent(home, args.issue_id, run, binary)
+                claims = ChainlinkClaims(
+                    agent_id="operator", chainlink_bin=binary, runner=run, home_path=home,
+                    max_attempts=config.defaults.max_claim_attempts,
+                    event_logger=log_durable_event_sync,
+                )
+                token = _CLAIM_CRITICAL_SECTION.set(True)
+                try:
+                    count = claims.grant_attempt(args.issue_id, reason=args.reason)
+                finally:
+                    _CLAIM_CRITICAL_SECTION.reset(token)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        print(f"grant-attempt refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"worklink #{args.issue_id}: one extra attempt granted ({count} grants in this generation)")
+    return 0
 
 
 def _status(args: argparse.Namespace) -> int:

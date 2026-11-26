@@ -594,6 +594,91 @@ above configures the Mimir process. Omitted keys use the defaults below.
 | `compute_backends` | mapping | `{}` | Configures compute substrates; the sole shipping substrate accepts an empty block only. | `compute_backends: {local_subprocess: {}}` |
 | `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "2.3.0", smoke: "opencode --version"}]` |
 
+### Cultivate operator overrides
+
+Prefer `<MIMIR_HOME>/worklink.local.yaml` over hand-editing setup-owned
+`worklink.yaml`. The optional overlay is operator-owned: setup never writes or
+deletes it, and never includes it in generated-file edit detection. Setup still
+refuses hand edits to `worklink.yaml`, and validates the effective configuration.
+Homes without an overlay keep their existing behavior.
+
+Only these keys are allowed:
+
+- `defaults.timeout_s`, `defaults.reaper_ttl_s`, `defaults.max_claim_attempts`,
+  `defaults.ci_wait_timeout_s`, and `defaults.max_concurrent`: positive integers
+  overriding the generated values.
+- `backends.<name>.bash_allowlist_extra`: a list appended to that backend's
+  configured (or derived) allowlist. Supported allowlist backends are `opencode`
+  and `claude_code`; entries use each backend's existing permission grammar.
+  Catch-all OpenCode `*` rules remain forbidden.
+
+```yaml
+# worklink.local.yaml
+defaults:
+  timeout_s: 7200
+  reaper_ttl_s: 86400
+  max_concurrent: 3
+  ci_wait_timeout_s: 7200
+backends:
+  opencode:
+    bash_allowlist_extra:
+      - "npm *"
+      - "npx *"
+```
+
+Every other key is an error, not an unrestricted YAML merge. Effective values
+must satisfy all config invariants, including `reaper_ttl_s >= 2 * timeout_s`
+and `factory_resumable_retention_s >= reaper_ttl_s`. Invalid overrides fail
+loading with an error naming `worklink.local.yaml`; unlike legacy base configs,
+an overlay's unsafe reaper TTL is not silently raised.
+
+Run `mimir worklink config-describe --home /path/to/home` to validate and display
+each overridden key, its effective value, and its `worklink.local.yaml` source.
+For `bash_allowlist_extra`, the display shows the complete appended allowlist.
+Restart/reload the deployment through the normal operator procedure after
+changing settings that a running process has already loaded.
+
+To migrate existing hand edits:
+
+1. Back up both the edited `worklink.yaml` and the last setup-written version.
+2. Move the supported default changes into `worklink.local.yaml`. For allowlist
+   changes, list only the additional rules under `bash_allowlist_extra`; the
+   generated rules are retained. Unsupported edits cannot be migrated through
+   this closed overlay surface.
+3. Restore `worklink.yaml` byte-for-byte from the setup-written backup, including
+   comments/formatting (and matching setup's recorded digest).
+4. Run `config-describe`, then re-run `mimir cultivate setup` without `--force`.
+   The overlay remains intact. Do not use `--force` as a substitute for migrating
+   operator changes; it replaces the generated file.
+
+### Granting one leaf another attempt
+
+Prefer a per-leaf grant over increasing deployment-wide `max_claim_attempts`
+when only one exhausted leaf needs another try:
+
+```bash
+mimir worklink grant-attempt 1131 --reason "Infrastructure fault consumed the last attempt" --home /path/to/home
+```
+
+The command refuses running leaves (including active claims/controllers or
+uncertain retained-worker liveness), epics, and leaves that still have an
+ordinary or already-granted attempt available. Each successful invocation
+authorizes exactly the next claim ordinal for that leaf, even if historical
+usage already exceeds today's configured limit. Once used, another invocation
+can grant one more. Grants do not raise the global limit or reset history.
+
+Every grant records the reason and a shared grant ID in a durable
+`worklink_attempt_granted` event and a `WORKLINK_ATTEMPT_GRANTED` Chainlink
+comment before activating operator-owned state under
+`state/worklink/attempt-grants/`. Bare comments cannot authorize grants; keep
+this state with the home and do not hand-edit it. Audit failure leaves the
+allowance unchanged. Legacy claim resets start a new generation and invalidate
+unused grants from the old generation.
+
+Granting changes no labels, retained state, or incident holds. Resolve the
+underlying fault, clear any incident through the existing operator recovery
+procedure, and re-promote the leaf to `worklink:ready` when appropriate.
+
 ### Repository Inventory
 
 The neutral repository and file-root inventory lives in

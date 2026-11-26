@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -273,14 +273,39 @@ class WorklinkConfig:
     tool_pins: tuple[ToolPin, ...] = ()
     publication: WorklinkPublication = field(default_factory=WorklinkPublication)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
+    operator_overrides: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "WorklinkConfig":
-        if not path.exists():
+        local_path = path.with_name("worklink.local.yaml")
+        if not path.exists() and not local_path.exists():
             return cls()
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data = data or {}
         if not isinstance(data, dict):
             raise ValueError("worklink config root must be a mapping")
+        if not local_path.exists():
+            return cls._from_data(path, data)
+        try:
+            overlay = yaml.safe_load(local_path.read_text(encoding="utf-8"))
+            overrides = _merge_operator_overlay(data, {} if overlay is None else overlay)
+            config = cls._from_data(path, data, strict=True)
+            # Validate appended rules at load time, using the same backend-specific
+            # validators as the registry, not a second permission grammar.
+            for name in (overlay or {}).get("backends", {}):
+                if f"backends.{name}.bash_allowlist_extra" not in overrides:
+                    continue
+                settings = config.backend_settings[name]
+                if name == "opencode":
+                    BackendRegistry._build_opencode(settings, test_command=config.defaults.test_command)
+                else:
+                    BackendRegistry._build_claude_code(settings, test_command=config.defaults.test_command)
+            return replace(config, operator_overrides=overrides)
+        except (ValueError, TypeError, yaml.YAMLError) as exc:
+            raise ValueError(f"{local_path}: {exc}") from exc
+
+    @classmethod
+    def _from_data(cls, path: Path, data: dict[str, Any], *, strict: bool = False) -> "WorklinkConfig":
         publication_data = data.get("publication", {})
         if not isinstance(publication_data, dict):
             raise ValueError("worklink publication must be a mapping")
@@ -307,8 +332,8 @@ class WorklinkConfig:
             default=WorklinkDefaults.reaper_ttl_s,
         )
         required_reaper_ttl_s = minimum_reaper_ttl_s(timeout_s)
-        reaper_ttl_s = max(configured_reaper_ttl_s, required_reaper_ttl_s)
-        if configured_reaper_ttl_s < required_reaper_ttl_s:
+        reaper_ttl_s = configured_reaper_ttl_s if strict else max(configured_reaper_ttl_s, required_reaper_ttl_s)
+        if not strict and configured_reaper_ttl_s < required_reaper_ttl_s:
             log.warning(
                 "Worklink config %s sets defaults.reaper_ttl_s=%s below the safe floor %s; "
                 "using %s for compatibility. Update defaults.reaper_ttl_s to at least %s.",
@@ -511,6 +536,65 @@ class WorklinkConfig:
                 f"runs. Ask the operator to review this configuration."
             )
         return True, None
+
+
+_OVERLAY_DEFAULTS = frozenset({
+    "timeout_s", "reaper_ttl_s", "max_claim_attempts", "ci_wait_timeout_s", "max_concurrent",
+})
+
+
+def _merge_operator_overlay(data: dict[str, Any], overlay: Any) -> dict[str, Any]:
+    """Apply only the operator tuning surface; never permit arbitrary deep merge."""
+    if not isinstance(overlay, dict):
+        raise ValueError("overlay root must be a mapping")
+    overrides: dict[str, Any] = {}
+    for section, values in overlay.items():
+        if section not in {"defaults", "backends"}:
+            raise ValueError(f"unknown overlay key: {section}")
+        if not isinstance(values, dict):
+            raise ValueError(f"{section} must be a mapping")
+        if section == "defaults":
+            defaults = dict(_expect_mapping(data.get("defaults"), "worklink defaults"))
+            for key, value in values.items():
+                if key not in _OVERLAY_DEFAULTS:
+                    raise ValueError(f"unknown overlay key: defaults.{key}")
+                if type(value) is not int or value <= 0:
+                    raise ValueError(f"defaults.{key} must be a positive integer")
+                defaults[key] = value
+                overrides[f"defaults.{key}"] = value
+            data["defaults"] = defaults
+            continue
+        backends = dict(_expect_mapping(data.get("backends"), "worklink backends"))
+        for name, settings in values.items():
+            if not isinstance(settings, dict):
+                raise ValueError(f"backends.{name} must be a mapping")
+            for key in settings:
+                if key != "bash_allowlist_extra":
+                    raise ValueError(f"unknown overlay key: backends.{name}.{key}")
+            if name not in {"opencode", "claude_code"}:
+                raise ValueError(f"unknown overlay key: backends.{name} (backend has no bash allowlist)")
+            if "bash_allowlist_extra" not in settings:
+                continue
+            extra = settings["bash_allowlist_extra"]
+            if not isinstance(extra, list) or not all(isinstance(rule, str) and rule for rule in extra):
+                raise ValueError(f"backends.{name}.bash_allowlist_extra must be a list of non-empty strings")
+            backend = dict(_expect_mapping(backends.get(name), f"backends.{name}"))
+            requested = backend.get("bash_allowlist")
+            if requested is None and "bash_allowlist" not in backend:
+                command = (data.get("defaults") or {}).get("test_command", WorklinkDefaults.test_command)
+                if name == "claude_code":
+                    from ...claude_code import bash_rules
+
+                    requested = list(bash_rules(command))
+                else:
+                    requested = list(_derive_bash_allowlist(command))
+            if not isinstance(requested, list):
+                raise ValueError(f"backends.{name}.bash_allowlist must be a list")
+            backend["bash_allowlist"] = [*requested, *extra]
+            backends[name] = backend
+            overrides[f"backends.{name}.bash_allowlist_extra"] = backend["bash_allowlist"]
+        data["backends"] = backends
+    return overrides
 
 
 def _non_negative_int(value: Any, *, default: int) -> int:
