@@ -3579,7 +3579,9 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch,
     else:
         from mimir_cultivate.worklink.claude_factory_host import DEFAULT_ENTRYPOINT
         assert config.backend_settings == {
-            'claude_code': {'model': 'sonnet', 'bash_allowlist': ['git *', 'npm *'],
+            'claude_code': {'model': 'sonnet', 'bash_allowlist': [
+                                'git *', 'npm *',
+                                *(['cargo nextest run *', 'cargo test *'] if toolchain == 'rust' else [])],
                             'pass_env': ['CLAUDE_CODE_OAUTH_TOKEN', *expected_env]},
             'feature_factory': {'host': 'claude_code', 'model': 'sonnet', 'entrypoint': DEFAULT_ENTRYPOINT},
         }
@@ -3807,6 +3809,122 @@ def test_worklink_script_allowlist_legacy_rendering_is_script_only(worklink_scri
     (home / '.mimir/worklink-setup.sha256').unlink()
     with pytest.raises(RuntimeError, match='--force'):
         provision('sh scripts/x.sh')
+    assert path.read_bytes() == edited
+
+
+@pytest.mark.parametrize('toolchain', ['rust', 'python', 'node', None])
+@pytest.mark.parametrize('host', ['opencode', 'claude_code'])
+def test_worklink_toolchain_allowlist_render(worklink_script_config, toolchain, host):
+    from mimir_cultivate.worklink.backends.registry import _opencode_pattern_matches
+
+    home, provision = worklink_script_config
+    command = 'npm test' if host == 'claude_code' else './tools/verify'
+    options = {'toolchain': toolchain,
+               'model_spec': 'claude-code:sonnet' if host == 'claude_code' else None}
+    assert provision(command, **options)
+    path = home / 'worklink.yaml'
+    patterns = yaml.safe_load(path.read_bytes())['backends'][host]['bash_allowlist']
+    expected = ['git *', 'npm *'] if host == 'claude_code' else [
+        'git *', './tools/verify', './tools/verify *']
+    if toolchain == 'rust':
+        expected += ['cargo nextest run *', 'cargo test *']
+    assert patterns == expected
+    for focused in ('cargo nextest run my_module', 'cargo test my_module'):
+        assert any(_opencode_pattern_matches(pattern, focused) for pattern in patterns) == (toolchain == 'rust')
+    for denied in ('cargo build', 'cargo nextest list', 'cargo testing my_module',
+                   'cargo nextest runner my_module', 'sh -c cargo test my_module'):
+        assert not any(_opencode_pattern_matches(pattern, denied) for pattern in patterns)
+    if host == 'claude_code':
+        from mimir_cultivate.claude_code import bash_rules
+        rules = bash_rules(command, patterns)
+        assert ('Bash(cargo nextest run:*)' in rules) == (toolchain == 'rust')
+        assert ('Bash(cargo test:*)' in rules) == (toolchain == 'rust')
+    before = path.read_bytes()
+    assert not provision(command, **options)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('host, command, old_patterns', [
+    ('opencode', './tools/verify', ['git *', './tools/verify', './tools/verify *']),
+    ('opencode', './tools/verify', ['git *', './tools/verify']),
+    ('opencode', 'cargo test', ['git *', 'cargo *']),
+    ('claude_code', 'npm test', ['git *', 'npm *']),
+])
+@pytest.mark.parametrize('has_digest', [False, True])
+@pytest.mark.parametrize('tracker', [None, {'close_on_merge': False, 'adapters': {'linear': {}}}])
+def test_worklink_rust_allowlist_upgrades_rc8(
+        worklink_script_config, capsys, host, command, old_patterns, has_digest, tracker):
+    home, provision = worklink_script_config
+    options = {'toolchain': 'rust',
+               'model_spec': 'claude-code:sonnet' if host == 'claude_code' else None,
+               'tracker': tracker, 'previous_tracker': tracker}
+    provision(command, **options)
+    path = home / 'worklink.yaml'
+    expected = path.read_bytes()
+    legacy = yaml.safe_load(expected)
+    legacy['backends'][host]['bash_allowlist'] = old_patterns
+    old = yaml.safe_dump(legacy, sort_keys=False).encode()
+    assert old != expected
+    path.write_bytes(old)
+    digest = home / '.mimir/worklink-setup.sha256'
+    if has_digest:
+        digest.write_text(hashlib.sha256(old).hexdigest() + '\n')
+    else:
+        digest.unlink()
+    assert provision(command, **options)
+    assert installer._WORKLINK_EDITED not in capsys.readouterr().out
+    assert path.read_bytes() == expected
+    assert digest.read_text().strip() == hashlib.sha256(expected).hexdigest()
+    assert not provision(command, **options)
+
+
+@pytest.mark.parametrize('host', ['opencode', 'claude_code'])
+@pytest.mark.parametrize('has_digest', [False, True])
+@pytest.mark.parametrize('edit', ['comment', 'setting', 'allowlist'])
+def test_worklink_rust_allowlist_preserves_rc8_operator_edits(
+        worklink_script_config, capsys, host, has_digest, edit):
+    home, provision = worklink_script_config
+    command = 'npm test' if host == 'claude_code' else './tools/verify'
+    options = {'toolchain': 'rust',
+               'model_spec': 'claude-code:sonnet' if host == 'claude_code' else None}
+    provision(command, **options)
+    path = home / 'worklink.yaml'
+    legacy = yaml.safe_load(path.read_bytes())
+    legacy['backends'][host]['bash_allowlist'] = (
+        ['git *', 'npm *'] if host == 'claude_code' else [
+            'git *', './tools/verify', './tools/verify *'])
+    old = yaml.safe_dump(legacy, sort_keys=False).encode()
+    if edit == 'comment':
+        edited = old + b'# operator note\n'
+    elif edit == 'setting':
+        edited = old.replace(b'max_concurrent: 2', b'max_concurrent: 7')
+    else:
+        edited = old.replace(b'- git *', b'- curl *')
+    assert edited != old
+    path.write_bytes(edited)
+    digest = home / '.mimir/worklink-setup.sha256'
+    if has_digest:
+        digest.write_text(hashlib.sha256(old).hexdigest() + '\n')
+    else:
+        digest.unlink()
+    with pytest.raises(RuntimeError, match='--force'):
+        provision(command, **options)
+    assert installer._WORKLINK_EDITED in capsys.readouterr().out
+    assert path.read_bytes() == edited
+
+
+def test_worklink_rust_allowlist_refuses_unwritten_legacy_combination(worklink_script_config):
+    home, provision = worklink_script_config
+    provision(toolchain='rust')
+    path = home / 'worklink.yaml'
+    config = yaml.safe_load(path.read_bytes())
+    # No setup version wrote the Rust additions without the older #204 rule.
+    config['backends']['opencode']['bash_allowlist'].remove('./tools/verify *')
+    edited = yaml.safe_dump(config, sort_keys=False).encode()
+    path.write_bytes(edited)
+    (home / '.mimir/worklink-setup.sha256').unlink()
+    with pytest.raises(RuntimeError, match='--force'):
+        provision(toolchain='rust')
     assert path.read_bytes() == edited
 
 

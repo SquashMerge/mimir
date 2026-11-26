@@ -1158,11 +1158,21 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
     elif script_arguments:
         allowlist.append(entry['test_command'] + ' *')
 
-    def render(section: dict | None, *, legacy_exact_script: bool = False) -> str:
+    def render(section: dict | None, *, legacy_exact_script: bool = False,
+               legacy_toolchain_allowlist: bool = False) -> str:
         rendered = dict(config)
         if legacy_exact_script and script_arguments:
             rendered['backends'] = {'opencode': {
                 **config['backends']['opencode'], 'bash_allowlist': allowlist[:-1]}}
+        # Add toolchain permissions only after selecting the historical script
+        # shape: allowlist[:-1] must still drop the #204 script-arguments rule.
+        if toolchain == 'rust' and not legacy_toolchain_allowlist:
+            backend = config['defaults']['backend']
+            backends = dict(rendered['backends'])
+            settings = backends[backend]
+            backends[backend] = {**settings, 'bash_allowlist': [
+                *settings['bash_allowlist'], 'cargo nextest run *', 'cargo test *']}
+            rendered['backends'] = backends
         if section:
             rendered['tracker'] = section
         return yaml.safe_dump(rendered, sort_keys=False)
@@ -1181,12 +1191,15 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         # Deployments that predate the digest are unedited when the file is
         # exactly the rendering of the previously saved tracker selection, or
         # the tracker-less rendering that setup wrote before trackers existed.
-        # Also recognize the old exact-only custom-script allowance, byte for
-        # byte; do not treat other digest-less edits as generated configuration.
+        # Also recognize the old exact-only custom-script allowance and the
+        # pre-toolchain allowlist, byte for byte; other digest-less edits are
+        # not generated configuration.
         unedited = (hashlib.sha256(current).hexdigest() == recorded if recorded
                     else current in tuple(
-                        render(section, legacy_exact_script=legacy).encode()
-                        for section in (previous_tracker, None) for legacy in (False, True)))
+                        render(section, legacy_exact_script=legacy,
+                               legacy_toolchain_allowlist=old_toolchain).encode()
+                        for section in (previous_tracker, None)
+                        for legacy, old_toolchain in ((False, False), (False, True), (True, True))))
         if not unedited:
             print(_WORKLINK_EDITED, flush=True)
             raise RuntimeError(f"Worklink config {path} differs; preserve operator edits or rerun with --force")
