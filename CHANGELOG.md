@@ -8,6 +8,20 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [1.0.0rc8] — 2026-11-26
+
+- Treat Chainlink's recognised empty ready-queue text as a successful read so Worklink no longer reports degraded on idle cycles; retain degraded reporting for failed or unrecognised reads.
+
+- Fix Worklink builder shells losing the validated heavy-run lease settings when the executor launches the session helper, while keeping its environment explicitly allowlisted.
+
+- Serialize Worklink base fetches per repository and retry ref-lock contention without spending a leaf's build attempt.
+
+- Cultivate setup now allows arguments to plain repository-relative verify scripts in OpenCode builder permissions and upgrades generated exact-only configurations on rerun.
+
+- Cultivate setup defaults to cargo-nextest 0.9.150 (unaffected by GHSA-vc25-qg58-w57c), honours nextest and uv pins across workflows and composite actions with bounded discovery, and refreshes the toolchain layer on re-setup.
+
+- Include the repository and PR number in repository-test completions so fresh follow-up turns can resume and push tested fixes even after other PRs run on the same channel.
+
 ## [1.0.0rc7] — 2026-11-24
 
 - Add mutation-sensitive Claude factory regressions for launch environment allowlisting, missing/blank OAuth refusal before worker start, and descendant-retirement recovery refusal for ordinary and inconsistent daemon-shaped records, with admitted positive controls.
