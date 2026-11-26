@@ -135,6 +135,9 @@ class WorklinkEvidence:
     test_env: dict[str, str] = field(default_factory=dict)
     opencode_session_id: str | None = None
     mcp_servers: tuple[str, ...] = ()
+    builder_lease_wait_s: float = 0.0
+    builder_deadline_extension_s: float = 0.0
+    builder_elapsed_s: float = 0.0
 
 
 @dataclass(frozen=True)

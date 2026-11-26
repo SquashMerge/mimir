@@ -1062,8 +1062,22 @@ def _demote_template_invalid_ready_leaf(
 def render_work_order(
     issue: IssueContext, *, template_path: Path, backend_name: str, test_command: str,
     prior_attempts: str | None = None,
+    gate_mode: str = "local",
 ) -> str:
     template = template_path.read_text(encoding="utf-8")
+    gate_instruction = (
+        "Run focused tests for the code you changed (one or a few test files or "
+        "a -k selection), directly, without -n or scripts/heavy_run.sh. Do NOT "
+        "run the whole suite locally. PR CI (both legs, all checks) supplies "
+        "full-suite evidence; the draft PR is not ready for review until CI is green. "
+        "Clear inherited/default xdist options where applicable, for example "
+        "uv run env PYTEST_ADDOPTS= pytest -o addopts='' -q tests/test_changed.py."
+        if gate_mode == "ci" else
+        "You are NOT done until the gate command below passes when YOU run it. "
+        "Run it yourself before finishing and fix everything it surfaces — even "
+        "failures in code you did not write. If it fails when the orchestrator "
+        "re-runs it, the attempt fails and nothing is pushed:\n  " + test_command
+    )
     rendered = template.format(
         issue_id=issue.issue_id,
         title=issue.title,
@@ -1072,6 +1086,7 @@ def render_work_order(
         parent_id=issue.parent_id if issue.parent_id is not None else "(none)",
         backend=backend_name,
         test_command=test_command,
+        gate_instruction=gate_instruction,
     )
     # After the spec: reference only, never part of what the leaf must do.
     return f"{rendered.rstrip()}\n\n{prior_attempts}\n" if prior_attempts else rendered
@@ -1219,6 +1234,7 @@ class WorklinkRunner:
                 template_path=template_path,
                 backend_name=selected_name,
                 test_command=(test_cmd or "PR CI (no local gate)") if gate_mode == "ci" else test_cmd,
+                gate_mode=gate_mode,
             )
             order = WorkOrder(
                 issue_id=issue.issue_id,
@@ -1464,6 +1480,7 @@ class WorklinkRunner:
                 backend_name=selected_name,
                 test_command=(test_cmd or "PR CI (no local gate)") if gate_mode == "ci" else test_cmd,
                 prior_attempts=_prior_attempts(self.home, issue, record.attempt),
+                gate_mode=gate_mode,
             )
             order = WorkOrder(
                 issue_id=issue.issue_id,
@@ -1514,11 +1531,23 @@ class WorklinkRunner:
                     configured_model=spec.backend_config.get("configured_model"),
                 )
             async def invoke_backend() -> ComputeResult:
-                nonlocal spec, retain_session, session_handle
+                nonlocal retain_session, session_handle
                 handle = None
+                relay = None
                 try:
+                    from time import monotonic
+                    from .lease_wait import LeaseWaitRelay, wait_for_builder
+                    from ..contained_execution import heavy_lock_environment
+                    heavy_env = heavy_lock_environment()
+                    builder_spec = spec
+                    if heavy_env:
+                        relay = LeaseWaitRelay(heavy_env)
+                        builder_spec = with_worker_environment(spec, relay.environment)
+                    builder_started = monotonic()
                     try:
-                        handle = await compute.launch(spec)
+                        handle = await compute.launch(
+                            replace(builder_spec, timeout_s=spec.timeout_s + relay.cap) if relay else spec
+                        )
                     except BaseException as exc:
                         from .compute import ComputeCleanupError
                         if isinstance(exc, ComputeCleanupError):
@@ -1560,7 +1589,8 @@ class WorklinkRunner:
                         await compute.cancel(handle)
                         raise
                     observed = await _heartbeat_while(
-                        compute.wait(handle, spec.timeout_s),
+                        wait_for_builder(compute, handle, spec.timeout_s, relay,
+                                         started_at=builder_started),
                         claims=claims,
                         record=record,
                     )
@@ -1574,21 +1604,29 @@ class WorklinkRunner:
                         launch_error=str(exc),
                     )
                 finally:
-                    if handle is not None:
-                        if retain_session:
+                    try:
+                        if handle is not None:
+                            if retain_session:
+                                try:
+                                    await compute.cancel(handle)
+                                except RuntimeError:
+                                    terminal_release.retain_for_recovery = True
+                                    raise
                             try:
-                                await compute.cancel(handle)
+                                await compute.cleanup(handle)
                             except RuntimeError:
+                                retain_session = True
+                                session_handle = handle
                                 terminal_release.retain_for_recovery = True
                                 raise
-                        try:
-                            await compute.cleanup(handle)
-                        except RuntimeError:
-                            retain_session = True
-                            session_handle = handle
-                            terminal_release.retain_for_recovery = True
-                            raise
-                        retain_session = False
+                            retain_session = False
+                    finally:
+                        if relay is not None:
+                            total_wait, extension = relay.snapshot()
+                            _log_event("worklink_builder_lease_wait", issue_id=issue.issue_id,
+                                       attempt=record.attempt, lease_wait_s=total_wait,
+                                       deadline_extension_s=extension, extension_cap_s=relay.cap)
+                            await asyncio.to_thread(relay.close)
 
             def remember_session(handle: LaunchHandle | None, retained: bool) -> None:
                 nonlocal session_handle, retain_session
@@ -1975,6 +2013,42 @@ class WorklinkRunner:
                 issue.issue_id, attempt, "stopped", reason=reason,
                 evidence_path=evidence_path, checkout=lease.path, branch=lease.branch,
             )
+        if (compute_result.timed_out and compute_result.builder_elapsed_s > 0
+                and compute_result.lease_wait_s >= compute_result.builder_elapsed_s * 0.5):
+            from .claims import LEASE_WAIT_DEFERRED_PREFIX
+            deferred = ShutdownAbortRecord(
+                issue_id=issue.issue_id, attempt=attempt, agent_id=claim_record.agent_id,
+                claimed_at=claim_record.claimed_at, aborted_at=datetime.now(UTC),
+            )
+            candidate = LEASE_WAIT_DEFERRED_PREFIX + deferred.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
+            history = claims._issue_comments(issue.issue_id, strict=True)
+            if claims.attempts_used([*history, candidate]) < claims.attempts_used(history):
+                reason = "builder timeout dominated by heavy lease queueing; retry after backoff"
+                evidence = WorklinkEvidence(
+                    issue=issue.issue_id, attempt=attempt, backend=selected_name,
+                    branch=lease.branch, checkout=str(lease.path),
+                    started_at=started.astimezone(UTC).isoformat(),
+                    finished_at=datetime.now(UTC).isoformat(), files_changed=[],
+                    diff_stat="", commands=[], tests=None, pr_url=None,
+                    status="refused", failure_reason=reason, diff_observed=False,
+                    builder_lease_wait_s=compute_result.lease_wait_s,
+                    builder_deadline_extension_s=compute_result.deadline_extension_s,
+                    builder_elapsed_s=compute_result.builder_elapsed_s,
+                )
+                evidence_path = _write_evidence(self.home, evidence)
+                claims._run("issue", "comment", str(issue.issue_id), candidate)
+                claims.transition_issue(issue.issue_id, status="refused", review_ready=False,
+                                        attempt=None, reason=None)
+                terminal_release.label_transition_applied = True
+                terminal_release.retain_for_recovery = False
+                terminal_release()
+                _log_event("worklink_lease_wait_timeout", issue_id=issue.issue_id,
+                           attempt=attempt, attempt_consumed=False,
+                           lease_wait_s=compute_result.lease_wait_s,
+                           deadline_extension_s=compute_result.deadline_extension_s,
+                           elapsed_s=compute_result.builder_elapsed_s)
+                return WorklinkRunResult(issue.issue_id, attempt, "refused", reason=reason,
+                                         evidence_path=evidence_path, checkout=lease.path, branch=lease.branch)
         raw = await backend.interpret(order, compute_result)
         if compute_result.timed_out:
             # The deadline owns the outcome, even if the worker exited zero or
@@ -2069,7 +2143,10 @@ class WorklinkRunner:
                 on_gate_launch=persist_gate_handle,
             )
             observed = replace(observed, evidence=replace(
-                observed.evidence, opencode_session_id=raw.opencode_session_id))
+                observed.evidence, opencode_session_id=raw.opencode_session_id,
+                builder_lease_wait_s=compute_result.lease_wait_s,
+                builder_deadline_extension_s=compute_result.deadline_extension_s,
+                builder_elapsed_s=compute_result.builder_elapsed_s))
             if snapshot is None:
                 return observed
             after = _gate_checkout_snapshot(

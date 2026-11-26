@@ -8,25 +8,44 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import shlex
 import sys
 
 from worklink_pytest_args import pytest_arguments
 
 
-def single_node(arguments: list[str]) -> bool:
-    # Unknown options (including -n, --pyargs, response files, repeats, option
-    # values and extra paths) conservatively take the lease. PYTEST_ADDOPTS can
-    # expand even a single node into distributed/repeated work.
-    if os.environ.get("PYTEST_ADDOPTS"):
+def focused(arguments: list[str]) -> bool:
+    """A few files or a -k selection, never xdist, repeats or timing runs."""
+    try:
+        arguments = [*shlex.split(os.environ.get("PYTEST_ADDOPTS", "")), *arguments]
+    except ValueError:
         return False
-    nodes = [arg for arg in arguments if arg not in {"-q", "-v", "-s", "-x"}]
-    return (len(nodes) == 1 and not nodes[0].startswith("-")
-            and ".py::" in nodes[0] and nodes[0].split("::")[-1].startswith("test_"))
+    paths = []
+    selection = False
+    iterator = iter(arguments)
+    for arg in iterator:
+        if arg in {"-q", "-v", "-s", "-x", "--disable-warnings"}:
+            continue
+        if arg == "-k":
+            if not next(iterator, ""):
+                return False
+            selection = True
+        elif arg == "-o":
+            if next(iterator, None) != "addopts=":
+                return False
+        elif arg.startswith("-k") and len(arg) > 2:
+            selection = True
+        elif arg.startswith("-"):
+            return False
+        else:
+            paths.append(arg)
+    return (len(paths) <= 5 and
+            (selection or bool(paths) and all(p.split("::")[0].endswith(".py") for p in paths)))
 
 
 def enforce(command: list[str], arguments: list[str]) -> None:
     if (not os.environ.get("MIMIR_HEAVY_LOCK_FILE")
-            or os.environ.get("MIMIR_HEAVY_LOCK_HELD") or single_node(arguments)):
+            or os.environ.get("MIMIR_HEAVY_LOCK_HELD") or focused(arguments)):
         return
     helper = Path(__file__).resolve().parents[1] / "heavy_run.sh"
     environment = {**os.environ, "MIMIR_HEAVY_TIER": "medium"}

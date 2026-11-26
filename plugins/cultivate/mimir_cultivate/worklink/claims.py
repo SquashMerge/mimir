@@ -62,10 +62,13 @@ OPERATOR_STOP_PREFIX = "WORKLINK_STOPPED "
 QUOTA_HOLD_PREFIX = "WORKLINK_QUOTA_HOLD "
 # Credit only the matching pre-checkout claim; ordinals still advance.
 BASE_FETCH_DEFERRED_PREFIX = "WORKLINK_BASE_FETCH_DEFERRED "
+LEASE_WAIT_DEFERRED_PREFIX = "WORKLINK_LEASE_WAIT_DEFERRED "
+LEASE_WAIT_BACKOFF_S = 900
 # A planned restart must not consume the ordinary retry budget, but repeated
 # restarts must not turn max_attempts into an infinite-retry loophole.
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
-# Automatic infrastructure retries need their own finite, per-generation cap.
+# Base-fetch and lease-wait deferrals share a finite, per-generation
+# infrastructure allowance; alternating causes must not create unlimited retries.
 MAX_BASE_FETCH_DEFERRAL_FORGIVENESS = 2
 REAPER_PREFIX = "WORKLINK_REAPER "
 REAPER_SKIP_SAMPLE_LIMIT = 20
@@ -289,7 +292,7 @@ def _scan_claim_history(
             if not line.startswith(CLAIM_PREFIX):
                 prefix = next((p for p in (
                     SHUTDOWN_ABORT_PREFIX, OPERATOR_STOP_PREFIX, QUOTA_HOLD_PREFIX,
-                    BASE_FETCH_DEFERRED_PREFIX,
+                    BASE_FETCH_DEFERRED_PREFIX, LEASE_WAIT_DEFERRED_PREFIX,
                 ) if line.startswith(p)), None)
                 if prefix is None:
                     continue
@@ -309,7 +312,7 @@ def _scan_claim_history(
                     continue
                 target = (
                     aborts if prefix == SHUTDOWN_ABORT_PREFIX else
-                    deferrals if prefix == BASE_FETCH_DEFERRED_PREFIX else stops
+                    deferrals if prefix in {BASE_FETCH_DEFERRED_PREFIX, LEASE_WAIT_DEFERRED_PREFIX} else stops
                 )
                 target.append(replace(abort, generation=generation))
                 continue
@@ -623,6 +626,19 @@ class ChainlinkClaims:
             attempt = self.next_attempt(comments)
             budget = self.attempt_budget(comments, home_path=claim_home)
             attempts_used = budget.charged
+            for comment in comments:
+                for line in comment.splitlines():
+                    if not line.startswith(LEASE_WAIT_DEFERRED_PREFIX):
+                        continue
+                    try:
+                        deferred = ShutdownAbortRecord.from_payload(
+                            json.loads(line[len(LEASE_WAIT_DEFERRED_PREFIX):]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if (deferred.issue_id == issue_id and
+                            (self.clock() - deferred.aborted_at).total_seconds() < LEASE_WAIT_BACKOFF_S):
+                        self.release_issue(issue_id)
+                        return ClaimResult(False, reason="lease_wait_backoff")
             if attempts_used >= self.max_attempts:
                 generation = budget.generation
                 self.release_issue(issue_id)

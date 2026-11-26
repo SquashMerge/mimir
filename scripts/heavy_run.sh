@@ -46,6 +46,7 @@
 #   MIMIR_HEAVY_TIMEOUT_TOOL    override gtimeout (macOS) / timeout (Linux)
 #   MIMIR_HEAVY_GTIMEOUT        legacy timeout-tool override, still honored
 #   MIMIR_HEAVY_PYTHON          Python 3 interpreter (default python3)
+#   WORKLINK_LEASE_SOCKET/AUTH controller-owned queue accounting (leaf builds only)
 set -eu
 
 if [ "$#" -eq 0 ]; then

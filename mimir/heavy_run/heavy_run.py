@@ -41,6 +41,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import select
 import signal
 import socket
 import subprocess
@@ -351,7 +352,8 @@ class Queue:
         return True
 
 
-def _acquire(base: str, tier: str, stale: float, interval: float, hb: Heartbeat) -> None:
+def _acquire(base: str, tier: str, stale: float, interval: float, hb: Heartbeat,
+             *, check=_check_signal, queued=lambda: None) -> None:
     slot1 = Lease(Path(base + ".lease").absolute(), stale)
     slot2 = Lease(Path(base + ".lease2").absolute(), stale)
     for lease in (slot1, slot2):
@@ -363,6 +365,7 @@ def _acquire(base: str, tier: str, stale: float, interval: float, hb: Heartbeat)
     ticket, tfd = queue.enqueue()
     hb.held[ticket] = tfd
     _hold(tfd, tier, "ticket")
+    queued()
     next_beat = time.monotonic() + interval
 
     def take(lease: Lease, role: str) -> bool:
@@ -392,7 +395,7 @@ def _acquire(base: str, tier: str, stale: float, interval: float, hb: Heartbeat)
                     os.close(fd)
 
     while True:
-        _check_signal()
+        check()
         if time.monotonic() >= next_beat:
             hb.beat()  # Keep our ticket and any slot we already hold alive.
             next_beat = time.monotonic() + interval
@@ -467,18 +470,45 @@ def run(command: list[str]) -> int:
         pass
 
     hb = Heartbeat()
+    relay = None
     child: subprocess.Popen | None = None
     handled = {signal.SIGINT, signal.SIGTERM}
     for sig in handled:
         signal.signal(sig, _interrupt)
     try:
-        _acquire(base, tier, stale, interval, hb)
+        endpoint = os.environ.get("WORKLINK_LEASE_SOCKET")
+        if endpoint:
+            # Worklink's controller owns acquisition and queue accounting. No
+            # claimed duration or builder-writable status file is trusted.
+            relay = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            relay.connect(endpoint)
+            relay.sendall((json.dumps({"token": os.environ.get(
+                "WORKLINK_LEASE_AUTH", ""), "tier": tier}) + "\n").encode())
+            relay.settimeout(0.1)
+            response = bytearray()
+            while not response.endswith(b"\n"):
+                _check_signal()
+                try:
+                    part = relay.recv(16)
+                except socket.timeout:
+                    continue
+                if not part:
+                    raise OSError("Worklink lease relay closed")
+                response.extend(part)
+                if len(response) > 16:
+                    raise OSError("invalid Worklink lease response")
+            if response != b"acquired\n":
+                raise OSError("invalid Worklink lease response")
+        else:
+            _acquire(base, tier, stale, interval, hb)
         _check_signal()
         child = subprocess.Popen(command, start_new_session=True,
                                  env={**os.environ, "MIMIR_HEAVY_LOCK_HELD": "1"})
         next_heartbeat = time.monotonic() + interval
         while True:
             _check_signal()
+            if relay is not None and select.select([relay], [], [], 0)[0]:
+                raise OSError("Worklink lease relay lost")
             try:
                 status = child.wait(timeout=min(interval, 0.1))
                 return status if status >= 0 else 128 - status
@@ -499,6 +529,8 @@ def run(command: list[str]) -> int:
             except ProcessLookupError:
                 pass
             child.wait()
+        if relay is not None:
+            relay.close()
         # Release in reverse acquisition order: slot 2, then slot 1.
         for path in sorted(hb.held, key=lambda p: p.name, reverse=True):
             fd = hb.held[path]

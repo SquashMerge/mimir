@@ -1864,8 +1864,9 @@ def test_shutdown_abort_forgiveness_is_capped_and_attempt_ordinals_keep_advancin
     assert claims.next_attempt(history) == MAX_SHUTDOWN_ABORT_FORGIVENESS + 2
 
 
-def test_base_fetch_deferral_credit_is_bounded_per_generation() -> None:
-    from mimir_cultivate.worklink.claims import BASE_FETCH_DEFERRED_PREFIX, CLAIM_RESET_PREFIX
+@pytest.mark.parametrize("prefix", ["WORKLINK_BASE_FETCH_DEFERRED ", "WORKLINK_LEASE_WAIT_DEFERRED "])
+def test_base_fetch_deferral_credit_is_bounded_per_generation(prefix) -> None:
+    from mimir_cultivate.worklink.claims import CLAIM_RESET_PREFIX
 
     claims = ChainlinkClaims(agent_id="next", max_attempts=3)
     history: list[str] = []
@@ -1877,7 +1878,7 @@ def test_base_fetch_deferral_credit_is_bounded_per_generation() -> None:
         for attempt in range(1, 6):
             ordinal += 1
             claim = ClaimRecord(1033, ordinal, "worker", now + timedelta(minutes=ordinal))
-            marker = BASE_FETCH_DEFERRED_PREFIX + ShutdownAbortRecord(
+            marker = prefix + ShutdownAbortRecord(
                 claim.issue_id, claim.attempt, claim.agent_id, claim.claimed_at,
                 claim.claimed_at + timedelta(seconds=1),
             ).to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)

@@ -19,18 +19,29 @@ Use them unmodified: never recolour, trace, crop or retype the logos or wordmark
 
 ## Evidence
 
-**Run both suites, and require both green.** A scoped run is not evidence:
+**Worklink issue builds run focused tests locally; PR CI is the full-suite
+evidence.** Require both CI legs (core and `MIMIR_PLUGINS=cultivate`), all checks,
+green before a draft PR is ready for review. Do not run the whole suite locally
+for a regular Worklink issue build.
 
 ```bash
-sh scripts/heavy_run.sh uv run pytest -q tests/test_<file>.py  # the file you touched
-sh scripts/heavy_run.sh uv run pytest -q               # the whole suite
+uv run pytest -o addopts='' -q tests/test_<file>.py  # focused: run directly
+uv run pytest -o addopts='' -q tests/test_one.py tests/test_two.py -k changed_behavior
+# Outside regular Worklink issue builds, whole-suite runs take the lease:
+sh scripts/heavy_run.sh uv run pytest -q
+sh scripts/heavy_run.sh uv run pytest -q -n 6
 ```
 
-Run any pytest invocation beyond a single test (several files, `-n`, or loops),
-and every heavy command, through `scripts/heavy_run.sh`. When the
+Run focused tests directly, without `heavy_run.sh`: one or a few test files or
+`-k` selections, without `-n`. Run the whole suite, any `-n`/xdist run, loops,
+timing-sensitive runs, and other heavy commands (Docker, builds) through
+`scripts/heavy_run.sh`. When the
 host shares a heavy-run lease (`MIMIR_HEAVY_LOCK_FILE` is set; Worklink passes it
 to builders and gates), it waits for other agents' heavy runs instead of competing
 with them for CPU; when it is unset, it runs the command directly.
+Clear this repository's default xdist options with `-o addopts=''` for focused runs.
+If `PYTEST_ADDOPTS` also enables xdist, clear it too, for example:
+`uv run env PYTEST_ADDOPTS= pytest -o addopts='' -q tests/test_<file>.py`.
 
 A test that passes alone and fails in the full suite is **not flaky** — it is
 asserting ambient state it does not own. See *Don't assert on ambient state you
@@ -97,9 +108,10 @@ Compare against `headRefOid`. `dismiss_stale_reviews` handles this for approvals
 `main`, but it dismisses **approvals only** — a `CHANGES_REQUESTED` still carries
 forward onto a head it never saw, and branches without protection get neither.
 
-**Do not open a PR whose integrated suite is red**, even when every scoped command
-passed. If the full suite fails, that is the finding; publish nothing until it is
-green or the failure is understood and stated in the PR body.
+**Do not mark a draft PR ready for review whose integrated suite is red**, even
+when every focused command passed. A Worklink issue build runs focused tests
+locally and opens a draft PR; PR CI (both legs, all checks) provides full-suite
+evidence. Repair red CI before marking the PR ready for review.
 
 ## Proving a negative
 

@@ -130,6 +130,8 @@ class ComputeResult:
     lease_wait_timed_out: bool = False
     lease_wait_s: float = 0.0
     run_duration_s: float = 0.0
+    deadline_extension_s: float = 0.0
+    builder_elapsed_s: float = 0.0
 
 
 class ComputeLaunchError(RuntimeError):

@@ -1340,6 +1340,21 @@ def test_bundled_work_order_requires_discriminating_fail_closed_mutation_test() 
     assert "explain why the mutation cannot discriminate instead of inventing a fixture" in prompt
 
 
+@pytest.mark.parametrize("mode", ["ci", "local"])
+def test_bundled_work_order_gate_instructions_match_mode(mode):
+    template = Path(__file__).parent.parent / "plugins/cultivate/mimir_cultivate/prompt_templates/worklink-order.md"
+    prompt = render_work_order(
+        IssueContext(2226, "Focused builds", "", {"worklink:ready"}),
+        template_path=template, backend_name="opencode",
+        test_command="PR CI (no local gate)" if mode == "ci" else "uv run pytest -q",
+        gate_mode=mode,
+    )
+    assert ("You are NOT done until the gate command" in prompt) == (mode == "local")
+    assert ("Run focused tests" in prompt) == (mode == "ci")
+    assert ("Do NOT run the whole suite locally" in prompt) == (mode == "ci")
+    assert ("draft PR is not ready for review until CI is green" in prompt) == (mode == "ci")
+
+
 def test_default_work_order_and_epic_prompt_omit_tracker_identity() -> None:
     issue = IssueContext(2064, "Improve builder prompts", "Build the feature", {"worklink:ready"}, parent_id=1912)
     template = Path(__file__).parent.parent / "plugins/cultivate/mimir_cultivate/prompt_templates/worklink-order.md"
@@ -3317,6 +3332,123 @@ def test_bounded_timeout_routes_failure_before_releasing_lock(tmp_path: Path) ->
     # discoverable by the stale-lock reaper instead of becoming unlocked work.
     assert calls.index(route) < calls.index(release)
     assert load_run_state(tmp_path, 441) is None
+
+
+@pytest.mark.parametrize("queued,prior_releases,timed_out,elapsed,expected", [
+    (0.8, 0, True, 1, "refused"), (0.5, 0, True, 1, "refused"),
+    (0.49, 0, True, 1, "failed"), (0.0, 0, True, 1, "failed"),
+    (0.8, 2, True, 1, "failed"), (0.8, 0, False, 1, "completed"),
+    (0.0, 0, True, 0, "failed"),
+])
+def test_builder_lease_timeout_classification_and_release_cap(
+    tmp_path, monkeypatch, queued, prior_releases, timed_out, elapsed, expected,
+):
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.claims import (
+        LEASE_WAIT_DEFERRED_PREFIX, SHUTDOWN_ABORT_PREFIX, ShutdownAbortRecord,
+    )
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE", raising=False)
+    repo = tmp_path / "repo"
+    worktree = tmp_path / ".worklink/repo" / f"441-{prior_releases + 1}"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    history = []
+    for ordinal in range(1, prior_releases + 1):
+        claim = ClaimRecord(441, ordinal, "old", datetime(2026, 1, ordinal, tzinfo=UTC))
+        history.extend([claim.to_comment(), LEASE_WAIT_DEFERRED_PREFIX + ShutdownAbortRecord(
+            441, ordinal, claim.agent_id, claim.claimed_at, claim.claimed_at,
+        ).to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)])
+
+    def runner(args, **kwargs):
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            payload = json.loads(ISSUE_JSON)
+            payload["comments"] = list(history)
+            return cp(args, stdout=json.dumps(payload))
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            history.append(args[4])
+        return base_runner(args, **kwargs)
+
+    class TimeoutCompute(FakeCompute):
+        async def wait(self, handle, timeout_s):
+            return ComputeResult(int(timed_out), "", "", timed_out=timed_out, lease_wait_s=queued,
+                                 deadline_extension_s=queued, builder_elapsed_s=elapsed)
+
+    config = WorklinkConfig(defaults=WorklinkDefaults(
+        compute_backend="fake_compute", allow_autonomous_local_subprocess=True,
+    ))
+    monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
+    registry = BackendRegistry(config)
+    registry.register(FakeBackend())
+    registry.register_compute(TimeoutCompute(shared_filesystem=True))
+    events = []
+    monkeypatch.setattr(orchestrator, "_log_event", lambda name, **data: events.append((name, data)))
+    result = asyncio.run(WorklinkRunner(
+        home=tmp_path, repo=repo, runner=runner, registry=registry,
+    ).run(441, backend_name="fake", test_command="echo ok", autonomous=True))
+    assert result.status == expected, result
+    budget = ChainlinkClaims(agent_id="test").attempts_used(history)
+    assert budget == (0 if expected == "refused" else 1)
+    incidents = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]
+    if expected == "refused":
+        assert "441" not in incidents
+        assert any(name == "worklink_lease_wait_timeout" for name, _ in events), result
+        event = next(data for name, data in events if name == "worklink_lease_wait_timeout")
+        assert event["attempt_consumed"] is False
+        evidence = json.loads(result.evidence_path.read_text())
+        assert evidence["builder_lease_wait_s"] == queued
+        assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
+        # A new dispatch is refused during the durable queue backoff, without
+        # publishing another claim or consuming an ordinal.
+        claims = ChainlinkClaims(agent_id="test", runner=lambda args: runner(args))
+        retry = claims.claim_issue(441, comments=history)
+        assert not retry.claimed
+        assert retry.reason == "lease_wait_backoff"
+    elif expected == "failed":
+        assert incidents["441"]["active"]
+        assert incidents["441"]["failure_kind"] == "operator_required"
+        assert not any(name == "worklink_lease_wait_timeout" for name, _ in events)
+    else:
+        assert "441" not in incidents
+        assert result.review_ready
+        evidence = json.loads(result.evidence_path.read_text())
+        assert evidence["builder_lease_wait_s"] == queued
+        assert evidence["builder_deadline_extension_s"] == queued
+
+
+def test_builder_relay_environment_and_hard_ceiling_do_not_leak_into_gate(tmp_path, monkeypatch):
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    _, runner = _orchestrator_runner(repo, tmp_path / ".worklink/repo/441-1")
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_FILE", str(tmp_path / "heavy"))
+    monkeypatch.setenv("MIMIR_HEAVY_LOCK_TIMEOUT", "60")
+    config = WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute", timeout_s=37))
+    monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
+    compute = FakeCompute(shared_filesystem=True)
+    registry = BackendRegistry(config)
+    registry.register(FakeBackend())
+    registry.register_compute(compute)
+    gate_specs = []
+    observe = orchestrator.observe_evidence
+
+    async def capture_gate(**kwargs):
+        gate_specs.append(kwargs["work_spec"])
+        return await observe(**kwargs)
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", capture_gate)
+    result = asyncio.run(WorklinkRunner(
+        home=tmp_path, repo=repo, runner=runner, registry=registry,
+    ).run(441, backend_name="fake", test_command="echo ok"))
+    assert result.status == "completed"
+    assert compute.specs[0].timeout_s == 97
+    assert compute.specs[0].env["WORKLINK_LEASE_SOCKET"]
+    assert compute.specs[0].env["WORKLINK_LEASE_AUTH"]
+    assert gate_specs
+    for spec in gate_specs:
+        assert spec.timeout_s == 37
+        assert "WORKLINK_LEASE_SOCKET" not in spec.env
+        assert "WORKLINK_LEASE_AUTH" not in spec.env
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux factory executor uses SOCK_SEQPACKET")

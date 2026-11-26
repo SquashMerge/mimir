@@ -129,12 +129,11 @@ def test_single_node_and_held_marker_pass_through(session, entry):
 
 
 @pytest.mark.parametrize("entry", MODULE_ENTRIES)
-def test_multiple_module_nodes_require_lease(session, entry):
+def test_multiple_module_nodes_run_directly(session, entry):
     arguments = ("a.py::test_a", "b.py::test_b")
     observed = result(run(session, entry, arguments=arguments))
-    assert observed["held"] == "1"
-    assert observed["tier"] == "medium"
-    assert len(observed["owners"]) == 1
+    assert observed["held"] is None
+    assert observed["owners"] == []
     assert observed["args"] == list(arguments)
 
 
@@ -200,16 +199,15 @@ def test_uv_run_venv_precedence_still_takes_lease(session):
 
 
 @pytest.mark.parametrize("entry", MODULE_ENTRIES)
-def test_real_pytest_collects_and_runs_only_under_lease(session, entry):
+def test_real_focused_pytest_runs_without_lease(session, entry):
     repo = session[0]
     (repo / "pytest.py").unlink()
     (repo / "test_lease.py").write_text(textwrap.dedent("""
         import os
         def test_first():
-            assert os.environ["MIMIR_HEAVY_LOCK_HELD"] == "1"
-            assert os.environ["MIMIR_HEAVY_TIER"] == "medium"
+            assert not os.environ.get("MIMIR_HEAVY_LOCK_HELD")
         def test_second():
-            assert os.environ["MIMIR_HEAVY_LOCK_HELD"] == "1"
+            assert not os.environ.get("MIMIR_HEAVY_LOCK_HELD")
     """))
     completed = run(session, entry,
                     arguments=("-q", "test_lease.py"), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
@@ -400,20 +398,36 @@ def test_venv_sitecustomize_is_chained(session, broken_guard):
     assert ("startup guard failed" in completed.stderr) == broken_guard
 
 
-def test_single_node_detection_is_conservative(monkeypatch):
+def test_focused_detection_is_conservative(monkeypatch):
     monkeypatch.syspath_prepend(str(SOURCE))
     spec = importlib.util.spec_from_file_location("guard_under_test", SOURCE / "worklink_pytest.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
-    assert module.single_node(["-q", "test_x.py::test_one"])
-    for args in ([], ["tests"], ["test_x.py"], ["a.py::test_a", "b.py::test_b"],
-                 ["-n", "6", "a.py::test_a"], ["--pyargs", "a.py::test_a"],
-                 ["-k", "a.py::test_a"], ["a.py::"], ["a.py::TestClass"],
-                 ["test_folder"], ["--option.py::test_a"]):
-        assert not module.single_node(args)
+    for args in (["-q", "test_x.py::test_one"], ["test_x.py"], ["a.py::test_a", "b.py::test_b"],
+                 ["-k", "selected"], ["tests", "-k", "selected"],
+                 ["a.py::"], ["a.py::TestClass"]):
+        assert module.focused(args)
+    for args in ([], ["tests"],
+                  ["-n", "6", "a.py::test_a"], ["--pyargs", "a.py::test_a"],
+                  ["-k"], ["--count=5", "a.py"], ["--durations=5", "a.py"],
+                  ["--dist=load", "a.py"], ["a.py"] * 6,
+                  ["test_folder"], ["--option.py::test_a"]):
+        assert not module.focused(args)
     monkeypatch.setenv("PYTEST_ADDOPTS", "-n 6")
-    assert not module.single_node(["a.py::test_a"])
+    assert not module.focused(["a.py::test_a"])
+
+
+@pytest.mark.parametrize("arguments", [
+    ("-q", "a.py", "b.py"), ("tests", "-k", "selected"),
+])
+def test_focused_run_ignores_occupied_lease(session, arguments):
+    base = session[2]["MIMIR_HEAVY_LOCK_FILE"]
+    for suffix in (".lease", ".lease2"):
+        Path(base + suffix).mkdir()
+    observed = result(run(session, ["pytest"], arguments=arguments,
+                          MIMIR_HEAVY_LOCK_TIMEOUT="0.1"))
+    assert observed["held"] is None
 
 
 def test_claude_leaf_environment_installs_guard(monkeypatch, tmp_path):
