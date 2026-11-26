@@ -19,6 +19,7 @@ from typing import Any, Callable, Sequence
 
 from mimir._rmtree import rmtree_missing_ok
 from mimir.plugins.discovery import enabled_plugins
+from mimir.redaction import redact_text, redact_url_userinfo
 from .identities import get_identities
 from .worker_client import worklink_checkout_root
 
@@ -32,6 +33,24 @@ _AUTHORIZATION_FACTORY = object()
 _DIRTY_PATH_SAMPLE_LIMIT = 20
 _WRITABLE_PATH_SAMPLE_LIMIT = 5
 _BASE_FETCH_ATTEMPTS = 3
+_BASE_FETCH_NETWORK_BACKOFF = (10, 20, 30)
+# Only known git/curl stderr diagnostics qualify, never an arbitrary exit code 128.
+_BASE_FETCH_NETWORK_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\bcould not resolve host\b",
+    r"\bcouldn't connect to server\b",
+    r"\b(?:connection|operation) timed out\b",
+    r"\bconnection reset\b",
+    r"\bfailed to connect\b",
+    r"\bthe requested URL returned error: 5\d{2}\b",
+    r"\bHTTP(?:/\d(?:\.\d)?)?\s+5\d{2}\b",
+))
+_BASE_FETCH_PERMANENT_PATTERN = re.compile(
+    r"authentication failed|permission denied|access denied|repository not found|couldn't find remote ref|"
+    r"fatal: bad object|cannot lock ref|"
+    r"the requested URL returned error: 4\d{2}\b|"
+    r"\bHTTP(?:/\d(?:\.\d)?)?\s+4\d{2}\b",
+    re.IGNORECASE,
+)
 _BASE_FETCH_STALE_LOCK_SECONDS = 10 * 60
 BASE_PERMISSIONS_REMEDIATION = (
     '(cd "$WORKLINK_REPO" && { printf \'.\\0\'; git ls-files -z; '
@@ -694,6 +713,17 @@ class BaseFetchContentionError(RuntimeError):
     """Base fetch exhausted its bounded ref-lock retries before checkout creation."""
 
 
+class BaseFetchTransientError(RuntimeError):
+    """Base fetch exhausted its bounded network retries before checkout creation."""
+
+
+def _base_fetch_network_error(stderr: str) -> bool:
+    """Fail closed for unknown diagnostics and any explicit permanent fault."""
+    if _BASE_FETCH_PERMANENT_PATTERN.search(stderr):
+        return False
+    return any(pattern.search(stderr) for pattern in _BASE_FETCH_NETWORK_PATTERNS)
+
+
 def _fetch_base_from_origin(
     repo: Path,
     base: str,
@@ -705,13 +735,35 @@ def _fetch_base_from_origin(
     remote_base = base.removeprefix("origin/")
 
     def fetch() -> subprocess.CompletedProcess[str]:
-        for attempt in range(_BASE_FETCH_ATTEMPTS):
+        lock_failures = 0
+        network_failures = 0
+        while True:
             result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
-            if result.returncode == 0 or not ref_locked(result):
+            if result.returncode == 0:
                 return result
-            if attempt + 1 < _BASE_FETCH_ATTEMPTS:
-                time.sleep(0.1 * (2 ** attempt))
-        return result
+            if ref_locked(result):
+                lock_failures += 1
+                if lock_failures >= _BASE_FETCH_ATTEMPTS:
+                    return result
+                time.sleep(0.1 * (2 ** (lock_failures - 1)))
+            elif _base_fetch_network_error(result.stderr):
+                if network_failures >= len(_BASE_FETCH_NETWORK_BACKOFF):
+                    if event_logger is not None:
+                        event_logger(
+                            "worklink_base_fetch_transient",
+                            repo=str(repo),
+                            base=remote_base,
+                            returncode=result.returncode,
+                            stderr=redact_text(redact_url_userinfo(_strip_for_event(result.stderr)))[:4000],
+                        )
+                    raise BaseFetchTransientError(
+                        f"base repo fetch transient network failure for origin/{remote_base} "
+                        f"after {network_failures + 1} attempts"
+                    )
+                time.sleep(_BASE_FETCH_NETWORK_BACKOFF[network_failures])
+                network_failures += 1
+            else:
+                return result
 
     def ref_locked(result: subprocess.CompletedProcess[str]) -> bool:
         return "cannot lock ref" in (result.stderr + result.stdout).casefold()

@@ -85,7 +85,8 @@ from .run_state import (
     save_run_state,
 )
 from .checkout import (
-    BaseFetchContentionError, CheckoutLease, cleanup_checkout, _cultivate_selected, create_isolated_checkout,
+    BaseFetchContentionError, BaseFetchTransientError, CheckoutLease, cleanup_checkout,
+    _cultivate_selected, create_isolated_checkout,
     assert_base_repo_not_worker_writable,
 )
 from .worker_client import worklink_checkout_root
@@ -1676,7 +1677,7 @@ class WorklinkRunner:
             terminal_release.retain_for_recovery = True
             try:
                 deferred_comment = None
-                if isinstance(exc, BaseFetchContentionError) and lease is None:
+                if isinstance(exc, (BaseFetchContentionError, BaseFetchTransientError)) and lease is None:
                     deferred = ShutdownAbortRecord(
                         issue_id=issue.issue_id, attempt=record.attempt,
                         agent_id=record.agent_id, claimed_at=record.claimed_at,
@@ -1684,8 +1685,8 @@ class WorklinkRunner:
                     )
                     candidate = BASE_FETCH_DEFERRED_PREFIX + deferred.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
                     history = claims._issue_comments(issue.issue_id, strict=True)
-                    # Use the same durable budget computation as admission. A
-                    # saturated allowance is an ordinary, incident-bearing failure.
+                    # Share the bounded, durable ref-lock/network allowance with
+                    # admission. Saturation is an ordinary, incident-bearing failure.
                     base_fetch_deferred = (
                         claims.attempts_used([*history, candidate]) < claims.attempts_used(history)
                     )
@@ -1704,6 +1705,11 @@ class WorklinkRunner:
                         preserved_ref=lease.branch if lease else None,
                         work_path=str(lease.path) if lease else None,
                         work_started=False if base_fetch_deferred else None,
+                        failure_kind=(
+                            "base_fetch_transient"
+                            if base_fetch_deferred and isinstance(exc, BaseFetchTransientError)
+                            else "operator_required"
+                        ),
                     )
                 except OSError as write_exc:
                     incident_owner.bind(write_exc)

@@ -882,7 +882,7 @@ def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> 
     # alternate, because that residue makes every fetch fail until it is pruned
     # (2026-07-28: a leftover refs/remotes/origin/pr/1188 cost six worklink
     # attempts). Here the probe finds nothing, so the fetch must NOT be retried —
-    # a genuine network failure should fail closed immediately, not double up.
+    # an unclassified diagnostic must fail closed, not double up.
     assert calls == [
         [
             "git", "-C", str(tmp_path), "status", "--porcelain=v1", "-z",
@@ -1034,6 +1034,138 @@ def test_base_fetch_ref_lock_retries_are_bounded(
         assert _git(repo, "rev-parse", prepare()) == fresh_sha
     assert len(fetches) == min(failures + 1, 3)
     assert delays == [0.1, 0.2][:min(failures, 2)]
+
+
+@pytest.mark.parametrize("stderr", [
+    "fatal: Could not resolve host: github.com",
+    "fatal: Couldn't connect to server",
+    "fatal: Connection timed out",
+    "fatal: Operation timed out after 30000 milliseconds",
+    "fatal: Recv failure: Connection reset by peer",
+    "fatal: Failed to connect to github.com port 443",
+    "fatal: The requested URL returned error: 500",
+    "fatal: The requested URL returned error: 503",
+    "fatal: HTTP 502",
+    "fatal: HTTP/2 504",
+])
+@pytest.mark.parametrize("recover", [True, False])
+def test_base_fetch_network_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: str, recover: bool,
+) -> None:
+    _, repo, _, fresh_sha = _repo_with_stale_local_main(tmp_path)
+    fetches = []
+    delays = []
+    events = []
+    monkeypatch.setattr(checkout_module.time, "sleep", delays.append)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if args[3] == "fetch":
+            fetches.append(list(args))
+            if not recover or len(fetches) == 1:
+                return subprocess.CompletedProcess(args, 128, "", stderr)
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    def prepare() -> str:
+        return checkout_module._prepare_fresh_base(
+            repo, "main", base_fetch=True, runner=runner,
+            event_logger=lambda name, **fields: events.append((name, fields)),
+        )
+
+    if recover:
+        assert _git(repo, "rev-parse", prepare()) == fresh_sha
+        assert len(fetches) == 2
+        assert delays == [10]
+        assert events == []
+    else:
+        with pytest.raises(checkout_module.BaseFetchTransientError, match="after 4 attempts"):
+            prepare()
+        assert len(fetches) == 4
+        assert delays == [10, 20, 30]
+        assert events == [("worklink_base_fetch_transient", {
+            "repo": str(repo), "base": "main", "returncode": 128, "stderr": stderr,
+        })]
+        with (repo / ".git" / "worklink-base-fetch.lock").open() as handle:
+            checkout_module.fcntl.flock(handle.fileno(), checkout_module.fcntl.LOCK_EX | checkout_module.fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("stderr", [
+    "fatal: The requested URL returned error: 401",
+    "fatal: The requested URL returned error: 403",
+    "fatal: HTTP/2 403",
+    "fatal: Authentication failed",
+    "fatal: Repository not found",
+    "fatal: couldn't find remote ref main",
+    "fatal: bad object refs/heads/main",
+    "network down",
+    "",
+    # Never trust stdout, unknown messages, or mixed permanent/transient errors.
+    "fatal: Authentication failed\nCould not resolve host: github.com",
+    "fatal: HTTP 403\nConnection reset by peer",
+    "fatal: permission denied\nFailed to connect",
+    "fatal: couldn't find remote ref main\nConnection timed out",
+    "fatal: bad object refs/heads/main\nHTTP 502",
+])
+def test_base_fetch_real_faults_are_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: str,
+) -> None:
+    fetches = []
+    delays = []
+    monkeypatch.setattr(checkout_module.time, "sleep", delays.append)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if args[3] == "fetch":
+            fetches.append(list(args))
+            return subprocess.CompletedProcess(args, 128, "Could not resolve host", stderr)
+        return completed(args)
+
+    with pytest.raises(RuntimeError, match="base repo fetch failed"):
+        checkout_module._fetch_and_verify_base(tmp_path, "main", runner=runner, event_logger=None)
+    assert len(fetches) == 1
+    assert delays == []
+
+
+def test_base_fetch_transient_event_redacts_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    monkeypatch.setattr(checkout_module.time, "sleep", lambda _: None)
+    secret = "ghp_" + "a" * 36
+    stderr = f"fatal: unable to access 'https://builder:private-password@github.com/repo/': Could not resolve host: github.com token={secret}"
+    with pytest.raises(checkout_module.BaseFetchTransientError):
+        checkout_module._fetch_base_from_origin(
+            tmp_path, "main",
+            runner=lambda args: subprocess.CompletedProcess(args, 128, "", stderr),
+            event_logger=lambda name, **fields: events.append((name, fields)),
+        )
+    assert len(events) == 1
+    assert events[0][0] == "worklink_base_fetch_transient"
+    assert secret not in events[0][1]["stderr"]
+    assert "private-password" not in events[0][1]["stderr"]
+    assert "builder" not in events[0][1]["stderr"]
+    assert "Could not resolve host" in events[0][1]["stderr"]
+
+
+def test_base_fetch_network_retry_stops_on_auth_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    errors = iter(["Could not resolve host: github.com", "The requested URL returned error: 403"])
+    delays = []
+    events = []
+    monkeypatch.setattr(checkout_module.time, "sleep", delays.append)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if args[3] == "fetch":
+            return subprocess.CompletedProcess(args, 128, "", next(errors))
+        return completed(args)
+
+    with pytest.raises(RuntimeError, match="base repo fetch failed"):
+        checkout_module._fetch_and_verify_base(
+            tmp_path, "main", runner=runner,
+            event_logger=lambda name, **fields: events.append((name, fields)),
+        )
+    assert delays == [10]
+    assert [name for name, _ in events] == ["worklink_base_fetch_failed"]
+    assert events[0][1]["stderr"] == "The requested URL returned error: 403"
 
 
 @pytest.mark.parametrize("age", [1, 599, 600, 601])
