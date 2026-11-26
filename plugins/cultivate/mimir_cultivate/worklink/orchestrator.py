@@ -6966,6 +6966,8 @@ def _leaf_publication(home: Path, issue_id: int, attempt: int) -> Iterator[_Publ
         # replacement whose newer, pre-publication evidence masks the original.
         evidence_dir = home / "state" / "worklink" / "evidence"
         evidence_dir.mkdir(parents=True, exist_ok=True)
+        from .publication_release import publication_is_released
+
         for evidence_path in evidence_dir.iterdir():
             if not re.fullmatch(rf"{issue_id}-\d+\.json", evidence_path.name):
                 continue
@@ -6975,7 +6977,8 @@ def _leaf_publication(home: Path, issue_id: int, attempt: int) -> Iterator[_Publ
             }:
                 raise WorklinkError(f"publication evidence unavailable: {evidence_path}")
             if payload.get("pr_url") is not None and not (
-                payload.get("status") == "stopped"
+                publication_is_released(home, evidence_path, payload["pr_url"])
+                or payload.get("status") == "stopped"
                 and isinstance(payload.get("pr_url"), str)
                 and re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*", payload["pr_url"])
             ):
