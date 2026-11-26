@@ -905,8 +905,8 @@ def _deployment_update(deploy: Path, paths: list[Path], directories: list[Path])
     """Restore only setup-owned files on failure, never Docker volumes or state.
 
     Backups live outside the deployment and retain secret-file permissions.
-    Keep this active through build, provisioning and live verification: those
-    checks cannot run until the new deployment files have been published.
+    Keep this active through build and provisioning, but close it once the new
+    container replaces the old one: later failures must retain the new files.
     """
     with tempfile.TemporaryDirectory(prefix="cultivate-rollback-") as temporary:
         backups = {}
@@ -918,17 +918,27 @@ def _deployment_update(deploy: Path, paths: list[Path], directories: list[Path])
         modes = {path: path.stat().st_mode & 0o777 for path in directories if path.exists()}
         try:
             yield
-        except Exception:
+        except Exception as exc:
+            unrestored = []
             for path, backup in backups.items():
-                if backup is not None:
-                    shutil.copy2(backup, path)
-                elif path.exists():
-                    path.unlink()
+                try:
+                    if backup is not None:
+                        shutil.copy2(backup, path)
+                    elif path.exists():
+                        path.unlink()
+                except OSError:
+                    unrestored.append(str(path))
             for path in reversed(directories):
-                if path in modes:
-                    path.chmod(modes[path])
-                elif path.exists():
-                    path.rmdir()
+                try:
+                    if path in modes:
+                        path.chmod(modes[path])
+                    elif path.exists():
+                        path.rmdir()
+                except OSError:
+                    unrestored.append(str(path))
+            if unrestored:
+                exc.args = (str(exc) + " File rollback incomplete; could not restore: "
+                            + ", ".join(unrestored), *exc.args[1:])
             raise
 
 
@@ -2145,13 +2155,14 @@ def _setup(args: argparse.Namespace, *, stack: ExitStack, request, run, verify) 
     except (ValueError, OSError):
         raise SetupError("Cannot assemble verified wheel Docker context; check released wheel resources.") from None
 
+    rollback_stack = stack.enter_context(ExitStack())
     if old_image and not getattr(args, "force", False):
         paths = [deploy / name for name in writes]
         if not getattr(args, "no_start", False):
             paths.append(key_path)
         paths.extend(wheel_dir / wheel.filename for wheel in (release.agent, release.cultivate))
         directories = [deploy, wheel_dir] + ([deploy / "codex"] if codex else [])
-        stack.enter_context(_deployment_update(deploy, paths, directories))
+        rollback_stack.enter_context(_deployment_update(deploy, paths, directories))
     deploy.mkdir(parents=True, exist_ok=True)
     deploy.chmod(0o700)
     if codex:
@@ -2219,12 +2230,15 @@ def _setup(args: argparse.Namespace, *, stack: ExitStack, request, run, verify) 
         # s6 starts the agent and daemon independently; setup and daemon-backed
         # workloads seed/reconcile the agent's login before checking readiness.
         docker_step("up", ["docker", "compose", "up", "-d", "agent"])
-        if not claude:
-            _verify_opencode_daemon(deploy, run=run)
+        # New code has provisioned the volume and replaced the old container.
+        # Restoring only host files now would describe the wrong running image.
+        rollback_stack.close()
     if old_image and old_image[1] != layer_tag:
         print("Previous agent image retained: " + old_image[1])
         print("Rollback (from " + str(deploy) + "): docker compose -f compose.yml -f <(printf 'services:\\n  agent:\\n    image: "
               + old_image[1] + "\\n') up -d --force-recreate --no-deps agent")
+    if not no_start and not claude:
+        _verify_opencode_daemon(deploy, run=run)
     if no_start:
         print(f"Build and provisioning complete. To start the agent later, from {deploy} run: docker compose up -d agent")
         if codex:
