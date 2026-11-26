@@ -325,11 +325,16 @@ def validate_test_env(value: object) -> None:
     if not isinstance(value, Mapping):
         raise ValueError(f"{label} must be a mapping")
     for key, text in value.items():
-        if key not in {"PYTEST_ADDOPTS", "RUSTUP_HOME", "CARGO_HOME", "UV_PYTHON_INSTALL_DIR"}:
+        if key not in {"PYTEST_ADDOPTS", "RUSTUP_HOME", "CARGO_HOME", "UV_PYTHON_INSTALL_DIR",
+                       "RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE"}:
             raise ValueError(f"{label} key {key!r} is not allowed")
         if not isinstance(text, str) or any(not char.isprintable() for char in text):
             raise ValueError(f"{label}.{key} must be plain text without newlines or control characters")
-        if key != "PYTEST_ADDOPTS" and (
+        if key == "RUSTC_WRAPPER" and text != "/usr/local/bin/sccache":
+            raise ValueError(f"{label}.{key} must be /usr/local/bin/sccache")
+        if key == "SCCACHE_CACHE_SIZE" and re.fullmatch(r"[1-9][0-9]*[KMGT]", text) is None:
+            raise ValueError(f"{label}.{key} must be a positive size such as 20G")
+        if key not in {"PYTEST_ADDOPTS", "SCCACHE_CACHE_SIZE"} and (
             not text.startswith("/") or ".." in Path(text).parts
         ):
             raise ValueError(f"{label}.{key} must be an absolute path without traversal")

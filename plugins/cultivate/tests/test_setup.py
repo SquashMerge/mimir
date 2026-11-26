@@ -3067,7 +3067,7 @@ def test_setup_daemon_projection_failure_does_not_launch_worker(tmp_path, monkey
 
 
 @pytest.mark.parametrize('kind, version, tools', [
-    ('rust', '1.99.1', ('rustc', 'cargo', 'cargo-fmt', 'cargo-clippy', 'cargo-nextest')),
+    ('rust', '1.99.1', ('rustc', 'cargo', 'cargo-fmt', 'cargo-clippy', 'cargo-nextest', 'sccache')),
     ('node', '22.16.0', ('node', 'npm', 'npx')),
     ('python', '3.11.11', ('uv', 'python')),
 ])
@@ -3107,8 +3107,14 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
     cache.mkdir()
     test_env = installer.toolchain_test_env(kind)
     if kind == 'rust':
-        assert test_env == {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'}
+        assert test_env == {
+            'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo',
+            'RUSTC_WRAPPER': '/usr/local/bin/sccache', 'SCCACHE_DIR': '/var/cache/mimir-sccache',
+            'SCCACHE_CACHE_SIZE': '20G'}
         test_env['CARGO_HOME'] = str(cache)
+        sccache_dir = tmp_path / 'sccache'
+        sccache_dir.mkdir(mode=0o700)
+        test_env['SCCACHE_DIR'] = str(sccache_dir)
     config_path = tmp_path / 'worklink.yaml'
     config_path.write_text(yaml.safe_dump({'defaults': {'test_command': './tools/verify'},
         'backends': {'opencode': {'test_env': test_env, 'bash_allowlist': ['./tools/verify']}}}))
@@ -3164,7 +3170,7 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
         assert observed['RUSTUP_HOME'] == '/opt/rustup'
         assert not list(cache.iterdir()), 'probe must remove its cache write test'
     launches = [json.loads(row) for row in marker.read_text().splitlines()]
-    assert [row[0] for row in launches] == (['rustc', 'cargo', 'cargo-fmt', 'cargo-clippy', 'cargo', 'rustc'] if kind == 'rust' else
+    assert [row[0] for row in launches] == (['rustc', 'cargo', 'cargo-fmt', 'cargo-clippy', 'cargo', 'sccache', 'rustc'] if kind == 'rust' else
                                              ['node', 'npm', 'npx', 'c++'] if kind == 'node' else
                                              ['uv', 'uv', 'python', 'cc'])
     assert (tmp_path / 'executed').read_text() == 'probe'
@@ -3177,6 +3183,23 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
     if kind == 'rust':
         assert launches[2][1] == ['--version'] and launches[3][1] == ['--version']
         assert launches[4][1] == ['nextest', '--version']
+        assert launches[5][1] == ['--version']
+        assert not list(sccache_dir.iterdir())
+        for mode in (0o707, 0o770, 0o777):
+            sccache_dir.chmod(mode)
+            with pytest.raises(installer.SetupError, match='toolchain_missing: sccache'):
+                installer._verify_toolchain(tmp_path, kind, version)
+        sccache_dir.chmod(0o700)
+        sccache = bin_dir / 'sccache'
+        contents = sccache.read_text()
+        sccache.write_text('#!/bin/sh\nexit 23\n')
+        with pytest.raises(installer.SetupError, match='toolchain_missing: sccache'):
+            installer._verify_toolchain(tmp_path, kind, version)
+        sccache.unlink()
+        with pytest.raises(installer.SetupError, match='toolchain_missing: sccache'):
+            installer._verify_toolchain(tmp_path, kind, version)
+        sccache.write_text(contents)
+        sccache.chmod(0o755)
         # Cargo subcommands must be available on the fixed worker PATH,
         # independently of the installer's /opt/cargo/bin.
         for name in ('cargo-fmt', 'cargo-clippy'):
@@ -3301,6 +3324,221 @@ def test_toolchain_test_env_validates_paths_and_keeps_reserved_names_closed(env)
     for key in ('PATH', 'HOME', 'LD_PRELOAD', 'GITHUB_TOKEN'):
         with pytest.raises(ValueError, match='not allowed'):
             validate_test_env({key: '/tmp/value'})
+
+
+def test_sccache_test_env_defaults_and_opt_out():
+    expected = {
+        'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo',
+        'RUSTC_WRAPPER': '/usr/local/bin/sccache', 'SCCACHE_DIR': '/var/cache/mimir-sccache',
+        'SCCACHE_CACHE_SIZE': '20G'}
+    assert installer.toolchain_test_env('rust') == expected
+    assert installer.toolchain_test_env('rust', sccache_cache_size='30G') == {
+        **expected, 'SCCACHE_CACHE_SIZE': '30G'}
+    assert installer.toolchain_test_env('rust', sccache=False) == {
+        'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'}
+    assert installer.toolchain_test_env('node') == {}
+    assert installer.toolchain_test_env('python') == {'UV_PYTHON_INSTALL_DIR': '/opt/uv-python'}
+
+
+@pytest.mark.parametrize('key,value', [
+    ('RUSTC_WRAPPER', '/usr/local/bin/sccache'),
+    ('SCCACHE_DIR', '/workspace/compiler-cache'),
+    ('SCCACHE_CACHE_SIZE', '20G'),
+    ('SCCACHE_CACHE_SIZE', '512M'),
+])
+def test_sccache_test_env_accepts_safe_values(key, value):
+    from mimir_cultivate.worklink.backends.opencode import validate_test_env
+    validate_test_env({key: value})
+
+
+@pytest.mark.parametrize('key,values', [
+    ('RUSTC_WRAPPER', ('', 'sccache', '/tmp/sccache', '/bin/sh', '/usr/local/bin/sccache ',
+                       '/usr/local/bin/../bin/sccache', '/usr/local/bin/sccache\n')),
+    ('SCCACHE_DIR', ('', 'cache', '/workspace/../cache', '/cache\n', '/cache\x00')),
+    ('SCCACHE_CACHE_SIZE', ('', '0G', '-20G', '20', '20GB', '20g', '1.5G', '20G ',
+                           '20G\n', '20G;id', '/20G', None)),
+    ('SCCACHE_BUCKET', ('bucket',)),
+    ('SCCACHE_ENDPOINT', ('https://example.com',)),
+])
+def test_sccache_test_env_rejects_unsafe_values(key, values):
+    from mimir_cultivate.worklink.backends.opencode import validate_test_env
+    for value in values:
+        with pytest.raises(ValueError):
+            validate_test_env({key: value})
+
+
+@pytest.mark.parametrize('kind,digest', [
+    ('rust', 'f42061aa822a85caa52058027b404e45eda753e6dd3edd7648c5cb7b7aed8d34'),
+    ('node', 'a0afe9b11dfa69081a6a920256fb34049ddb27948003d47f5a49b31dcb1f6dbd'),
+    ('python', 'f329c75e5c2ac3b0ff3321faa535d7f64c9b654ddcda4cea707eea4e4cc1d35b'),
+])
+def test_sccache_opt_out_layer_matches_pre_cache_bytes(kind, digest):
+    # Captured from the parent revision's renderer, including the nextest pin.
+    layer = installer.render_layer(kind, '1.99.1', 'root:sha', sccache=False)
+    assert hashlib.sha256(layer.encode()).hexdigest() == digest
+    if kind != 'rust':
+        assert installer.render_layer(kind, '1.99.1', 'root:sha') == layer
+
+
+def test_sccache_compose_persists_private_worker_cache_and_opt_out():
+    from mimir.scaffold_docker import render_compose_yml
+    template = render_compose_yml(service_name='agent', web_port=8123, mode='pypi')
+    uncached = installer.render_compose(template, 'image:sha', 'rust', 'repo', sccache=False)
+    assert hashlib.sha256(uncached.encode()).hexdigest() == (
+        '708b7d181ba5b7b81ea9da9fc759b7a2fdc73915f188d511b71292db520e214e')
+    cached = yaml.safe_load(installer.render_compose(template, 'image:sha', 'rust', 'repo'))
+    plain = yaml.safe_load(uncached)
+    for service in ('agent', 'init'):
+        mounts = cached['services'][service]['volumes']
+        assert mounts == [*plain['services'][service]['volumes'], 'sccache:/var/cache/mimir-sccache']
+    assert cached['volumes'] == {**plain['volumes'], 'sccache': None}
+    command = cached['services']['init']['command'][0]
+    assert command.endswith(' && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-sccache')
+    assert cached['services']['agent']['environment']['MIMIR_SHELL_PASS_ENV'].endswith(
+        ',RUSTC_WRAPPER,SCCACHE_DIR,SCCACHE_CACHE_SIZE')
+    for kind in ('node', 'python'):
+        assert installer.render_compose(template, 'image:sha', kind, 'repo') == (
+            installer.render_compose(template, 'image:sha', kind, 'repo', sccache=False))
+
+
+def test_sccache_layer_pins_both_architectures_and_root_owned_binary():
+    layer = installer.render_layer('rust', '1.99.1', 'root:sha')
+    assert installer.DEFAULT_SCCACHE_VERSION == '0.20.1'
+    assert 'https://github.com/mozilla/sccache/releases/download/v0.20.1/$archive.tar.gz' in layer
+    assert 'archive=sccache-v0.20.1-$triple' in layer
+    assert 'amd64) triple=x86_64-unknown-linux-musl; sha256=c9f6c5a3ae84d9da0956b28c357a365827bda33f3383647fc0b67484c74a5ea9' in layer
+    assert 'arm64) triple=aarch64-unknown-linux-musl; sha256=505324daad5fcbb1a3cab5d57d26ef42baf4d10b236df7de93a008196f1f2230' in layer
+    assert 'install -o root -g root -m 0755 "/tmp/sccache-install/$archive/sccache" /usr/local/bin/sccache' in layer
+    assert 'RUN set -eu; install -d -o worklink -g worklink -m 0700 /var/cache/mimir-sccache\n' in layer
+    assert 'ENV RUSTC_WRAPPER=/usr/local/bin/sccache SCCACHE_DIR=/var/cache/mimir-sccache SCCACHE_CACHE_SIZE=20G\n' in layer
+
+
+@pytest.mark.parametrize('arch', ['amd64', 'arm64', 'unsupported'])
+@pytest.mark.parametrize('valid_checksum', [False, True])
+def test_sccache_layer_checksum_check_executes_before_extraction(tmp_path, monkeypatch, arch, valid_checksum):
+    version = installer.DEFAULT_SCCACHE_VERSION
+    if valid_checksum and arch != 'unsupported':
+        # The positive control owns its download AND its pin; no network or Docker.
+        monkeypatch.setitem(installer.SCCACHE_SHA256, version, {
+            **installer.SCCACHE_SHA256[version], arch: hashlib.sha256(b'downloaded archive').hexdigest()})
+    layer = installer.render_layer('rust', '1.99.1', 'root:sha')
+    script = next(line.removeprefix('RUN ') for line in layer.splitlines() if '/tmp/sccache.tar.gz' in line)
+    script = script.replace('/tmp/sccache', str(tmp_path / 'sccache'))
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    marker = tmp_path / 'extracted'
+    installed = tmp_path / 'installed'
+    for name, body in [
+        ('dpkg', f'echo {arch}'),
+        ('curl', 'printf "downloaded archive" > "$2"'),
+        ('tar', f'touch {marker}'),
+        ('install', f'touch {installed}'),
+    ]:
+        path = bin_dir / name
+        path.write_text('#!/bin/sh\n' + body + '\n')
+        path.chmod(0o755)
+    result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True,
+                            env=dict(os.environ, PATH=str(bin_dir) + ':/usr/bin:/bin'))
+    if valid_checksum and arch != 'unsupported':
+        assert result.returncode == 0, result.stderr
+        assert marker.exists() and installed.exists()
+    else:
+        assert result.returncode != 0
+        assert not marker.exists() and not installed.exists()
+        if arch != 'unsupported':
+            assert 'FAILED' in result.stdout
+
+
+def test_sccache_repository_pin_requires_reviewed_hashes():
+    pin = installer._tool_pin({'workflow': 'tool: sccache@0.12.0'}, 'sccache', installer.DEFAULT_SCCACHE_VERSION)
+    assert pin == '0.12.0'
+    assert '/v0.12.0/$archive.tar.gz' in installer.render_layer(
+        'rust', '1.99.1', 'root:sha', sccache_version=pin)
+    with pytest.raises(installer.SetupError, match='No verified sccache checksums'):
+        installer.render_layer('rust', '1.99.1', 'root:sha', sccache_version='999.0.0')
+    with pytest.raises(installer.SetupError, match='Conflicting sccache'):
+        installer._tool_pin({'a': 'sccache@0.12.0', 'b': 'sccache@0.20.1'}, 'sccache', pin)
+
+
+def test_sccache_setup_options_persist_and_reconcile(setup_environment):
+    deploy, args, state, calls, invoke = setup_environment
+    state['repository_files'] = {
+        'rust-toolchain.toml': '[toolchain]\nchannel = "1.99.1"',
+        '.github/workflows/build.yml': 'tool: sccache@0.12.0'}
+    args.sccache_cache_size = '30G'
+    invoke()
+    assert '/v0.12.0/' in (deploy / 'Dockerfile.toolchain').read_text()
+    assert 'SCCACHE_CACHE_SIZE=30G' in (deploy / 'Dockerfile.toolchain').read_text()
+    provision = (deploy / 'provision.py').read_text()
+    assert "sccache=m.get('sccache', True)" in provision
+    assert "sccache_cache_size=m.get('sccache_cache_size', '20G')" in provision
+    args.sccache_cache_size = None
+    invoke()
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['sccache'] is True and manifest['sccache_cache_size'] == '30G'
+    args.sccache = False
+    invoke()
+    assert 'sccache' not in (deploy / 'Dockerfile.toolchain').read_text()
+    assert 'sccache' not in yaml.safe_load((deploy / 'compose.yml').read_text())['volumes']
+    args.sccache = None
+    invoke()
+    assert json.loads((deploy / 'manifest.json').read_text())['sccache'] is False
+    args.sccache = True
+    args.sccache_cache_size = '20G;id'
+    before = {p.name: p.read_bytes() for p in deploy.iterdir() if p.is_file()}
+    with pytest.raises(installer.SetupError, match='positive size'):
+        invoke()
+    assert before == {p.name: p.read_bytes() for p in deploy.iterdir() if p.is_file()}
+
+
+def test_sccache_setup_rejects_non_boolean_saved_option(setup_environment):
+    deploy, args, state, calls, invoke = setup_environment
+    state['repository_files'] = {'rust-toolchain.toml': '[toolchain]\nchannel = "1.99.1"'}
+    invoke()
+    path = deploy / 'manifest.json'
+    manifest = json.loads(path.read_text())
+    manifest['sccache'] = 'false'
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(installer.SetupError, match='expected a boolean'):
+        invoke()
+
+
+def test_sccache_setup_flags():
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest='command'))
+    assert parser.parse_args(['cultivate', 'setup']).sccache is None
+    assert parser.parse_args(['cultivate', 'setup', '--no-sccache']).sccache is False
+    args = parser.parse_args(['cultivate', 'setup', '--sccache', '--sccache-cache-size', '30G'])
+    assert args.sccache is True and args.sccache_cache_size == '30G'
+
+
+@pytest.mark.parametrize('failure', ['owner', 'symlink', 'missing', 'unwritable'])
+def test_sccache_toolchain_probe_rejects_invalid_cache(tmp_path, failure):
+    cargo = tmp_path / 'cargo'
+    cargo.mkdir()
+    cache = tmp_path / 'cache'
+    cache.mkdir(mode=0o700)
+    prefix = 'import os, tempfile\n'
+    if failure == 'owner':
+        prefix += f'os.geteuid = lambda: {os.geteuid() + 1}\n'
+    elif failure == 'symlink':
+        link = tmp_path / 'link'
+        link.symlink_to(cache)
+        cache = link
+    elif failure == 'missing':
+        cache.rmdir()
+    else:
+        # Root can write a mode-000 directory. Inject the owned IO failure instead.
+        prefix += ('real_temp = tempfile.NamedTemporaryFile\n'
+                   'def temp(*args, **kwargs):\n'
+                   f' if str(kwargs.get("dir")) == {str(cache)!r}: raise PermissionError("denied")\n'
+                   ' return real_temp(*args, **kwargs)\n'
+                   'tempfile.NamedTemporaryFile = temp\n')
+    env = {**installer.toolchain_test_env('rust'), 'HOME': '/nonexistent-worker-home',
+           'CARGO_HOME': str(cargo), 'SCCACHE_DIR': str(cache)}
+    result = subprocess.run([sys.executable, '-I', '-S', '-c', prefix + installer._TOOLCHAIN_WORKER_PROBE,
+                             json.dumps(env), 'rust', '1.99.1'], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == 'toolchain_missing: sccache'
 
 
 def test_existing_env_never_overwrites_operator_secrets(tmp_path):
@@ -3688,8 +3926,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert worklink.defaults.base_branch == inventory['repositories'][0]['base_branch']
     assert worklink.defaults.test_command == inventory['repositories'][0]['test_command']
     assert worklink.defaults.allow_autonomous_local_subprocess
-    assert worklink.backend_settings['opencode']['test_env'] == {
-        'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'}
+    assert worklink.backend_settings['opencode']['test_env'] == installer.toolchain_test_env('rust')
     assert (home / '.chainlink/agent.json').read_text() == '{"id":"cultivate-worklink"}'
     assert any(argv[-1] == str(tmp_path / 'worklink/base/repo') for argv in calls if 'clone' in argv)
     assert not any("setup-git" in argv for argv in calls)
@@ -3830,10 +4067,11 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
 
 @pytest.mark.parametrize('toolchain', ['rust', 'python', 'node'])
 @pytest.mark.parametrize('host', ['opencode', 'claude_code'])
-def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch, toolchain, host):
+@pytest.mark.parametrize('sccache', [False, True])
+def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch, toolchain, host, sccache):
     from functools import partial
     monkeypatch.setattr(installer, '_provision_worklink', partial(
-        installer._provision_worklink, toolchain=toolchain,
+        installer._provision_worklink, toolchain=toolchain, sccache=sccache, sccache_cache_size='30G',
         model_spec="claude-code:sonnet" if host == "claude_code" else None))
     original_run = subprocess.run
     origin = tmp_path / 'remote.git'
@@ -3879,8 +4117,7 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch,
     assert config.defaults.base_branch == entry['base_branch']
     assert config.defaults.test_command == entry['test_command']
     assert config.defaults.backend == host
-    expected_env = {'rust': {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'},
-                    'python': {'UV_PYTHON_INSTALL_DIR': '/opt/uv-python'}, 'node': {}}[toolchain]
+    expected_env = installer.toolchain_test_env(toolchain, sccache=sccache, sccache_cache_size='30G')
     if host == 'opencode':
         assert config.backend_settings['opencode']['test_env'] == expected_env
     else:
