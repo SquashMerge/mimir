@@ -49,6 +49,8 @@
 # attempt, one timestamped file per attempt) — debugging material, not
 # durable state; tracking them grows .git/objects permanently.
 state/worklink/transcripts/
+# PR-lease draft snapshots are private, recoverable local copies, not durable state.
+state/pr-lease-drafts/
 *.db
 *.db-shm
 *.db-wal

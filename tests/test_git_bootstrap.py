@@ -634,6 +634,41 @@ def test_gitignore_admits_arbitrary_state_file(tmp_path: Path) -> None:
     assert "state/voice-drafts.md" in res.stdout
 
 
+def test_gitignore_blocks_pr_lease_drafts_in_new_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    git_bootstrap.bootstrap_git_repo(home)
+
+    draft = home / "state" / "pr-lease-drafts" / "draft-x"
+    draft.mkdir(parents=True)
+    for name in (
+        "history.bundle", "worktree.patch", "staged.patch",
+        "untracked.tar", "metadata.json",
+    ):
+        path = draft / name
+        path.write_text("private draft\n")
+        assert _git(
+            "check-ignore", str(path.relative_to(home)), cwd=home, check=False,
+        ).returncode == 0
+
+    state = home / "state" / "other.json"
+    state.write_text("{}\n")
+    run = home / "state" / "worklink" / "runs" / "run-x.json"
+    run.parent.mkdir(parents=True)
+    run.write_text("{}\n")
+    for path in (state, run):
+        assert _git(
+            "check-ignore", str(path.relative_to(home)), cwd=home, check=False,
+        ).returncode == 1
+
+    _git("add", "-A", cwd=home)
+    tracked = _git("ls-files", cwd=home).stdout.splitlines()
+    assert "state/other.json" in tracked
+    assert "state/worklink/runs/run-x.json" in tracked
+    assert not any(path.startswith("state/pr-lease-drafts/") for path in tracked)
+    assert (draft / "history.bundle").read_text() == "private draft\n"
+
+
 def test_gitignore_reblocks_dotenv_under_allowlisted_roots(tmp_path: Path) -> None:
     """A ``.env`` under an allowlisted root (state/, memory/, ...) must be
     IGNORED, not merely refused by the hook. The gitignore re-block must mirror
@@ -1439,5 +1474,54 @@ def test_gitignore_upgrade_matches_leading_slash_variant(tmp_path: Path) -> None
 
     gi = tmp_path / ".gitignore"
     # Operator already ignores it with a leading slash — must not duplicate.
-    gi.write_text("/state/worklink/transcripts/\n", encoding="utf-8")
+    gi.write_text(
+        "/state/worklink/transcripts/\nstate/pr-lease-drafts/\n",
+        encoding="utf-8",
+    )
     assert _append_missing_gitignore_entries(gi) is False
+
+
+@pytest.mark.parametrize("existing_entry", ["", "/state/pr-lease-drafts/\n"])
+def test_existing_gitignore_upgrades_pr_lease_drafts(
+    tmp_path: Path, existing_entry: str,
+) -> None:
+    home = tmp_path / "home"
+    _init_bare_repo(home)
+    # Pre-upgrade allowlist plus operator edits; deliberately no final newline.
+    original = (
+        "*\n!*/\n!state/**\nstate/worklink/transcripts/\n"
+        f"{existing_entry}# operator's own file\n*.secret\nscratch/"
+    )
+    gi = home / ".gitignore"
+    gi.write_text(original, encoding="utf-8")
+
+    draft = home / "state" / "pr-lease-drafts" / "draft-x" / "metadata.json"
+    draft.parent.mkdir(parents=True)
+    draft.write_text("{}\n")
+    if not existing_entry:
+        assert _git(
+            "check-ignore", str(draft.relative_to(home)), cwd=home, check=False,
+        ).returncode == 1
+
+    first = git_bootstrap.bootstrap_git_repo(home)
+    upgraded = gi.read_text(encoding="utf-8")
+    assert first.gitignore_written is (not existing_entry)
+    assert upgraded.startswith(original)
+    assert sum(
+        line.strip("/") == "state/pr-lease-drafts"
+        for line in upgraded.splitlines()
+    ) == 1
+    assert _git(
+        "check-ignore", str(draft.relative_to(home)), cwd=home, check=False,
+    ).returncode == 0
+
+    for relative in ("state/other.json", "state/worklink/runs/run-x.json"):
+        path = home / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+        assert _git("check-ignore", relative, cwd=home, check=False).returncode == 1
+
+    second = git_bootstrap.bootstrap_git_repo(home)
+    assert second.gitignore_written is False
+    assert gi.read_text(encoding="utf-8") == upgraded
+    assert draft.read_text() == "{}\n"
