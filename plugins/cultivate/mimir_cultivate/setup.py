@@ -114,6 +114,24 @@ def _build_context_helper(host: str = "opencode") -> str:
 # GHSA-vc25-qg58-w57c affects cargo-nextest 0.9.125 through 0.9.149.
 DEFAULT_NEXTEST_VERSION = "0.9.150"
 DEFAULT_UV_VERSION = "0.11.0"
+DEFAULT_SCCACHE_VERSION = "0.12.0"
+DEFAULT_SCCACHE_CACHE_SIZE = "20G"
+SCCACHE_DIR = "/var/cache/mimir-sccache"
+# Upstream release asset SHA-256 digests, not a checksum fetched at build time:
+# https://github.com/mozilla/sccache/releases/tag/v0.12.0
+# https://github.com/mozilla/sccache/releases/tag/v0.11.0
+# A repository sccache@X.Y.Z / sccache-version: X.Y.Z declaration must have
+# reviewed digests here; never silently trust an unknown version.
+_SCCACHE_SHA256 = {
+    "0.11.0": {
+        "amd64": "c861cdb23e83433e1a9929f15b2e829c6f8f82d6e7ea2a6dc188b91e3c3e12fb",
+        "arm64": "46aaa502e06fdf3ac4c96f6a58f3579c6f76c6bcb3062098a1101fcffda2d021",
+    },
+    "0.12.0": {
+        "amd64": "b0e89ead6899224a4ba2b90e9073bf1ce036d95bab30f3dc33c1e1468bc4ad44",
+        "arm64": "111ddd28fb108cb3e17edb69ab62cefe1dcc97b02e5006ff9c1330f4f2e78368",
+    },
+}
 _MAX_TOOL_PIN_FILES = 64
 _MAX_TOOL_PIN_FILE_BYTES = 64 * 1024
 DEFAULT_SAGA_MODELS = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5",
@@ -756,6 +774,7 @@ def _tool_pin(files: dict[str, str | None], tool: str, default: str) -> str:
     patterns = {
         "nextest": r"cargo-nextest@([0-9]+\.[0-9]+\.[0-9]+)",
         "uv": r"uv-version:\s*['\"]?([0-9]+\.[0-9]+\.[0-9]+)",
+        "sccache": r"(?:sccache@|sccache-version:\s*['\"]?)([0-9]+\.[0-9]+\.[0-9]+)",
     }
     pins = {match for text in files.values() if text for match in re.findall(patterns[tool], text)}
     if len(pins) > 1:
@@ -763,9 +782,34 @@ def _tool_pin(files: dict[str, str | None], tool: str, default: str) -> str:
     return next(iter(pins), default)
 
 
+def _sccache_hashes(version: str) -> dict[str, str]:
+    hashes = _SCCACHE_SHA256.get(version)
+    if hashes is None:
+        raise SetupError(f"Unsupported sccache pin {version!r}; add reviewed amd64 and arm64 release SHA-256 pins before setup.")
+    return hashes
+
+
+def _sccache_settings(args: argparse.Namespace, previous: dict) -> tuple[bool, str]:
+    enabled = getattr(args, "sccache", None)
+    enabled = previous.get("sccache", True) if enabled is None else enabled
+    size = getattr(args, "sccache_cache_size", None)
+    size = previous.get("sccache_cache_size", DEFAULT_SCCACHE_CACHE_SIZE) if size is None else size
+    if not isinstance(enabled, bool):
+        raise SetupError("Invalid sccache setting in manifest.json; expected a boolean.")
+    from .worklink.backends.opencode import validate_test_env
+
+    try:
+        validate_test_env({"SCCACHE_CACHE_SIZE": size})
+    except ValueError as exc:
+        raise SetupError(f"Invalid --sccache-cache-size: {exc}") from None
+    return enabled, size
+
+
 def render_layer(kind: str, version: str, root_image: str, *,
                  nextest_version: str = DEFAULT_NEXTEST_VERSION,
                  uv_version: str = DEFAULT_UV_VERSION,
+                 sccache: bool = True, sccache_version: str = DEFAULT_SCCACHE_VERSION,
+                 sccache_cache_size: str = DEFAULT_SCCACHE_CACHE_SIZE,
                  system_packages: list[str] | None = None) -> str:
     """Keep version-pinned tools on /usr/local/bin, without changing shell policy."""
     packages = validate_system_packages(system_packages or [])
@@ -788,6 +832,25 @@ def render_layer(kind: str, version: str, root_image: str, *,
                    "tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest && rm /tmp/nextest.tar.gz\n"
                    "RUN set -eu; install -d -o worklink -g worklink -m 0700 /var/cache/mimir-cargo\n"
                    "ENV CARGO_HOME=/var/cache/mimir-cargo\n")
+        if sccache:
+            hashes = _sccache_hashes(sccache_version)
+            cache_env = toolchain_test_env(kind, sccache_cache_size=sccache_cache_size)
+            install += (
+                "RUN set -eu; arch=$(dpkg --print-architecture); case $arch in "
+                f"amd64) triple=x86_64-unknown-linux-musl; sha256={hashes['amd64']};; "
+                f"arm64) triple=aarch64-unknown-linux-musl; sha256={hashes['arm64']};; "
+                "*) exit 2;; esac && tmp=$(mktemp -d) && "
+                f"archive=sccache-v{sccache_version}-$triple && "
+                'curl -fsSLo "$tmp/sccache.tar.gz" '
+                f"https://github.com/mozilla/sccache/releases/download/v{sccache_version}/$archive.tar.gz && "
+                'printf \'%s  %s\\n\' "$sha256" "$tmp/sccache.tar.gz" | sha256sum -c - && '
+                'tar -xzf "$tmp/sccache.tar.gz" -C "$tmp" "$archive/sccache" && '
+                'install -o root -g root -m 0755 "$tmp/$archive/sccache" /usr/local/bin/sccache && '
+                'rm -r "$tmp"\n'
+                f"RUN set -eu; install -d -o worklink -g worklink -m 0700 {SCCACHE_DIR}\n"
+                + "ENV " + " ".join(f"{key}={cache_env[key]}" for key in
+                                   ("RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE")) + "\n"
+            )
     elif kind == "node":
         install = (f"RUN set -eu; arch=$(dpkg --print-architecture); case $arch in amd64) arch=x64;; arm64) ;; *) exit 2;; esac && "
                     "apt-get update && apt-get install -y --no-install-recommends g++ make python3 && "
@@ -854,7 +917,7 @@ def _heavy_lock_timeout(args: argparse.Namespace, previous: dict, heavy_lock_dir
 
 def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, codex: bool = False,
                    heavy_lock_dir: str | None = None, heavy_lock_timeout: str | None = "14400",
-                   worklink_host: str = "opencode") -> str:
+                   sccache: bool = True, worklink_host: str = "opencode") -> str:
     """Modify the scaffold structurally; fail closed on incompatible shapes."""
     if worklink_host not in {"opencode", "claude_code"}:
         raise SetupError("Worklink host must be opencode or claude_code.")
@@ -872,6 +935,8 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
         del agent["build"]
         agent["image"] = layer_tag
         passthrough = "UV_PYTHON_INSTALL_DIR" if kind == "python" else "RUSTUP_HOME,CARGO_HOME" if kind == "rust" else ""
+        if kind == "rust" and sccache:
+            passthrough += ",RUSTC_WRAPPER,SCCACHE_DIR,SCCACHE_CACHE_SIZE"
         environment.update({"MIMIR_ACP_ENABLED": "1", "MIMIR_PR_CHECKOUT_LEASE_ROOT": "/workspace/pr-leases",
                             "MIMIR_SHELL_PASS_ENV": passthrough, "MIMIR_ENABLE_CLAUDE_CODE": "0",
                             "MIMIR_HOME": "/home/mimir/agent", "MIMIR_PLUGINS": "cultivate",
@@ -888,6 +953,8 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                    "worklink-daemon:/var/lib/mimir-worklink/daemon"]
         if worklink_host == "claude_code":
             volumes.pop()
+        if kind == "rust" and sccache:
+            volumes.append(f"sccache:{SCCACHE_DIR}")
         if codex:
             volumes.append("./codex:/home/mimir/.codex")
             environment["CODEX_HOME"] = "/home/mimir/.codex"
@@ -912,6 +979,10 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
         doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon")}
         if worklink_host == "claude_code":
             del doc["volumes"]["worklink-daemon"]
+        if kind == "rust" and sccache:
+            doc["volumes"]["sccache"] = None
+            doc["services"]["init"]["command"][0] += (
+                f" && install -d -o worklink -g worklink -m 0700 {SCCACHE_DIR}")
         return yaml.safe_dump(doc, sort_keys=False)
     except (KeyError, TypeError, AttributeError, yaml.YAMLError):
         raise SetupError("Incompatible scaffold Compose template; expected agent build and environment mapping.") from None
@@ -1058,12 +1129,16 @@ def _check_in_flight(deploy: Path, run) -> None:
         raise SetupError("Agent is busy: " + ", ".join(active) + "; retry when idle or use --force.")
 
 
-def toolchain_test_env(kind: str) -> dict[str, str]:
+def toolchain_test_env(kind: str, *, sccache: bool = True,
+                      sccache_cache_size: str = DEFAULT_SCCACHE_CACHE_SIZE) -> dict[str, str]:
     """Settings persisted for both the leaf build and its evidence gate."""
     from .worklink.backends.opencode import validate_test_env
 
     env = {'rust': {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'},
            'python': {'UV_PYTHON_INSTALL_DIR': '/opt/uv-python'}, 'node': {}}[kind]
+    if kind == "rust" and sccache:
+        env.update({"RUSTC_WRAPPER": "/usr/local/bin/sccache", "SCCACHE_DIR": SCCACHE_DIR,
+                    "SCCACHE_CACHE_SIZE": sccache_cache_size})
     validate_test_env(env)
     return env
 
@@ -1071,6 +1146,7 @@ def toolchain_test_env(kind: str) -> dict[str, str]:
 def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
                         git_auth: list[str], force: bool = False,
                         toolchain: str | None = None, tracker: dict | None = None,
+                        sccache: bool = True, sccache_cache_size: str = DEFAULT_SCCACHE_CACHE_SIZE,
                         previous_tracker: dict | None = None, model_spec: str | None = None) -> bool:
     """Reconcile the dedicated, controller-owned base and Worklink settings."""
     from .worklink.backends.registry import BackendRegistry, WorklinkConfig, _derive_bash_allowlist
@@ -1140,8 +1216,9 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         script_arguments = bool(re.fullmatch(
             fr"\./(?:{component}/)*{component}", entry['test_command']
         )) and '..' not in entry['test_command'].split('/')
-    config['backends'] = {'opencode': {'bash_allowlist': allowlist,
-                                     'test_env': toolchain_test_env(toolchain) if toolchain else {}}}
+    test_env = toolchain_test_env(toolchain, sccache=sccache,
+                                 sccache_cache_size=sccache_cache_size) if toolchain else {}
+    config['backends'] = {'opencode': {'bash_allowlist': allowlist, 'test_env': test_env}}
     if model_spec is not None and model_spec.startswith("claude-code:"):
         from .claude_code import bash_rules, resolve_model
         from .worklink.claude_factory_host import DEFAULT_ENTRYPOINT
@@ -1151,7 +1228,7 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         config['backends'] = {
             'claude_code': {'model': model, 'bash_allowlist': allowlist,
                             'pass_env': ['CLAUDE_CODE_OAUTH_TOKEN',
-                                         *(toolchain_test_env(toolchain) if toolchain else {})]},
+                                         *test_env]},
             'feature_factory': {'host': 'claude_code', 'model': model,
                                 'entrypoint': DEFAULT_ENTRYPOINT},
         }
@@ -1455,7 +1532,9 @@ def _agent_exec(deploy: Path, *argv: str) -> str:
 
 _TOOLCHAIN_WORKER_PROBE = """\
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1481,6 +1560,18 @@ with tempfile.TemporaryDirectory(prefix='mimir-toolchain-probe-') as home:
   except (KeyError, OSError):
    print('toolchain_missing: cargo')
    sys.exit(0)
+  if 'RUSTC_WRAPPER' in env:
+   try:
+    cache = Path(env['SCCACHE_DIR'])
+    info = cache.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+     raise OSError('unsafe cache permissions')
+    with tempfile.NamedTemporaryFile(dir=cache, prefix='setup-write-'):
+     pass
+   except (KeyError, OSError):
+    print('toolchain_missing: sccache')
+    sys.exit(0)
+   commands.append(('sccache', [env['RUSTC_WRAPPER'], '--version']))
  if kind == 'python':
   commands.append(('python', ['uv', 'python', 'find', '--managed-python', '--no-python-downloads', '--no-project', version]))
  for tool, argv in commands:
@@ -1535,7 +1626,8 @@ def toolchain_probe_environment(config) -> dict[str, str]:
         settings = config.backend_settings['claude_code']
         # Match the leaf's declared tool variables, without sending OAuth to a
         # compiler/version probe or synthesizing OpenCode configuration.
-        tool_names = {'RUSTUP_HOME', 'CARGO_HOME', 'UV_PYTHON_INSTALL_DIR'}
+        tool_names = {'RUSTUP_HOME', 'CARGO_HOME', 'UV_PYTHON_INSTALL_DIR',
+                      'RUSTC_WRAPPER', 'SCCACHE_DIR', 'SCCACHE_CACHE_SIZE'}
         test_env = {name: os.environ[name] for name in settings.get('pass_env', ())
                     if name in tool_names and name in os.environ}
         validate_test_env(test_env)
@@ -1567,7 +1659,7 @@ def _verify_toolchain(deploy: Path, kind: str, version: str) -> None:
                   "agent", "/usr/local/bin/python", "-c", _TOOLCHAIN_WORKER_PROBE,
                   configured, kind, version], cwd=deploy)
     if check != "ok":
-        tools = {"rust": {"rustc", "cargo", "cargo-fmt", "cargo-clippy", "cargo-nextest", "cc"},
+        tools = {"rust": {"rustc", "cargo", "cargo-fmt", "cargo-clippy", "cargo-nextest", "cc", "sccache"},
                  "node": {"node", "npm", "npx", "c++"}, "python": {"uv", "python", "cc"}}
         reason = check if check in {"toolchain_missing: " + tool for tool in tools[kind]} else "toolchain_missing: " + kind
         raise SetupError(f"Leaf toolchain verification failed ({reason}); rebuild the agent image and check its toolchain installation.")
@@ -1774,6 +1866,10 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
                        help="Absolute host directory shared with other agents for heavy-run leases "
                             "(scripts/heavy_run.sh); mounted at " + HEAVY_LOCK_MOUNT + " with MIMIR_HEAVY_LOCK_FILE set. "
                             "none clears the directory and timeout; omit to preserve the saved directory.")
+    setup.add_argument("--sccache", action=argparse.BooleanOptionalAction, default=None,
+                       help="Enable Rust compiler caching (default); --no-sccache preserves the uncached image and test env. Omit to preserve the saved setting.")
+    setup.add_argument("--sccache-cache-size",
+                       help="Rust compiler cache size, e.g. 20G (default); omit to preserve the saved cap.")
     setup.add_argument("--heavy-lock-timeout", metavar="seconds",
                        help="Heavy-run timeout covering queueing plus running: ASCII digits, 60..86400 "
                             "(default: 14400); omit to preserve the saved timeout. Only written with a shared directory.")
@@ -1978,6 +2074,11 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     tree = _repository_tree(repo, branch, token, request)
     files.update(_tool_pin_files(repo, branch, token, tree, request))
     kind, version, suggestion = detect_toolchain(files)
+    sccache, sccache_cache_size = _sccache_settings(args, previous)
+    sccache_version = DEFAULT_SCCACHE_VERSION
+    if kind == "rust" and sccache:
+        sccache_version = _tool_pin(files, "sccache", DEFAULT_SCCACHE_VERSION)
+        _sccache_hashes(sccache_version)
     suggestion = _verify_script(repo, branch, token, request, tree) or suggestion
     nextest_version = _tool_pin(files, "nextest", DEFAULT_NEXTEST_VERSION)
     uv_version = _tool_pin(files, "uv", DEFAULT_UV_VERSION)
@@ -2017,6 +2118,12 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "--build-arg MIMIR_EXTRAS=" + ",".join(sorted(extras))]
     context_helper = _build_context_helper(host)
     provision = _PROVISION
+    if kind == "rust":
+        provision = provision.replace(
+            "toolchain=m.get('toolchain'),",
+            "toolchain=m.get('toolchain'),\n"
+            "                            sccache=m.get('sccache', True),\n"
+            "                            sccache_cache_size=m.get('sccache_cache_size', '20G'),")
     if claude:
         build_args = [arg for arg in build_args if arg != "--build-arg MIMIR_ENABLE_OPENCODE=1"]
         build_args.extend(["--build-arg MIMIR_WORKLINK_HOST=claude_code",
@@ -2054,7 +2161,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   + release.agent.sha256 + " MIMIR_CULTIVATE_SHA256=" + release.cultivate.sha256 + "\n")
     compose = provenance + render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex,
                                           heavy_lock_dir=heavy_lock_dir, heavy_lock_timeout=heavy_lock_timeout,
-                                          worklink_host=host)
+                                          sccache=sccache, worklink_host=host)
     generated = {"compose.yml": compose, ".gitignore": "*\n", "build_context.py": context_helper,
                  "provision.py": provision, "compose.provision.yml": provenance + _PROVISION_COMPOSE}
     _check_generated(deploy, generated, previous, force=bool(getattr(args, "force", False)))
@@ -2082,7 +2189,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         path.chmod(0o600)
     # The layer and build script are wholly generated from setup inputs.
     _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
-           nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages), replace=True)
+           nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages,
+           sccache=sccache, sccache_version=sccache_version, sccache_cache_size=sccache_cache_size), replace=True)
     _write(deploy / "build.sh", build_script, mode=0o755, replace=True)
     for name, text in generated.items():
         _write(deploy / name, text, replace=True)
@@ -2124,6 +2232,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                     **(tracing_manifest if tracing_env else {})}
     if claude:
         manifest["worklink_toolchain"] = _worklink_toolchain()
+    if kind == "rust":
+        manifest.update({"sccache": sccache, "sccache_cache_size": sccache_cache_size})
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     # The provision script and manifest are mounted read-only for a one-shot
     # non-root container, never into the long-running agent.

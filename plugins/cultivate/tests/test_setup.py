@@ -2248,6 +2248,38 @@ def test_pinned_auxiliary_tools_and_repo_override():
         installer._tool_pin(files, "nextest", installer.DEFAULT_NEXTEST_VERSION)
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_setup_sccache_settings_reach_layer_compose_and_provision(setup_environment, enabled):
+    deploy, args, state, calls, invoke = setup_environment
+    state["repository_files"] = {
+        "rust-toolchain.toml": '[toolchain]\nchannel = "1.99.1"',
+        ".github/actions/install/action.yml": "tool: sccache@0.11.0",
+    }
+    args.sccache = enabled
+    args.sccache_cache_size = "5G"
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["sccache"] is enabled
+    assert manifest["sccache_cache_size"] == "5G"
+    layer = (deploy / "Dockerfile.toolchain").read_text()
+    if enabled:
+        assert "https://github.com/mozilla/sccache/releases/download/v0.11.0/" in layer
+        assert "SCCACHE_CACHE_SIZE=5G" in layer
+    else:
+        assert "sccache" not in layer
+    compose = yaml.safe_load((deploy / "compose.yml").read_text())
+    assert ("sccache" in compose["volumes"]) is enabled
+    script = (deploy / "provision.py").read_text()
+    assert "sccache=m.get('sccache', True)" in script
+    assert "sccache_cache_size=m.get('sccache_cache_size', '20G')" in script
+    compile(script, "provision.py", "exec")
+    # An ordinary rerun preserves both the opt-out and the size override.
+    args.sccache = args.sccache_cache_size = None
+    invoke()
+    assert (deploy / "Dockerfile.toolchain").read_text() == layer
+    assert json.loads((deploy / "manifest.json").read_text())["sccache"] is enabled
+
+
 def test_nextest_default_outside_advisory_range():
     version = tuple(map(int, installer.DEFAULT_NEXTEST_VERSION.split(".")))
     assert not (0, 9, 125) <= version <= (0, 9, 149), "GHSA-vc25-qg58-w57c"
@@ -2798,7 +2830,7 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
 
     cache = tmp_path / 'cargo-cache'
     cache.mkdir()
-    test_env = installer.toolchain_test_env(kind)
+    test_env = installer.toolchain_test_env(kind, sccache=False)
     if kind == 'rust':
         assert test_env == {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'}
         test_env['CARGO_HOME'] = str(cache)
@@ -3382,7 +3414,9 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert worklink.defaults.test_command == inventory['repositories'][0]['test_command']
     assert worklink.defaults.allow_autonomous_local_subprocess
     assert worklink.backend_settings['opencode']['test_env'] == {
-        'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'}
+        'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo',
+        'RUSTC_WRAPPER': '/usr/local/bin/sccache', 'SCCACHE_DIR': '/var/cache/mimir-sccache',
+        'SCCACHE_CACHE_SIZE': '20G'}
     assert (home / '.chainlink/agent.json').read_text() == '{"id":"cultivate-worklink"}'
     assert any(argv[-1] == str(tmp_path / 'worklink/base/repo') for argv in calls if 'clone' in argv)
     assert not any("setup-git" in argv for argv in calls)
@@ -3572,7 +3606,9 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch,
     assert config.defaults.base_branch == entry['base_branch']
     assert config.defaults.test_command == entry['test_command']
     assert config.defaults.backend == host
-    expected_env = {'rust': {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'},
+    expected_env = {'rust': {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo',
+                             'RUSTC_WRAPPER': '/usr/local/bin/sccache',
+                             'SCCACHE_DIR': '/var/cache/mimir-sccache', 'SCCACHE_CACHE_SIZE': '20G'},
                     'python': {'UV_PYTHON_INSTALL_DIR': '/opt/uv-python'}, 'node': {}}[toolchain]
     if host == 'opencode':
         assert config.backend_settings['opencode']['test_env'] == expected_env
@@ -3676,6 +3712,32 @@ def worklink_script_config(tmp_path, monkeypatch):
             git_auth=['git', '-c', 'credential.helper=fixture'], **options)
 
     return home, provision
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_sccache_provision_settings_reach_builder_and_gate(worklink_script_config, monkeypatch, enabled):
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+    from mimir_cultivate.worklink.compute import _enabled_child_env
+
+    home, provision = worklink_script_config
+    provision(toolchain="rust", sccache=enabled, sccache_cache_size="5G")
+    config = WorklinkConfig.load(home / "worklink.yaml")
+    selected = config.backend_settings["opencode"]["test_env"]
+    expected = {"RUSTUP_HOME": "/opt/rustup", "CARGO_HOME": "/var/cache/mimir-cargo"}
+    if enabled:
+        expected.update({"RUSTC_WRAPPER": "/usr/local/bin/sccache",
+                         "SCCACHE_DIR": "/var/cache/mimir-sccache", "SCCACHE_CACHE_SIZE": "5G"})
+    assert selected == expected
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:proof-model")
+    backend = BackendRegistry(config).get("opencode")
+    for attempt in (1, 2):
+        spec = backend.work_spec(WorkOrder(1, home, "", None, 30, {}), attempt=attempt,
+                                 repo_url="", base_ref="", branch="", test_command="./tools/verify")
+        # This persisted setting is also what the orchestrator passes to the gate.
+        assert spec.backend_config["test_env"] == expected
+        child_env = _enabled_child_env(spec, "sccache-proof")
+        assert {key: child_env[key] for key in expected} == expected
 
 
 @pytest.mark.parametrize('command, expected', [
