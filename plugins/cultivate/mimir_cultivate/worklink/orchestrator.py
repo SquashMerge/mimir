@@ -506,7 +506,8 @@ def _sweep_retained_attempts(
                 continue
             _log_event("worklink_attempt_preserved", issue_id=issue_id, attempt=preserved.attempt,
                        ref=preserved.ref, error=preserved.error, status=preserved.status,
-                       failures=preserved.failures, trigger="dispatch")
+                       failures=preserved.failures, omitted_paths=preserved.omitted_paths,
+                       omitted_count=preserved.omitted_count, trigger="dispatch")
             comment(issue_id, preserved_line(preserved))
             swept = True
         except Exception as exc:  # noqa: BLE001 - never blocks dispatch
@@ -1857,7 +1858,9 @@ class WorklinkRunner:
                 return None
             _log_event("worklink_attempt_preserved", issue_id=record.issue_id,
                        attempt=record.attempt, ref=preserved.ref, error=preserved.error,
-                       status=preserved.status, failures=preserved.failures)
+                       status=preserved.status, failures=preserved.failures,
+                       omitted_paths=preserved.omitted_paths,
+                       omitted_count=preserved.omitted_count)
             claims._run(  # noqa: SLF001
                 "issue", "comment", str(record.issue_id), preserved_line(preserved),
             )
@@ -1891,7 +1894,9 @@ class WorklinkRunner:
                 return
             _log_event("worklink_attempt_preserved", issue_id=lease.issue_id,
                        attempt=lease.attempt, ref=preserved.ref, error=preserved.error,
-                       status=preserved.status, failures=preserved.failures)
+                       status=preserved.status, failures=preserved.failures,
+                       omitted_paths=preserved.omitted_paths,
+                       omitted_count=preserved.omitted_count)
             claims._run(  # noqa: SLF001 - Chainlink wrapper owns quoting/checks.
                 "issue", "comment", str(lease.issue_id), preserved_line(preserved),
             )
@@ -7168,8 +7173,19 @@ def _assert_staged_diff_has_no_secret(
 class _GateCheckoutSnapshot:
     dirty: set[str]
     untracked: set[str]
-    fingerprints: dict[str, tuple[int, str] | None]
+    fingerprints: dict[str, tuple[object, ...] | None]
     index_diff: str
+
+
+_GATE_SNAPSHOT_FILE_BYTES = 1_048_576
+_GATE_SNAPSHOT_TOTAL_BYTES = 16 * _GATE_SNAPSHOT_FILE_BYTES
+
+
+def _gate_metadata_fingerprint(marker: str, metadata: os.stat_result) -> tuple[object, ...]:
+    return (
+        marker, metadata.st_mode, metadata.st_size, metadata.st_mtime_ns,
+        metadata.st_ctime_ns, metadata.st_ino, metadata.st_dev,
+    )
 
 
 def _top_level(path: str) -> str:
@@ -7209,19 +7225,48 @@ def _gate_checkout_snapshot(
             dirty.add(records[position])
         position += 1
 
-    fingerprints: dict[str, tuple[int, str] | None] = {}
-    for path in dirty if protected is None else protected:
+    fingerprints: dict[str, tuple[object, ...] | None] = {}
+    remaining = _GATE_SNAPSHOT_TOTAL_BYTES
+    # Stable ordering keeps protected paths' budget allocation independent of
+    # newly untracked gate output.
+    for path in sorted(dirty if protected is None else protected):
         target = checkout / path
+        metadata = None
         try:
             metadata = target.lstat()
             if stat.S_ISLNK(metadata.st_mode):
+                # Read only the link, never its (possibly huge) target.
                 data = os.readlink(target).encode("utf-8", "surrogateescape")
             elif stat.S_ISREG(metadata.st_mode):
-                data = target.read_bytes()
+                limit = min(_GATE_SNAPSHOT_FILE_BYTES, remaining)
+                if metadata.st_size > limit:
+                    fingerprints[path] = _gate_metadata_fingerprint("bounded", metadata)
+                    continue
+                # Bound the actual read too: a worker may grow the file after
+                # lstat. Reserve the allowance even if open/read fails.
+                remaining -= limit
+                with target.open("rb", buffering=0) as stream:
+                    data = stream.read(limit)
+                    current = os.fstat(stream.fileno())
+                remaining += limit - len(data)
+                if (
+                    len(data) != metadata.st_size
+                    or _gate_metadata_fingerprint("", current)
+                    != _gate_metadata_fingerprint("", metadata)
+                ):
+                    fingerprints[path] = _gate_metadata_fingerprint("unstable", current)
+                    continue
             else:
                 data = b""
         except FileNotFoundError:
             fingerprints[path] = None
+        except OSError:
+            # If lstat failed too, no stable evidence exists. A fresh token
+            # fails closed on comparison instead of trusting a constant.
+            fingerprints[path] = (
+                _gate_metadata_fingerprint("unreadable", metadata)
+                if metadata is not None else ("unreadable", object())
+            )
         else:
             fingerprints[path] = (metadata.st_mode, hashlib.sha256(data).hexdigest())
     return _GateCheckoutSnapshot(dirty, untracked, fingerprints, index.stdout)

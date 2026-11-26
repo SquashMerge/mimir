@@ -22,6 +22,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -67,6 +68,8 @@ class PreservedAttempt:
     status: str = "preserved"
     failures: int = 0
     retry_after: float | None = None
+    omitted_paths: list[str] = field(default_factory=list)
+    omitted_count: int = 0
 
 
 def _positive(value: object, name: str) -> int:
@@ -228,6 +231,41 @@ def _gate_summary(home: Path, issue_id: int, attempt: int) -> str | None:
     return redact_text(summary)[:MAX_REASON]
 
 
+def _stage_attempt(git: ControllerGitPublication, checkout: Path, omitted: list[str]) -> None:
+    # Never silently omit tracked work. Errors retain the existing bounded
+    # retry/terminal lifecycle.
+    _git_ok(git.run("add", "-u", timeout=GIT_TIMEOUT_S), "add tracked")
+    result = git.run("ls-files", "-z", "--others", "--exclude-standard", timeout=GIT_TIMEOUT_S)
+    _git_ok(result, "list untracked")
+    selected = []
+    for path in result.stdout.split("\0"):
+        if not path:
+            continue
+        target = checkout / path
+        try:
+            metadata = target.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                os.readlink(target)
+            elif stat.S_ISREG(metadata.st_mode):
+                # Probe as the controller: mode bits/os.access do not reliably
+                # account for ACLs and the worker's different uid.
+                with target.open("rb", buffering=0) as stream:
+                    stream.read(1)
+            else:
+                # Git cannot preserve special files. Never block on a FIFO.
+                omitted.append(path)
+                continue
+        except OSError:
+            omitted.append(path)
+        else:
+            selected.append(path)
+    # Literal pathspecs prevent worker filenames selecting omitted files.
+    # Batch build trees to stay below the OS argv limit.
+    for start in range(0, len(selected), 200):
+        _git_ok(git.run("--literal-pathspecs", "add", "--", *selected[start:start + 200],
+                        timeout=GIT_TIMEOUT_S), "add untracked")
+
+
 def preserve_attempt(
     *,
     home: Path,
@@ -278,13 +316,14 @@ def _preserve_attempt(
     gate = _gate_summary(home, issue_id, attempt)
     bounded_reason = redact_text(reason)[:MAX_REASON] if reason else None
     base = head = None
+    omitted: list[str] = []
     try:
         with _checkout_git(checkout, trusted_repo, branch,
                            home / "state" / "worklink" / "publication", publication) as git:
             # Snapshot tracked and untracked work in the controller-owned index;
             # the worker's own index and config never take part.
             _git_ok(git.run("read-tree", "HEAD", timeout=GIT_TIMEOUT_S), "read-tree")
-            _git_ok(git.run("add", "-A", timeout=GIT_TIMEOUT_S), "add")
+            _stage_attempt(git, checkout, omitted)
             tree = _git_ok(git.run("write-tree", timeout=GIT_TIMEOUT_S), "write-tree")
             parent = _git_ok(git.run("rev-parse", "--verify", "HEAD^{commit}", timeout=GIT_TIMEOUT_S), "rev-parse")
             head = _git_ok(git.run(
@@ -299,7 +338,7 @@ def _preserve_attempt(
         names = _git_ok(runner(["git", "-C", str(trusted_repo), "diff", "--name-only", floor, head]),
                         "diff --name-only")
         files = [name for name in names.splitlines() if name]
-        if not files:
+        if not files and not omitted:
             runner(["git", "-C", str(trusted_repo), "update-ref", "-d", ref])
             atomic_write_json(_lifecycle_dir(home, issue_id) / f"{attempt}.json", {
                 "issue": issue_id, "attempt": attempt, "status": "empty",
@@ -314,6 +353,7 @@ def _preserve_attempt(
             files=files[:MAX_FILES], gate=gate, reason=bounded_reason,
             spec_sha256=spec["sha256"] if spec else None, created_at=created,
             patch_truncated=truncated,
+            omitted_paths=omitted[:MAX_FILES], omitted_count=len(omitted),
         )
         state = _state_dir(home, issue_id)
         state.mkdir(parents=True, exist_ok=True)
@@ -327,6 +367,7 @@ def _preserve_attempt(
             created_at=created, error=redact_text(f"{type(exc).__name__}: {exc}")[:MAX_REASON],
             status="unpreservable" if terminal else "retry_pending", failures=failures,
             retry_after=None if terminal else time.time() + RETRY_BACKOFF_S * 2 ** (failures - 1),
+            omitted_paths=omitted[:MAX_FILES], omitted_count=len(omitted),
         )
     state = _state_dir(home, issue_id)
     state.mkdir(parents=True, exist_ok=True)
@@ -412,6 +453,8 @@ def preserved_line(record: PreservedAttempt) -> str:
         "files": record.files, "gate": record.gate, "reason": record.reason,
         "patch_truncated": record.patch_truncated,
         "status": record.status,
+        "omitted_paths": record.omitted_paths,
+        "omitted_count": record.omitted_count,
     }
     if record.error is not None:
         fields["error"] = record.error
