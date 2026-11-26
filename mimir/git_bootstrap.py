@@ -457,6 +457,11 @@ _REQUIRED_GITIGNORE_ENTRIES: tuple[tuple[str, str], ...] = (
         "(MBs/attempt) —\n# debugging material, not durable state; tracking "
         "them grows .git/objects forever.",
     ),
+    (
+        "state/pr-lease-drafts/",
+        "# PR-lease draft snapshots are private, recoverable local copies, "
+        "not durable state.",
+    ),
 )
 
 
