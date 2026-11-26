@@ -490,7 +490,7 @@ def test_pre_commit_hook_refuses_bearer_token_content(tmp_path: Path) -> None:
 
     # Drop a bearer-token shaped string into a tracked file.
     (home / "memory" / "leak.md").write_text(
-        "Authorization: Bearer ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123\n"
+        "Authorization: Bearer " + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123\n"
     )
     _git("add", "memory/leak.md", cwd=home)
 
@@ -501,6 +501,63 @@ def test_pre_commit_hook_refuses_bearer_token_content(tmp_path: Path) -> None:
     assert proc.returncode != 0
     msg = (proc.stdout + proc.stderr).lower()
     assert "refusing" in msg and "bearer" in msg
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "gepa-cluster-" + "observation-evaluator",
+        "refs/remotes/origin/gepa-cluster-" + "observation-evaluator",
+        "xtvly-" + "a" * 24,
+        "npa-" + "a" * 24,
+        "_xapp-" + "a" * 24,
+        "-AIza" + "a" * 35,
+        "pa-" + "a" * 10 + "-" + "b" * 14,
+    ],
+)
+def test_pre_commit_hook_allows_provider_lookalikes(tmp_path: Path, text: str) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _seed_home_with_hook(home)
+    before = _git("rev-parse", "HEAD", cwd=home).stdout.strip()
+    (home / "memory" / "refs.md").write_text(text + "\n")
+    _git("add", "memory/refs.md", cwd=home)
+
+    proc = _git("commit", "-q", "-m", "benign ref name", cwd=home, check=False)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _git("rev-parse", "HEAD", cwd=home).stdout.strip() != before
+    assert _git("show", "HEAD:memory/refs.md", cwd=home).stdout == text + "\n"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("pa-" + "V_1a" * 6, id="voyage"),
+        pytest.param("tvly-dev-" + "T_1a" * 6, id="tavily"),
+        pytest.param("xapp-1-" + "Ab-1" * 6, id="slack-app"),
+        pytest.param("AIza" + "G_1a-" * 7, id="google"),
+    ],
+)
+@pytest.mark.parametrize(
+    "wrapper", ["{}", "VOYAGE_API_KEY={}", "a {}", '"{}"', "key:{}"]
+)
+def test_pre_commit_hook_refuses_bare_provider_keys(
+    tmp_path: Path, key: str, wrapper: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    _seed_home_with_hook(home)
+    before = _git("rev-parse", "HEAD", cwd=home).stdout.strip()
+    (home / "memory" / "leak.md").write_text(wrapper.format(key) + "\n")
+    _git("add", "memory/leak.md", cwd=home)
+
+    proc = _git("commit", "-q", "-m", "should refuse", cwd=home, check=False)
+
+    assert proc.returncode != 0
+    assert "refusing to commit content matching:" in proc.stderr
+    assert key in proc.stderr
+    assert _git("rev-parse", "HEAD", cwd=home).stdout.strip() == before
 
 
 def test_pre_commit_hook_refuses_credential_filename(tmp_path: Path) -> None:
