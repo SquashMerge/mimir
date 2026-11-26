@@ -474,7 +474,7 @@ def _preserve_before_prune(
         _log_best_effort("worklink_attempt_preserved", issue_id=issue_id, attempt=attempt,
                          ref=preserved.ref, error=preserved.error, status=preserved.status,
                          failures=preserved.failures, omitted_paths=preserved.omitted_paths,
-                         trigger="prune")
+                         omitted_count=preserved.omitted_count, trigger="prune")
         _comment_best_effort(run, issue_id, preserved_line(preserved))
         pruned = prune_preserved(home, repo, issue_id, keep=defaults.preserved_attempts_keep,
                                  runner=lambda args: run(list(args)))

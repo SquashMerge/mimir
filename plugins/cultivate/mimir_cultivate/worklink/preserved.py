@@ -69,6 +69,7 @@ class PreservedAttempt:
     failures: int = 0
     retry_after: float | None = None
     omitted_paths: list[str] = field(default_factory=list)
+    omitted_count: int = 0
 
 
 def _positive(value: object, name: str) -> int:
@@ -352,7 +353,7 @@ def _preserve_attempt(
             files=files[:MAX_FILES], gate=gate, reason=bounded_reason,
             spec_sha256=spec["sha256"] if spec else None, created_at=created,
             patch_truncated=truncated,
-            omitted_paths=omitted,
+            omitted_paths=omitted[:MAX_FILES], omitted_count=len(omitted),
         )
         state = _state_dir(home, issue_id)
         state.mkdir(parents=True, exist_ok=True)
@@ -366,7 +367,7 @@ def _preserve_attempt(
             created_at=created, error=redact_text(f"{type(exc).__name__}: {exc}")[:MAX_REASON],
             status="unpreservable" if terminal else "retry_pending", failures=failures,
             retry_after=None if terminal else time.time() + RETRY_BACKOFF_S * 2 ** (failures - 1),
-            omitted_paths=omitted,
+            omitted_paths=omitted[:MAX_FILES], omitted_count=len(omitted),
         )
     state = _state_dir(home, issue_id)
     state.mkdir(parents=True, exist_ok=True)
@@ -453,6 +454,7 @@ def preserved_line(record: PreservedAttempt) -> str:
         "patch_truncated": record.patch_truncated,
         "status": record.status,
         "omitted_paths": record.omitted_paths,
+        "omitted_count": record.omitted_count,
     }
     if record.error is not None:
         fields["error"] = record.error

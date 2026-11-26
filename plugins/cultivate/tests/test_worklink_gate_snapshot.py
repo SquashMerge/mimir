@@ -8,6 +8,7 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -209,6 +210,32 @@ def test_protected_metadata_changes_fail_closed(checkout, monkeypatch, fallback,
     assert before.fingerprints[target.relative_to(checkout).as_posix()] != after.fingerprints[
         target.relative_to(checkout).as_posix()
     ]
+
+
+@pytest.mark.parametrize("fallback", ["unreadable", "bounded"])
+def test_protected_same_size_rewrite_with_restored_mtime_is_changed(checkout, monkeypatch, fallback):
+    target = checkout / "target-ratchet/private.lock"
+    target.write_bytes(b"before")
+    if fallback == "unreadable":
+        _deny_open(monkeypatch, target)
+    else:
+        monkeypatch.setattr(orch, "_GATE_SNAPSHOT_FILE_BYTES", 4)
+    before = orch._gate_checkout_snapshot(checkout, runner=_runner)
+    metadata = target.lstat()
+    # Cross even a coarse filesystem timestamp tick without changing mode,
+    # size, inode or device. Restore mtime after an in-place gate rewrite.
+    time.sleep(1.05)
+    with open(target, "r+b") as stream:
+        stream.write(b"after!")
+    os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    current = target.lstat()
+    assert current.st_ctime_ns != metadata.st_ctime_ns
+    for field in ("st_mode", "st_size", "st_mtime_ns", "st_ino", "st_dev"):
+        assert getattr(current, field) == getattr(metadata, field), field
+    after = orch._gate_checkout_snapshot(checkout, runner=_runner, protected=before.fingerprints)
+    path = "target-ratchet/private.lock"
+    assert before.fingerprints[path][0] == after.fingerprints[path][0] == fallback
+    assert before.fingerprints[path] != after.fingerprints[path]
 
 
 @pytest.mark.parametrize("change", ["becomes_unreadable", "stat_denied"])

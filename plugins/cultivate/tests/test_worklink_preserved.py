@@ -514,6 +514,48 @@ def test_unreadable_untracked_is_omitted_and_reported_without_retries(rig, monke
     assert target.exists()  # Omission never deletes worker work.
 
 
+@pytest.mark.parametrize("staging_fails", [False, True])
+def test_many_unreadable_paths_have_bounded_reports_and_true_count(rig, monkeypatch, staging_fails):
+    home, operator, _, checkout, _ = rig
+    directory = checkout / "target-ratchet"
+    directory.mkdir()
+    paths = [f"target-ratchet/{index:04d}.lock" for index in range(preserved_mod.MAX_FILES + 7)]
+    for path in paths:
+        (checkout / path).write_bytes(b"private")
+    original_open = Path.open
+
+    def denied(path, *args, **kwargs):
+        if path.parent == directory:
+            raise PermissionError("worker-private lock")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", denied)
+    if staging_fails:
+        original_run = preserved_mod.ControllerGitPublication.run
+
+        def failed(git, *args, **kwargs):
+            if args[0] == "write-tree":
+                return subprocess.CompletedProcess(args, 1, "", "write-tree unavailable")
+            return original_run(git, *args, **kwargs)
+
+        monkeypatch.setattr(preserved_mod.ControllerGitPublication, "run", failed)
+    cycle, events, comments = _periodic_rig(rig, monkeypatch)
+    cycle()
+    record = _lifecycle(home)
+    assert record["status"] == ("retry_pending" if staging_fails else "preserved")
+    expected = paths[:preserved_mod.MAX_FILES]
+    # Both durable records, the event and the comment carry the same bounded
+    # sample and the full count, including preservation's error path.
+    for payload in (record, list_preserved(home, 7)[0], events[0][1]):
+        assert payload["omitted_paths"] == expected
+        assert payload["omitted_count"] == len(paths)
+    assert len(events) == len(comments) == 1
+    assert "omitted_paths=" + json.dumps(expected) + " " in comments[0]
+    assert f"omitted_count={len(paths)}" in comments[0]
+    assert paths[-1] not in comments[0]
+    assert all((checkout / path).exists() for path in paths)
+
+
 def test_unreadable_tracked_work_is_not_silently_omitted(rig, monkeypatch):
     home, operator, _, checkout, _ = rig
     _change_everything(checkout)
