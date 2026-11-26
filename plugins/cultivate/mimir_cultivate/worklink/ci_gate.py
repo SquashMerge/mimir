@@ -21,11 +21,30 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 _SHA = re.compile(r"[0-9a-fA-F]{40}")
 _SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+_MAX_TRANSIENT_FAILURES = 10
+# Only forge transport diagnostics qualify; malformed data and integrity failures
+# must not become retryable merely because their message contains a network word.
+_TRANSIENT_FORGE_READ = re.compile(
+    r"error connecting to api\.github\.com\b|could not resolve host\b"
+    r"|\bconnection reset\b|\btimed out\b"
+    r"|\bHTTP(?:/[0-9.]+)?[ :]+5[0-9]{2}\b|\b(?:502|503|504)\b",
+    re.IGNORECASE,
+)
+_PERMANENT_FORGE_READ = re.compile(
+    r"\b(?:401|403|404)\b|\bnot found\b|\bbad credentials\b"
+    r"|\b(?:requires?|required) authentication\b|\bauthentication required\b"
+    r"|\bforbidden\b|\bresource not accessible\b",
+    re.IGNORECASE,
+)
+
+
+class _TransientForgeReadError(RuntimeError):
+    """A failed forge read with a recognized transport diagnostic."""
 
 
 @dataclass(frozen=True)
 class CIResult:
-    outcome: str  # green, red, infrastructure, timeout, moved, stopped
+    outcome: str  # green, red, infrastructure, timeout, moved, stopped, error
     reason: str
     checks: tuple[tuple[str, str], ...] = ()
     excerpt: str = ""
@@ -33,9 +52,16 @@ class CIResult:
 
 
 def _json(run: Runner, args: list[str]) -> object:
-    result = run(args, timeout=30)
+    try:
+        result = run(args, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise _TransientForgeReadError("CI forge read timed out") from exc
     if result.returncode != 0:
-        raise RuntimeError("CI forge read failed: " + redact_text((result.stderr or result.stdout)[:500]))
+        detail = (result.stderr or result.stdout)[:500]
+        error = "CI forge read failed: " + redact_text(detail)
+        if not _PERMANENT_FORGE_READ.search(detail) and _TRANSIENT_FORGE_READ.search(detail):
+            raise _TransientForgeReadError(error)
+        raise RuntimeError(error)
     return json.loads(result.stdout)
 
 
@@ -198,13 +224,26 @@ async def wait_for_ci(
 ) -> CIResult:
     deadline = time.monotonic() + timeout_s
     latest = CIResult("pending", "CI checks have not appeared")
+    transient_failures = 0
+    unobserved = f"CI was not observed for {pr_url} at head {sha}: "
     while True:
         if stopped():
             return CIResult("stopped", "stopped by operator", latest.checks)
         try:
             latest = await asyncio.to_thread(_snapshot, run, repo, pr_url, sha)
+        except _TransientForgeReadError as exc:
+            transient_failures += 1
+            reason = (
+                unobserved + f"{transient_failures} consecutive transient forge read failures: "
+                + redact_text(str(exc))[:500]
+            )
+            if transient_failures >= _MAX_TRANSIENT_FAILURES:
+                return CIResult("error", reason, latest.checks)
+            latest = CIResult("pending", reason, latest.checks)
         except (RuntimeError, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as exc:
-            return CIResult("error", redact_text(str(exc))[:500], latest.checks)
+            return CIResult("error", unobserved + redact_text(str(exc))[:500], latest.checks)
+        else:
+            transient_failures = 0
         if latest.outcome != "pending":
             return latest
         remaining = deadline - time.monotonic()
