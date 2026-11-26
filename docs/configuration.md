@@ -390,6 +390,8 @@ outcome, and taint source domains without logging option values.
 | `MIMIR_HEAVY_HEARTBEAT_SECONDS` | float | `1` | Shared heavy-run helper heartbeat interval in seconds; must be finite, positive, and less than the stale threshold. Not implicitly forwarded to pollers. |
 | `MIMIR_HEAVY_STALE_SECONDS` | float | `600` | Shared heavy-run helper stale threshold in seconds: a lease identity and heartbeat must remain unchanged for this interval before stale recovery. Must be finite, positive, and greater than the heartbeat interval. Not implicitly forwarded to pollers. |
 | `MIMIR_HEAVY_LOCK_HELD` | internal marker | unset | Set to `1` by the lease helper for its child and by the controller for a gate running under its owned lease. Any non-empty value makes `heavy_run.sh` skip reacquisition. Do not set manually to bypass lease acquisition; this is not an operator tuning knob and is not implicitly forwarded to pollers. |
+| `WORKLINK_LEASE_SOCKET` | internal Unix socket path | unset | Injected by the Worklink controller into a leaf builder so the heavy-run helper requests lease acquisition through the controller-owned relay. The controller credits only time spent acquiring the lease, not builder-reported durations. Not an operator setting; without it the helper uses the ordinary lease protocol. |
+| `WORKLINK_LEASE_AUTH` | internal secret | unset | Per-relay authentication token injected alongside `WORKLINK_LEASE_SOCKET`. Authorizes lease requests, not wait-duration claims. Do not configure manually or log its value. |
 
 ### Codex quota-pause recovery
 
