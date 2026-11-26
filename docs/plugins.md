@@ -95,8 +95,8 @@ value in argv. Setup stores only `CLAUDE_CODE_OAUTH_TOKEN` in mode-0600
 model is `claude-code:sonnet:low`; local embeddings need no API key.
 
 This route installs the official Claude CLI **2.1.326** and
-`claude-code-feature-factory` **0.14.2** under `/opt/mimir-claude`, using that
-plugin's vendored factory **0.14.2** for every epic control. Worklink YAML selects
+`claude-code-feature-factory` **0.14.3** under `/opt/mimir-claude`, using that
+plugin's vendored factory **0.14.3** for every epic control. Worklink YAML selects
 `claude_code` and `feature_factory.host: claude_code`. Leaves use restricted,
 contained subprocesses; factory drivers use the plugin's upstream tool policy
 in a contained foreground subprocess. There is no OpenCode daemon, telemetry

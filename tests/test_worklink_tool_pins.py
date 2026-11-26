@@ -126,7 +126,7 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     factory_arg = re.search(r"(?m)^ARG FACTORY_VERSION=([^\s]+)$", dockerfile)
     assert factory_arg is not None
     assert FACTORY_VERSION == pins["feature-factory"].pin == factory_arg.group(1)
-    assert FACTORY_VERSION == "0.14.2"
+    assert FACTORY_VERSION == "0.14.3"
     cultivate = install_sources["plugins/cultivate/mimir_cultivate/docker/base.sh"]
     assert cultivate.splitlines()[1] == f"# factory-version: {FACTORY_VERSION}"
     assert "feature-factory@${FACTORY_VERSION}" in cultivate
@@ -174,7 +174,7 @@ def test_factory_daemon_scaffold_and_fixture_pins_match_installs(tmp_path: Path)
     from tests.opencode_fixtures import seed_factory_install
 
     pins = {pin.name: pin.pin for pin in default_tool_pins()}
-    assert pins["feature-factory"] == pins["opencode2-feature-factory"] == FACTORY_VERSION == "0.14.2"
+    assert pins["feature-factory"] == pins["opencode2-feature-factory"] == FACTORY_VERSION == "0.14.3"
     expected = {"package": f"opencode2-feature-factory@{FACTORY_VERSION}"}
     daemon = daemon_configuration({}, resolve_daemon_credentials({})).config
     assert daemon["plugins"][0] == expected
@@ -188,3 +188,21 @@ def test_factory_daemon_scaffold_and_fixture_pins_match_installs(tmp_path: Path)
         assert manifest["version"] == pins[package]
         if package == "opencode2-feature-factory":
             assert manifest["dependencies"]["feature-factory"] == FACTORY_VERSION
+
+
+def test_claude_setup_and_install_metadata_pins_match_inventory() -> None:
+    from mimir_cultivate.setup import _worklink_toolchain
+    from mimir_cultivate.worklink.claude_factory_host import FACTORY_VERSION as CLAUDE_FACTORY_VERSION
+
+    pins = {pin.name: pin.pin for pin in default_tool_pins()}
+    assert pins["claude-code-feature-factory"] == CLAUDE_FACTORY_VERSION == FACTORY_VERSION == "0.14.3"
+    assert _worklink_toolchain() == {"host": "claude_code", "packages": {
+        "@anthropic-ai/claude-code": pins["claude-code"],
+        "claude-code-feature-factory": FACTORY_VERSION,
+        "feature-factory": FACTORY_VERSION,
+    }}
+    root = Path(__file__).resolve().parents[1]
+    fragment = (root / "plugins/cultivate/mimir_cultivate/docker/base.sh").read_text()
+    for package in ("claude-code-feature-factory", "claude-code-feature-factory/vendor/feature-factory"):
+        name = package.rsplit("/", 1)[-1]
+        assert f'["{package}", "{name}", "{FACTORY_VERSION}"]' in fragment

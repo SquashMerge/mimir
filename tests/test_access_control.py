@@ -4830,7 +4830,7 @@ async def test_service_shell_policy_refused_at_authorization_without_error(
         enforcement_enabled=enforce,
         repo_pr_scope_registry=RepoPRScopeRegistry((state,)) if state is not None else None,
     )
-    command = "npm pack claude-code-feature-factory@0.14.2" if case == "npm-pack" else "git status"
+    command = "npm pack claude-code-feature-factory@0.14.3" if case == "npm-pack" else "git status"
     arguments = {"command": command}
     if case == "outside-lease":
         arguments["cwd"] = str(tmp_path)

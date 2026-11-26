@@ -11,7 +11,7 @@ from uuid import UUID
 
 DEFAULT_ENTRYPOINT = "/opt/mimir-claude/lib/node_modules/claude-code-feature-factory/vendor/feature-factory/bin/factory.js"
 CLAUDE_EXECUTABLE = "/opt/mimir-claude/bin/claude"
-FACTORY_VERSION = "0.14.2"
+FACTORY_VERSION = "0.14.3"
 _LIMIT = 1024 * 1024
 _EXPORT_ARGS = r"""
 import { readFileSync } from "node:fs";

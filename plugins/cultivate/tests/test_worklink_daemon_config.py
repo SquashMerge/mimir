@@ -172,7 +172,7 @@ def test_exact_telemetry_options_and_plugin_entries(capture):
     result = daemon_configuration(env, resolve_daemon_credentials(env))
     assert result.telemetry_state == ("content_on" if capture else "metrics_only")
     assert result.config == {"plugins": [
-        {"package": "opencode2-feature-factory@0.14.2"},
+        {"package": "opencode2-feature-factory@0.14.3"},
         {"package": "@devtheops/opencode-plugin-otel@2.1.0", "options": {
             "enabled": True, "endpoint": "https://collector.example/otel", "protocol": "http/protobuf",
             "resourceAttributes": "service.name=agent.bot", "logsEnabled": capture,
@@ -301,7 +301,7 @@ MODEL = {"providerID": "openai", "id": "gpt-6.1-sol", "variant": "high"}
 def test_deployment_model_becomes_factory_profile_and_daemon_default():
     """#2126: with no model configured, specialists fell back to github-copilot and the PAT was refused."""
     result = daemon_configuration({}, resolve_daemon_credentials({}), model=MODEL)
-    assert result.config["plugins"][0] == {"package": "opencode2-feature-factory@0.14.2", "options": {
+    assert result.config["plugins"][0] == {"package": "opencode2-feature-factory@0.14.3", "options": {
         "profile": {"model": "openai/gpt-6.1-sol"}}}
     assert result.config["model"] == {"providerID": "openai", "model": "gpt-6.1-sol", "variant": "high"}
     assert result.config["plugins"][1]["package"] == "@devtheops/opencode-plugin-otel@2.1.0"

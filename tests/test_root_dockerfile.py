@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-FACTORY_VERSION = "0.14.2"
+FACTORY_VERSION = "0.14.3"
 OPENCODE_VERSION = "2.3.0"
 from mimir.plugin_dockerfile import main as assemble_main, verify_pins
 
@@ -1070,6 +1070,43 @@ def test_claude_route_does_not_install_opencode(tmp_path):
     assert not any("opencode" in " ".join(argv) for argv in commands)
 
 
+@pytest.mark.parametrize("package", [
+    "claude-code-feature-factory",
+    "claude-code-feature-factory/vendor/feature-factory",
+])
+def test_claude_install_metadata_guard_rejects_previous_patch(tmp_path, package):
+    """Run the installer's real Node check, not the npm/node recording stubs."""
+    import json
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required to execute the container metadata guard")
+    source = (ROOT / "plugins/cultivate/mimir_cultivate/docker/base.sh").read_text()
+    match = re.search(r"    node -e '([\s\S]*?)\n    '", source)
+    assert match is not None
+    prefix = tmp_path / "node_modules"
+    for relative, name, version in (
+        ("@anthropic-ai/claude-code", "@anthropic-ai/claude-code", "2.1.326"),
+        ("claude-code-feature-factory", "claude-code-feature-factory", FACTORY_VERSION),
+        ("claude-code-feature-factory/vendor/feature-factory", "feature-factory", FACTORY_VERSION),
+    ):
+        directory = prefix / relative
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "package.json").write_text(json.dumps({"name": name, "version": version}))
+    entrypoint = prefix / "claude-code-feature-factory/vendor/feature-factory/bin/factory.js"
+    entrypoint.parent.mkdir()
+    entrypoint.write_text("// fixture-owned installed entrypoint\n")
+    program = match[1].replace("/opt/mimir-claude/lib/node_modules/", str(prefix) + "/")
+    good = subprocess.run([node, "-e", program], capture_output=True, timeout=5)
+    assert good.returncode == 0, good.stderr
+    manifest = prefix / package / "package.json"
+    data = json.loads(manifest.read_text())
+    data["version"] = f"0.14.{int(FACTORY_VERSION.split('.')[2]) - 1}"
+    manifest.write_text(json.dumps(data))
+    stale = subprocess.run([node, "-e", program], capture_output=True, timeout=5)
+    assert stale.returncode == 1
+
+
 @pytest.mark.parametrize("enabled", ["0", "1"])
 def test_legacy_routes_do_not_install_claude(tmp_path, enabled):
     result, commands = _run_toolchain_script(tmp_path, "opencode", enabled, "0")
@@ -1145,7 +1182,7 @@ def test_root_factory_install_resolves_both_packages_to_pinned_version(tmp_path:
     assert log.read_text().splitlines() == [
         "install", "--global", "--prefix", "/opt/mimir-opencode",
         f"@opencode/cli@{OPENCODE_VERSION}", "@openai/codex@0.139.0",
-        "feature-factory@0.14.2", "opencode2-feature-factory@0.14.2",
+        "feature-factory@0.14.3", "opencode2-feature-factory@0.14.3",
         "@devtheops/opencode-plugin-otel@2.1.0",
     ]
 

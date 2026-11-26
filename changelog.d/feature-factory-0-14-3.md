@@ -1,0 +1,1 @@
+- Pin feature-factory, opencode2-feature-factory and claude-code-feature-factory to exactly 0.14.3 across container installs, daemon configuration and admission checks. This enables a later adoption of CI-backed `verify_unavailable_exit` and `verify_scope` configuration without changing `.factory.json` here.

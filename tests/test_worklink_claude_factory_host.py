@@ -49,6 +49,33 @@ def entrypoint(package):
     return package / "vendor/feature-factory/bin/factory.js"
 
 
+@pytest.mark.parametrize("manifest", ["package.json", "vendor/feature-factory/package.json"])
+@pytest.mark.parametrize("installed_version", [
+    "0.14.0", "^0.14.3",
+    pytest.param(f"0.14.{int(FACTORY_VERSION.split('.')[2]) - 1}", id="previous-patch"),
+])
+def test_claude_factory_metadata_admission_refuses_stale_packages(tmp_path, manifest, installed_version):
+    """Admission must reject either stale manifest without needing an installed CLI."""
+    package = tmp_path / "claude-code-feature-factory"
+    cli = entrypoint(package)
+    cli.parent.mkdir(parents=True)
+    cli.write_text("// fixture-owned CLI; admission must never execute it\n")
+    launcher = package / "launcher/launch.js"
+    launcher.parent.mkdir()
+    launcher.write_text("// fixture-owned launcher\n")
+    for directory, name in ((package, "claude-code-feature-factory"),
+                            (cli.parents[1], "feature-factory")):
+        (directory / "package.json").write_text(json.dumps({"name": name, "version": FACTORY_VERSION}))
+    assert FACTORY_VERSION == host.FACTORY_VERSION == "0.14.3"
+    assert resolve_factory_entrypoint(cli, host="claude_code") == cli
+    path = package / manifest
+    data = json.loads(path.read_text())
+    data["version"] = installed_version
+    path.write_text(json.dumps(data))
+    with pytest.raises(FactoryContractError, match=r"requires .*@0\.14\.3"):
+        resolve_factory_entrypoint(cli, host="claude_code")
+
+
 def order_for(checkout):
     return WorkOrder(2126, checkout, "build", None, 30, {
         "MIMIR_MODEL_SPEC": "claude-code:opus",
@@ -88,7 +115,7 @@ def test_claude_factory_spec_and_lockstep(real_package, tmp_path):
     assert backend.host == "claude_code"
     assert backend.capabilities().quota_pool == "claude_code"
     assert BackendRegistry().get("feature_factory").host == "opencode"
-    assert FACTORY_VERSION == host.FACTORY_VERSION == "0.14.2"
+    assert FACTORY_VERSION == host.FACTORY_VERSION == "0.14.3"
     assert resolve_factory_entrypoint(entrypoint(real_package), host="claude_code") == entrypoint(real_package)
     for settings in ({"host": "unknown"}, {"host": "claude_code", "model": 1}, {"host": "opencode", "model": "sonnet"}):
         with pytest.raises(ValueError):
@@ -103,7 +130,7 @@ def test_claude_factory_rejects_version_drift(real_package, tmp_path, manifest):
     data = json.loads(path.read_text())
     data["version"] = "0.14.0"
     path.write_text(json.dumps(data))
-    with pytest.raises(FactoryContractError, match="0.14.2"):
+    with pytest.raises(FactoryContractError, match="0.14.3"):
         resolve_factory_entrypoint(entrypoint(package), host="claude_code")
 
 
