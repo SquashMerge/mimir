@@ -28,7 +28,7 @@ def seed_opencode_binary(root: Path) -> Path:
     return binary
 
 
-def seed_factory_install(root: Path, version: str = "0.14.2") -> Path:
+def seed_factory_install(root: Path, version: str = "0.14.3") -> Path:
     """Synthetic manifests only; never execute a downloaded or ambient factory."""
     modules = root / "lib/node_modules"
     factory = modules / "feature-factory"

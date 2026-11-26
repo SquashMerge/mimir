@@ -469,8 +469,8 @@ def test_opencode_2_3_0_source_and_factory_permission_claims():
     assert "A(y),y.id=g" in excerpts["agent_editor_replacement"]
     factory = json.loads((root / "factory-result.json").read_text())
     assert factory["binary_version"] == "2.3.0" and factory["server_awaited"] is True
-    assert factory["package"]["version"] == "0.14.2"
-    assert factory["package"]["dependencies"]["feature-factory"] == "0.14.2"
+    assert factory["package"]["version"] == "0.14.3"
+    assert factory["package"]["dependencies"]["feature-factory"] == "0.14.3"
     assert factory["package"]["peerDependencies"] == {"solid-js": "^1.9.0", "@opentui/solid": ">=0.5.17"}
     assert "feature" in factory["skills"] and "feature" in factory["commands"]
     agents = {agent["id"]: agent["permissions"] for agent in factory["agents"]}

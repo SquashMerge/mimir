@@ -62,3 +62,26 @@ into separate scratch roots.
 Vendored entrypoint SHA-256: 0.14.1
 `bc5bded59ec5d335cc702eddf83218e7042d22ffcfa52a93650a845c24288340` (as above);
 0.14.2 `2f043b2d9300fca5a67ef41a7122ae1b0e2916ff0e2ff4e7876662a82dfdd681`.
+
+## #2230: claude-code-feature-factory 0.14.3 recheck (2026-11-26)
+
+The current Claude route pins the plugin and its vendored core to 0.14.3.
+The six-package `npm pack` comparison and tarball checksums are recorded in
+`../opencode_2_3_0/PROVENANCE.md`. In both 0.14.2 and 0.14.3, every vendored core
+file is byte-identical to the corresponding published `feature-factory` file.
+The Claude launcher is byte-identical between releases, including its
+`claudeArgs` and `projectMcpServers` exports. Outside the vendored core, only
+the two version manifests and `skills/feature/WORKFLOW.md` change.
+
+The 0.14.3 vendored CLI's `init`, `status --json`, lock claim and competing-lock
+refusal were re-executed using `local_factory_capture`, and the resulting status
+passes Worklink's parser and agrees with this historical fixture's lifecycle and
+owner. Installed-launcher export tests and all recorded-vendor control tests
+also pass with `MIMIR_TEST_CLAUDE_FACTORY_ROOT` pointing to the extracted 0.14.3
+plugin. Historical capture files are retained, not relabeled as fresh captures.
+No Docker build, live deployment, provider or authenticated publishing ran.
+
+0.14.3 vendored entrypoint SHA-256:
+`afa852fcc5ae8808611fb2b490244c3f0dc7e87636d877984016922abc93e1ec`.
+Unchanged launcher SHA-256:
+`8baa5b30e6f090373f5f8496b2806c211350a32d8b0e8ca160c1c7a690a3331c`.

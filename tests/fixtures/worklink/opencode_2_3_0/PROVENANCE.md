@@ -168,3 +168,45 @@ Tarball SHA-256 values:
 | feature-factory | 0.14.2 | `941b516adbf383c40b466efffa6c90e139307d690859e0cc2f7dee8a23ba15dc` |
 | opencode2-feature-factory | 0.14.1 | `1753d5c0301a341a1be3a723fc73907a8fd673c9959eac26d0c2869e83ff6489` |
 | opencode2-feature-factory | 0.14.2 | `1d331778da20af163f5e2db5c7a1ab6c1baf27c1e69c634771aba7023d79a0ec` |
+
+## #2230: published factory 0.14.3 metadata refresh (2026-11-26)
+
+`factory-result.json`'s package version and exact core dependency are refreshed
+from the published `opencode2-feature-factory@0.14.3/package.json`. Its engines
+and peer dependencies are unchanged; the OpenCode agent/permission/registration
+observations remain the original capture, not a new daemon or provider run.
+
+Rechecked with `npm pack feature-factory@0.14.2 feature-factory@0.14.3
+opencode2-feature-factory@0.14.2 opencode2-feature-factory@0.14.3
+claude-code-feature-factory@0.14.2 claude-code-feature-factory@0.14.3`, extracting
+each tarball into a separate scratch directory and comparing every file:
+
+- Core changes only `README.md`, `WORKFLOW.md`, `bin/factory.js`,
+  `observe/repository-config.js` and `package.json`. The complete CLI diff adds
+  the optional verify keys and verify classification/deferral; command/flag
+  declarations, argument parsing, usage, state/status schemas, lock handling,
+  snapshot implementation and the direct backend control handlers are unchanged.
+- The adapter changes only `package.json`, `skills/feature/SKILL.md` and
+  `skills/feature/WORKFLOW.md`. `plugin/`, `observe/` and `tui/dist/` are
+  byte-identical.
+- All 26 commands and their flags match exactly: `init`, `status`,
+  `amend-paths`, `resume`, `grant-retry`, `restore`, `snapshot`, `decide`, `lock`,
+  `heartbeat`, `gate`, `step`, `terminal`, `slices-seed`, `slice`, `observe`,
+  `validator`, `pr`, `reverify-repair`, `effective-push`, `identity`, `remediate`,
+  `sync-base`, `handoff`, `grant-remediation`, and `override-validator`.
+  In isolated HOME/repository scratch roots, 59 invocations (no command, global
+  `--help`/`-h`, unknown command, each command bare and with `--help`, and
+  run-ID-first lock claim/release/steal without a session) produce identical
+  exit status, stdout and stderr. Subcommand `--help` remains an unknown option,
+  not a new help interface.
+- Direct controls preserve `--repo`, `--json`, `--session`, `--pr-base`, `--mode`,
+  `--max-retries`, `--publishing-identity` and `--reason`; observe's existing
+  flags/output schema are unchanged. Its new refusal when configured verify is
+  unavailable is intentional; default slice verification remains compatible.
+  No backend adaptation or repository config change is needed.
+
+| Package | Version | Tarball SHA-256 |
+| --- | --- | --- |
+| feature-factory | 0.14.3 | `7950c05eff8d71cf0e0087d572868aeada945077d623fe9c2fe78315cff6f4a0` |
+| opencode2-feature-factory | 0.14.3 | `85ccf689ae3ce51dd9afcb7d7cfae9cd31813a1a3472976a16e44c54f82f967d` |
+| claude-code-feature-factory | 0.14.3 | `3348421a0176d9811190ce8c7121f2b293916e585da460bffea7fc933c7c8936` |

@@ -35,7 +35,7 @@ def _image_factory_version() -> str:
 
 def test_current_factory_documentation_matches_runtime_version() -> None:
     factory_version = _image_factory_version()
-    assert FACTORY_VERSION == factory_version
+    assert FACTORY_VERSION == factory_version == "0.14.3"
     for tool in DEFAULT_TOOL_PINS:
         if tool.name in {"feature-factory", "opencode2-feature-factory"}:
             assert tool.pin == factory_version
@@ -45,6 +45,17 @@ def test_current_factory_documentation_matches_runtime_version() -> None:
         assert text.count(f"`opencode2-feature-factory@{factory_version}`") == 1, relative_path
         assert "`feature-factory@0.7.0`" not in text, relative_path
         assert "`opencode-feature-factory@0.7.0`" not in text, relative_path
+
+
+def test_claude_factory_docs_and_ci_verify_keys_match_pinned_release() -> None:
+    plugins = (ROOT / "docs/plugins.md").read_text()
+    assert f"`claude-code-feature-factory` **{FACTORY_VERSION}**" in plugins
+    assert f"vendored factory **{FACTORY_VERSION}**" in plugins
+    worklink = " ".join((ROOT / "docs/internal/WORKLINK.md").read_text().split())
+    assert "`verify_unavailable_exit` (integer 1–255, classified as unavailable rather than failed)" in worklink
+    assert '`verify_scope` (`"slice"` by default, or `"integration"`' in worklink
+    assert "once after all slices are merged" in worklink
+    assert "separate change after deployment" in worklink
 
 
 def test_current_factory_admission_claims_match_runtime_version() -> None:

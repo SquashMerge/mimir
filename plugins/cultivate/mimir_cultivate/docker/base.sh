@@ -1,5 +1,5 @@
 #!/bin/sh
-# factory-version: 0.14.2
+# factory-version: 0.14.3
 set -eu
 case "$MIMIR_ENABLE_OPENCODE" in 0|1) ;; *) exit 1 ;; esac
 case "${MIMIR_WORKLINK_HOST:-opencode}:${MIMIR_ENABLE_CLAUDE_CODE:-0}:$MIMIR_ENABLE_OPENCODE" in
@@ -35,8 +35,8 @@ if [ "${MIMIR_WORKLINK_HOST:-opencode}" = claude_code ]; then
       const root = "/opt/mimir-claude/lib/node_modules/";
       for (const [path, name, version] of [
         ["@anthropic-ai/claude-code", "@anthropic-ai/claude-code", "2.1.326"],
-        ["claude-code-feature-factory", "claude-code-feature-factory", "0.14.2"],
-        ["claude-code-feature-factory/vendor/feature-factory", "feature-factory", "0.14.2"]
+        ["claude-code-feature-factory", "claude-code-feature-factory", "0.14.3"],
+        ["claude-code-feature-factory/vendor/feature-factory", "feature-factory", "0.14.3"]
       ]) {
         const pkg = JSON.parse(fs.readFileSync(root + path + "/package.json", "utf8"));
         if (pkg.name !== name || pkg.version !== version) process.exit(1);
