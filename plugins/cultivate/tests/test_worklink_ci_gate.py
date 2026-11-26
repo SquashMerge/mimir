@@ -487,3 +487,220 @@ def test_log_failure_has_explicit_limitation(monkeypatch) -> None:
     result = ci_gate._snapshot(Forge({A: [check("failure")]}), "acme/widget", PR, A)
     assert result.outcome == "red"
     assert "HTTP 403" in result.excerpt
+
+
+class ReadFailureForge(Forge):
+    """Inject read failures, then recover, without counting partial reads as polls."""
+
+    def __init__(self, failures, *, rows=None):
+        super().__init__({A: rows or [check("success")]})
+        self.failures = iter(failures)
+        self.polls = 0
+        self.comments = []
+
+    def __call__(self, args, **kwargs):
+        if args[:2] == ["gh", "api"] and "check-runs?" in args[-1]:
+            self.polls += 1
+            failure = next(self.failures, None)
+            if isinstance(failure, Exception):
+                raise failure
+            if failure is not None:
+                return subprocess.CompletedProcess(args, 1, "", failure)
+        if args[1:3] == ["issue", "comment"]:
+            self.comments.append(args[-1])
+        return super().__call__(args, **kwargs)
+
+
+@pytest.mark.parametrize("failure", [
+    "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+    "Could not resolve host: api.github.com",
+    "read: connection reset by peer",
+    "TLS handshake timed out",
+    "gh: server error (HTTP 500)",
+    "HTTP/2 599",
+    "502 Bad Gateway",
+    "503 Service Unavailable",
+    "504 Gateway Timeout",
+    subprocess.TimeoutExpired(["gh", "api"], 30),
+])
+@pytest.mark.asyncio
+async def test_transient_forge_read_recovers_to_green(failure) -> None:
+    forge = ReadFailureForge([failure])
+    result = await ci_gate.wait_for_ci(
+        forge, "acme/widget", PR, A, timeout_s=60, stopped=lambda: False, poll_s=0,
+    )
+    assert result.outcome == "green"
+    assert forge.polls == 2
+    await ci_gate.ready_pr(forge, PR, A)
+    assert forge.ready and forge.ready_calls == 1
+
+
+@pytest.mark.parametrize("failure", [
+    "gh: Resource not accessible by integration (HTTP 403)",
+    "gh: Bad credentials (HTTP 401)",
+    "gh: Not Found (HTTP 404)",
+    "gh: Forbidden (HTTP 403); upstream connection timed out (503)",
+    "gh: Not Found; error connecting to api.github.com",
+    "gh: unknown API failure",
+    RuntimeError("PR head moved; connection timed out"),
+    ValueError("invalid JSON: 502"),
+])
+@pytest.mark.asyncio
+async def test_permanent_forge_read_fails_immediately(failure) -> None:
+    forge = ReadFailureForge([failure])
+    result = await ci_gate.wait_for_ci(
+        forge, "acme/widget", PR, A, timeout_s=60, stopped=lambda: False, poll_s=0,
+    )
+    assert result.outcome == "error"
+    assert forge.polls == 1
+    assert "CI was not observed" in result.reason
+    assert PR in result.reason and A in result.reason
+    assert forge.ready_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_forge_json_is_not_retried() -> None:
+    reads = []
+
+    def invalid_json(args, **kwargs):
+        reads.append(args)
+        return subprocess.CompletedProcess(args, 0, "502 Bad Gateway", "")
+
+    result = await ci_gate.wait_for_ci(
+        invalid_json, "acme/widget", PR, A, timeout_s=60, stopped=lambda: False, poll_s=0,
+    )
+    assert result.outcome == "error"
+    assert len(reads) == 1
+
+
+@pytest.mark.asyncio
+async def test_consecutive_transient_forge_failures_are_bounded() -> None:
+    # Recover on poll 11: deleting the bound must fail, not hang this test.
+    forge = ReadFailureForge(["Could not resolve host: api.github.com"] * 10)
+    result = await ci_gate.wait_for_ci(
+        forge, "acme/widget", PR, A, timeout_s=60, stopped=lambda: False, poll_s=0,
+    )
+    assert result.outcome == "error"
+    assert forge.polls == 10
+    assert "10 consecutive transient forge read failures" in result.reason
+    assert "CI was not observed" in result.reason
+    assert PR in result.reason and A in result.reason
+    assert forge.ready_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_successful_pending_poll_resets_transient_failure_count() -> None:
+    pending = {**check("success"), "status": "in_progress", "conclusion": None}
+    forge = ReadFailureForge(
+        ["HTTP 503"] * 9 + [None] + ["HTTP 503"] * 9 + [None],
+        rows=[pending, check("success")],
+    )
+    result = await ci_gate.wait_for_ci(
+        forge, "acme/widget", PR, A, timeout_s=60, stopped=lambda: False, poll_s=0,
+    )
+    assert result.outcome == "green"
+    assert forge.polls == 20
+
+
+@pytest.mark.parametrize("stop", [False, True])
+@pytest.mark.asyncio
+async def test_transient_forge_failure_respects_deadline_and_stop(monkeypatch, stop) -> None:
+    class Clock:
+        now = 0
+
+        def monotonic(self):
+            return self.now
+
+        async def sleep(self, delay):
+            sleeps.append(delay)
+            self.now += delay
+
+    clock = Clock()
+    sleeps = []
+    monkeypatch.setattr(ci_gate, "time", clock)
+    monkeypatch.setattr(ci_gate.asyncio, "sleep", clock.sleep)
+    forge = ReadFailureForge(["HTTP 503"] * 10)
+    result = await ci_gate.wait_for_ci(
+        forge, "acme/widget", PR, A, timeout_s=25,
+        stopped=lambda: stop and bool(sleeps), poll_s=10,
+    )
+    assert result.outcome == ("stopped" if stop else "timeout")
+    assert sleeps == ([10] if stop else [10, 10, 5])
+    assert forge.polls < 10
+    if not stop:
+        assert "CI was not observed" in result.reason
+        assert PR in result.reason and A in result.reason
+
+
+@pytest.mark.parametrize("recover", [True, False])
+@pytest.mark.asyncio
+async def test_forge_read_failure_publication_and_comment(tmp_path, monkeypatch, recover) -> None:
+    started = datetime.now(UTC)
+    forge = ReadFailureForge(["Could not resolve host: api.github.com"] * (1 if recover else 10))
+    claim = ClaimRecord(2050, 1, "agent", started)
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=forge)
+    lease = CheckoutLease(2050, 1, tmp_path, tmp_path, "issue/2050-a1", "main")
+    worker = orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)
+
+    @dataclass(frozen=True)
+    class Spec:
+        repo_url: str = "https://github.com/acme/widget.git"
+        base_ref: str = "main"
+        timeout_s: int = 5
+        backend_config: dict | None = None
+
+    class Backend:
+        name = "opencode"
+
+        async def interpret(self, order, result):
+            return RawResult(0, None, "success", None)
+
+    async def observe_evidence(**kwargs):
+        return validate_evidence(WorklinkEvidence(
+            issue=2050, attempt=1, backend="opencode", branch=lease.branch, checkout=str(tmp_path),
+            started_at=started.isoformat(), finished_at=started.isoformat(), files_changed=["fix.py"],
+            diff_stat="1 file", commands=[], tests=None, pr_url=None, status="completed",
+            gate_mode="ci", diff_observed=True,
+        ))
+
+    # Exercise the real wait and finalization, but neither wait ten seconds in
+    # tests nor run an actual builder, git publication, or tracker CLI.
+    async def wait_without_delay(*args, **kwargs):
+        return await ci_gate.wait_for_ci(*args, **kwargs, poll_s=0)
+
+    opened = []
+    monkeypatch.setattr(orchestrator, "wait_for_ci", wait_without_delay)
+    monkeypatch.setattr(orchestrator, "observe_evidence", observe_evidence)
+    monkeypatch.setattr(orchestrator, "_with_outside_checkout_detection", lambda value, **kw: value)
+    monkeypatch.setattr(orchestrator, "_commit_checkout_changes", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_ensure_clean_checkout", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_git_push", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_with_head_sha", lambda value, *a, **kw:
+        replace(value, evidence=replace(value.evidence, head_sha=A)))
+    monkeypatch.setattr(orchestrator, "_open_pr", lambda *a, **kw: opened.append(kw["draft"]) or PR)
+    monkeypatch.setattr(orchestrator, "_cleanup_checkout_after_transition", lambda *a, **kw: None)
+    result = await worker._finalize(
+        issue=orchestrator.IssueContext(2050, "Fix", "body", set()),
+        claims=claims, claim_record=claim, attempt=1,
+        config=WorklinkConfig(defaults=WorklinkDefaults(ci_wait_timeout_s=60)),
+        backend=Backend(), compute=None, compute_result=ComputeResult(0, "", ""),
+        order=WorkOrder(issue_id=2050, checkout=tmp_path, prompt="fix", rules=None, timeout_s=5),
+        lease=lease, spec=Spec(backend_config={"test_env": {}}), started=started,
+        test_cmd=None, root_dirty_before=(), runner=forge, gate_mode="ci",
+        terminal_release=orchestrator._TerminalClaimRelease(
+            claims, home=tmp_path, issue_id=2050, attempt=1,
+        ),
+    )
+    assert result.status == ("completed" if recover else "blocked"), result.reason
+    assert result.review_ready is recover
+    assert opened == [True]
+    assert forge.ready is recover
+    assert forge.ready_calls == (1 if recover else 0)
+    evidence = json.loads(result.evidence_path.read_text())
+    assert evidence["pr_url"] == PR and evidence["head_sha"] == A
+    if not recover:
+        assert "CI was not observed" in evidence["blocked_reason"]
+        assert PR in evidence["blocked_reason"] and A in evidence["blocked_reason"]
+        comment = next(text for text in forge.comments if text.startswith("WORKLINK_EVIDENCE"))
+        assert "CI was not observed" in comment
+        assert PR in comment and A in comment
