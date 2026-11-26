@@ -248,6 +248,9 @@ class RepoTestJobRegistry:
             source="system", source_id=f"repo_test:{job.job_id}",
             content=json.dumps({
                 "job_id": job.job_id, "status": record["status"],
+                # Routing context for the model, not authority: only the
+                # host-owned completion binding can renew checkout grants.
+                "repository": record["repository"], "pull_request": record["pull_request"],
                 "head_sha": record["head_sha"], "suite": record["suite"],
                 "snapshot": ({key: value for key, value in record["snapshot"].items()
                               if key != "path"} if record["snapshot"] else None),
