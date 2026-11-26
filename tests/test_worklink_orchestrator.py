@@ -4751,7 +4751,73 @@ def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path
     _reset_logger_for_tests()
 
 
-@pytest.mark.parametrize("failure", ["ref_lock", "fresh_lock", "stale_lock", "network", "after_checkout", "credit_write"])
+def test_base_fetch_dns_retry_proceeds_to_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir_cultivate.worklink.checkout as checkout
+
+    repo = tmp_path / "repo"
+    worktree = tmp_path / ".worklink" / repo.name / "441-1"
+    _, base_runner = _orchestrator_runner(repo, worktree)
+    fetches = []
+    delays = []
+    monkeypatch.setattr(checkout.time, "sleep", delays.append)
+
+    def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "fetch"]:
+            fetches.append(args)
+            if len(fetches) == 1:
+                return cp(args, returncode=128, stderr="fatal: Could not resolve host: github.com")
+        return base_runner(args, **kwargs)
+
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+    result = asyncio.run(WorklinkRunner(
+        home=tmp_path, repo=repo, runner=runner, registry=registry,
+    ).run(441, backend_name="fake", test_command="echo ok"))
+    assert result.status == "completed", result.reason
+    assert len(backend.orders) == 1
+    assert len(fetches) == 2
+    assert delays == [10]
+
+
+@pytest.mark.parametrize("retry_after", ["valid", None, "invalid", "2026-11-26T00:00:00"])
+def test_base_fetch_transient_backoff_is_inactive_but_fail_closed(
+    tmp_path: Path, retry_after: str | None,
+) -> None:
+    from mimir_cultivate.worklink.dispatch_failures import (
+        autonomous_dispatch_block_reason, current_failure_identity,
+        failure_state_transaction, pending_failure_alerts, record_failure,
+    )
+
+    now = datetime(2026, 11, 26, tzinfo=UTC)
+    entry = record_failure(
+        tmp_path, issue_id=441, attempt=1, exit_status=1,
+        error="base fetch transient", log_path=None, work_started=False,
+        failure_kind="base_fetch_transient", now=now,
+    )
+    assert entry["active"] is False
+    assert entry["attempt_consumed"] is False
+    assert current_failure_identity(tmp_path, 441) is None
+    if retry_after != "valid":
+        with failure_state_transaction(tmp_path) as state:
+            state["issues"]["441"]["retry_after"] = retry_after
+        assert autonomous_dispatch_block_reason(tmp_path, 441, now=now + timedelta(days=1))
+        assert pending_failure_alerts(tmp_path, now=now + timedelta(days=1)) == ({441}, [])
+    else:
+        expiry = now + timedelta(minutes=5)
+        assert entry["retry_after"] == expiry.isoformat()
+        assert autonomous_dispatch_block_reason(tmp_path, 441, now=expiry - timedelta(seconds=1))
+        assert pending_failure_alerts(tmp_path, now=expiry - timedelta(seconds=1)) == ({441}, [])
+        assert autonomous_dispatch_block_reason(tmp_path, 441, now=expiry) is None
+        assert pending_failure_alerts(tmp_path, now=expiry) == (set(), [])
+
+
+@pytest.mark.parametrize("failure", [
+    "ref_lock", "fresh_lock", "stale_lock", "network", "unknown",
+    "auth", "missing_ref", "after_checkout", "after_checkout_network", "credit_write",
+])
 def test_base_fetch_contention_defers_without_consuming_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
@@ -4759,8 +4825,18 @@ def test_base_fetch_contention_defers_without_consuming_attempt(
     import mimir_cultivate.worklink.orchestrator as orchestrator
     from mimir_cultivate.worklink.claims import BASE_FETCH_DEFERRED_PREFIX
     from mimir_cultivate.worklink.dispatch_failures import (
-        autonomous_dispatch_block_reason, dispatch_failure_state_dir, load_failure_state,
+        autonomous_dispatch_block_reason, dispatch_failure_state_dir, load_failure_state, pending_failure_alerts,
     )
+    import mimir_cultivate.worklink.dispatch_failures as dispatch_failures
+
+    clock = datetime.now(UTC)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock
+
+    monkeypatch.setattr(dispatch_failures, "datetime", Clock)
 
     _reset_logger_for_tests()
     logger = init_logger(tmp_path / "events.jsonl", session_id="base-fetch")
@@ -4795,9 +4871,12 @@ def test_base_fetch_contention_defers_without_consuming_attempt(
             if args[:4] == ["git", "-C", str(repo), "fetch"]:
                 calls.append(args)
                 fetches.append(args)
-                if failure != "after_checkout":
+                if failure not in {"after_checkout", "after_checkout_network"}:
                     return cp(args, returncode=1, stderr=(
-                        "network down" if failure == "network" else
+                        "fatal: Could not resolve host: github.com" if failure == "network" else
+                        "network down" if failure == "unknown" else
+                        "fatal: The requested URL returned error: 403" if failure == "auth" else
+                        "fatal: couldn't find remote ref main" if failure == "missing_ref" else
                         "error: cannot lock ref 'refs/remotes/origin/main': is at abc but expected def"
                     ))
             if args[:3] == ["chainlink", "issue", "comment"]:
@@ -4814,6 +4893,8 @@ def test_base_fetch_contention_defers_without_consuming_attempt(
     class Backend(FakeBackend):
         async def interpret(self, order: WorkOrder, result: object) -> RawResult:
             # A similarly typed exception after checkout must NOT grant credit.
+            if failure == "after_checkout_network":
+                raise checkout.BaseFetchTransientError("backend failure, not prework")
             raise checkout.BaseFetchContentionError("backend failure, not prework")
 
     registry = BackendRegistry(config)
@@ -4825,18 +4906,21 @@ def test_base_fetch_contention_defers_without_consuming_attempt(
     try:
         # Two free deferrals, then an active incident stops automatic dispatch.
         # Explicit operator retries still charge the remaining attempt budget.
-        for ordinal in range(1, 6 if failure == "ref_lock" else 2):
+        capped = failure in {"ref_lock", "network"}
+        for ordinal in range(1, 6 if capped else 2):
             result = asyncio.run(WorklinkRunner(
                 home=tmp_path, repo=repo, runner=runner, registry=registry,
             ).run(441, backend_name="fake", test_command="echo ok", autonomous=ordinal <= 3))
             assert result.attempt == ordinal, result.reason
             incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["441"]
-            if failure in {"network", "after_checkout", "stale_lock"} or (failure == "ref_lock" and ordinal > 2):
+            if failure in {"unknown", "auth", "missing_ref", "after_checkout", "after_checkout_network", "stale_lock"} or (capped and ordinal > 2):
                 assert result.status == "failed"
                 assert incident["attempt_consumed"] is True
                 assert incident["active"] is True
-                assert claims.attempts_used(comments) == (ordinal - 2 if failure == "ref_lock" else 1)
-                if failure != "ref_lock":
+                assert incident["failure_kind"] == "operator_required"
+                assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path))[1]
+                assert claims.attempts_used(comments) == (ordinal - 2 if capped else 1)
+                if not capped:
                     assert not any(c.startswith(BASE_FETCH_DEFERRED_PREFIX) for c in comments)
                     if failure == "stale_lock":
                         assert str(ref_lock) in incident["terminal_error"]
@@ -4870,14 +4954,34 @@ def test_base_fetch_contention_defers_without_consuming_attempt(
             assert claims.attempts_used(comments) == 0
             assert claims.next_attempt(comments) == ordinal + 1
             assert load_run_state(tmp_path, 441) is None
+            if failure == "network":
+                state_dir = dispatch_failure_state_dir(tmp_path)
+                assert incident["failure_kind"] == "base_fetch_transient"
+                assert pending_failure_alerts(state_dir) == ({441}, [])
+                comments_before = list(comments)
+                fetch_count_before = len(fetches)
+                blocked = asyncio.run(WorklinkRunner(
+                    home=tmp_path, repo=repo, runner=runner, registry=registry,
+                ).run(441, backend_name="fake", test_command="echo ok", autonomous=True))
+                assert blocked.status == "refused"
+                assert blocked.attempt is None
+                assert "backoff" in blocked.reason
+                assert comments == comments_before
+                assert len(fetches) == fetch_count_before
+                clock += timedelta(minutes=6)
+                assert pending_failure_alerts(state_dir) == (set(), [])
             assert autonomous_dispatch_block_reason(dispatch_failure_state_dir(tmp_path), 441) is None
-        if failure != "after_checkout":
+        if failure not in {"after_checkout", "after_checkout_network"}:
             assert compute.specs == []
-        assert len(fetches) == (1 if failure in {"network", "after_checkout"} else 3 * (5 if failure == "ref_lock" else 1))
+        assert len(fetches) == (
+            20 if failure == "network" else
+            1 if failure in {"unknown", "auth", "missing_ref", "after_checkout", "after_checkout_network"} else
+            3 * (5 if failure == "ref_lock" else 1)
+        )
         if failure == "fresh_lock":
             assert ref_lock.read_text() == "external lock"
-        if failure == "ref_lock":
-            assert delays == [0.1, 0.2] * 5
+        if capped:
+            assert delays == ([10, 20, 30] if failure == "network" else [0.1, 0.2]) * 5
             assert sum(isinstance(c, list) and c[:3] == ["chainlink", "locks", "release"] for c in calls) == 5
             assert claims.claim_issue(441, comments).attempts_exhausted
             logger.flush_sync()

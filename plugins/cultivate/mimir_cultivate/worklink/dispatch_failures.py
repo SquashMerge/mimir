@@ -19,12 +19,13 @@ from mimir.redaction import redact_text
 STATE_FILE = "dispatch_failures.json"
 POLLER_NAME = "worklink-ready-queue"
 INITIAL_BACKOFF_MINUTES = 15
+BASE_FETCH_TRANSIENT_BACKOFF_MINUTES = 5
 MAX_BACKOFF_MINUTES = 240
 MAX_NOTIFIED_SIGNATURES = 32
 MERGE_RETRY_PASSES = 3
 # A fresh attempt can repair a failing gate; spec and operational incidents
 # require changed external state and therefore remain operator-gated.
-AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed", "quota_exhausted"})
+AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed", "quota_exhausted", "base_fetch_transient"})
 MAX_CONSECUTIVE_QUOTA_HOLDS = 4
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 FACTORY_STOP_KINDS = frozenset({"factory_needs_human", "factory_blocked", "factory_partial"})
@@ -142,6 +143,8 @@ def autonomous_dispatch_block_reason(
         return None
     if not isinstance(entry, dict) or not isinstance(entry.get("active"), bool):
         return "dispatch failure state unavailable: invalid issue record"
+    if entry.get("failure_kind") == "base_fetch_transient" and _incident_blocks_dispatch(entry, now):
+        return "transient base fetch backoff blocks fresh autonomous dispatch"
     if entry["active"] and _incident_blocks_dispatch(entry, now):
         return "an unresolved Worklink incident blocks fresh autonomous dispatch"
     return None
@@ -735,8 +738,9 @@ def record_failure(
     ``work_started=False`` is reserved for preconditions decided before this
     dispatch creates or adopts a checkout/sandbox or invokes a backend. Such a
     refusal is retained for diagnosis, but is inactive and does not consume an
-    attempt. The default preserves the historical attempt-based classification
-    for callers that do not own that lifecycle boundary.
+    attempt. Transient base fetch refusals also carry a dispatch backoff without
+    an active incident or intervention prompt. The default preserves the historical
+    attempt-based classification for callers that do not own that lifecycle boundary.
     """
     now = now or datetime.now(UTC)
     full_error = redact_text(str(error))[:4000]
@@ -810,8 +814,10 @@ def record_failure(
             ),
             "retry_after": (
                 None
-                if prework_refusal
-                else (quota_reset_at if failure_kind == "quota_exhausted" and quota_reset_at is not None
+                if prework_refusal and failure_kind != "base_fetch_transient"
+                else (now + timedelta(minutes=BASE_FETCH_TRANSIENT_BACKOFF_MINUTES)
+                      if failure_kind == "base_fetch_transient"
+                      else quota_reset_at if failure_kind == "quota_exhausted" and quota_reset_at is not None
                       else now + timedelta(minutes=delay)).isoformat()
             ),
             "log_path": redact_text(
@@ -853,7 +859,9 @@ def pending_failure_alerts(
     alerts: list[dict[str, object]] = []
     with failure_state_transaction(state_dir) as state:
         for entry in state["issues"].values():
-            if not isinstance(entry, dict) or entry.get("active") is not True:
+            if not isinstance(entry, dict) or (
+                entry.get("active") is not True and entry.get("failure_kind") != "base_fetch_transient"
+            ):
                 continue
             try:
                 issue_id = int(entry["issue_id"])
@@ -861,7 +869,7 @@ def pending_failure_alerts(
                 continue
             if _incident_blocks_dispatch(entry, now):
                 backed_off.add(issue_id)
-            if entry.get("failure_kind") == "quota_exhausted":
+            if entry.get("failure_kind") in {"quota_exhausted", "base_fetch_transient"}:
                 continue  # A scheduled hold is not an operator incident.
             signature = str(entry.get("signature") or "")
             notified = entry.get("notified_signatures")
