@@ -61,43 +61,6 @@ CREDENTIAL_CORPUS = [
 ]
 
 
-CREDENTIAL_CORPUS = [
-    pytest.param("ghp_" + "a" * 36, id="github-classic-pat"),
-    pytest.param("gho_" + "b" * 36, id="github-oauth"),
-    pytest.param("ghu_" + "c" * 36, id="github-user-to-server"),
-    pytest.param("ghs_" + "d" * 36, id="github-app-installation"),
-    pytest.param("ghr_" + "e" * 36, id="github-refresh"),
-    pytest.param("github_pat_" + "A" * 60, id="github-fine-grained-pat"),
-    pytest.param("sk-ant-" + "A1b2" * 6, id="anthropic"),
-    pytest.param("sk-proj-" + "B" * 24, id="openai-project"),
-    pytest.param("sk-" + "C" * 24, id="openai-classic"),
-    pytest.param("Authorization: Bearer " + "z" * 30, id="bearer"),
-    pytest.param("AKIA" + "A" * 16, id="aws-access-key"),
-    pytest.param("ASIA" + "0" * 16, id="aws-sts-access-key"),
-    pytest.param(
-        "AWS_SECRET_ACCESS_KEY=" + "aB0/" * 10,
-        id="aws-secret-access-key-assignment",
-    ),
-    pytest.param(
-        'config = {"refresh_token": "' + "x" * 30 + '"}',
-        id="oauth-refresh-json",
-    ),
-    pytest.param(
-        'config = {"access_token": "' + "y" * 30 + '"}',
-        id="oauth-access-json",
-    ),
-    pytest.param(
-        'config = {"client_secret": "' + "z" * 30 + '"}',
-        id="oauth-client-secret-json",
-    ),
-    pytest.param("xoxb-" + "A" * 24, id="slack-bot"),
-    pytest.param("xoxp-" + "B" * 24, id="slack-user"),
-    pytest.param("xoxa-" + "C" * 24, id="slack-app"),
-    pytest.param("xoxs-" + "D" * 24, id="slack-config"),
-    pytest.param("xoxr-" + "E" * 24, id="slack-refresh"),
-    pytest.param("M" * 24 + "." + "n" * 6 + "." + "o" * 27, id="discord-bot"),
-]
-
 def test_module_and_pre_commit_pattern_lists_stay_in_step() -> None:
     hook = Path(__file__).parents[1] / "mimir" / "templates" / "git" / "pre-commit"
     hook_patterns: list[str] = []
@@ -111,7 +74,9 @@ def test_module_and_pre_commit_pattern_lists_stay_in_step() -> None:
             hook_patterns.append(line.split("'", 2)[1])
 
     module_patterns = [
-        pattern.pattern.replace(r"\s", "[[:space:]]").replace(r"\b", "")
+        pattern.pattern.replace(r"\s", "[[:space:]]")
+        .replace(r"\b", "")
+        .replace(r"(?<![A-Za-z0-9_-])", "(^|[^A-Za-z0-9_-])")
         for pattern in _SECRET_PATTERNS
     ]
     assert module_patterns == hook_patterns
@@ -180,3 +145,45 @@ def test_pre_commit_template_matches_credential_corpus(
 )
 def test_contains_secret_ignores_benign_corpus(text: str) -> None:
     assert contains_secret(text) is False
+
+
+BARE_PROVIDER_KEYS = [
+    pytest.param("pa-" + "V_1a" * 6, id="voyage"),
+    pytest.param("tvly-dev-" + "T_1a" * 6, id="tavily"),
+    pytest.param("xapp-1-" + "Ab-1" * 6, id="slack-app"),
+    pytest.param("AIza" + "G_1a-" * 7, id="google"),
+]
+
+
+@pytest.mark.parametrize("key", BARE_PROVIDER_KEYS)
+@pytest.mark.parametrize(
+    "wrapper", ["{}", "VOYAGE_API_KEY={}", "a {}", '"{}"', "key:{}", "a\n{}"]
+)
+def test_bare_provider_keys_match_at_left_boundaries(key: str, wrapper: str) -> None:
+    text = wrapper.format(key)
+    assert contains_secret(text) is True
+    assert secret_matches(text) == {key}
+
+
+@pytest.mark.parametrize("key", BARE_PROVIDER_KEYS)
+@pytest.mark.parametrize("prefix", ["n", "X", "0", "_", "-"])
+def test_bare_provider_keys_ignore_identifier_suffixes(key: str, prefix: str) -> None:
+    text = prefix + key
+    assert contains_secret(text) is False
+    assert secret_matches(text) == set()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "gepa-cluster-" + "observation-evaluator",
+        "refs/remotes/origin/gepa-cluster-" + "observation-evaluator",
+        "xtvly-" + "a" * 24,
+        "npa-" + "a" * 24,
+        "pa-" + "a" * 10 + "-" + "b" * 14,
+        "pa-" + "a" * 19,
+    ],
+)
+def test_contains_secret_ignores_provider_lookalikes(text: str) -> None:
+    assert contains_secret(text) is False
+    assert secret_matches(text) == set()
