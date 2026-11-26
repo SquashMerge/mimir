@@ -22,6 +22,51 @@ def auth_context(channel_id="repo-test-channel"):
     )
 
 
+@pytest.mark.parametrize("case", ["http", "scope", "missing_lease"])
+def test_repo_test_remint_isolates_fail_closed_boundaries(case):
+    """Other admission checks must not mask HTTP, scope or missing-lease guards."""
+    from mimir import access_control as ac
+    from mimir.repo_test_jobs import RepoTestCompletion
+
+    scope = SimpleNamespace(
+        owner="cultivate", scope_id="scope", canonical_repo="o/r", pr_number=9,
+        observed_head_sha="a" * 40,
+    )
+    grants = ac.ScopedPRGrants(
+        "alice", (), _issuer=ac._SCOPED_PR_ISSUER,
+    )
+    lease = SimpleNamespace(path="checkout", recovery_id="identity")
+    state = SimpleNamespace(
+        action_scope=scope, git_expected_head="a" * 40, checkout_lease=lease,
+    )
+    auth = replace(
+        auth_context(), scoped_pr_grants=grants,
+        ifc_labels=InformationFlowLabels(),
+        repo_pr_scope_registry=SimpleNamespace(resolve=lambda *_: state),
+    )
+    binding = ac.RepoTestGrantBinding(
+        scope, frozenset(), ("checkout", "identity"), "a" * 40, "a" * 40, "turn-1", grants,
+    )
+    event = AgentEvent(
+        trigger="repo_test_complete", channel_id=auth.channel_id, content="{}",
+        continuation_auth_context=auth,
+        extra={"_repo_test_completion": RepoTestCompletion(
+            binding, "o/r", 9, "a" * 40, "completed", True,
+        )},
+    )
+    assert not auth.ifc_labels.has_untrusted_active_ingest
+    # Positive control: a single changed boundary is the only refusal below.
+    assert ac.remint_repo_test_grants(event, auth) is not None
+    if case == "http":
+        auth = replace(auth, event_ingress="http")
+        event.continuation_auth_context = auth
+    elif case == "scope":
+        state.action_scope = SimpleNamespace(**vars(scope))
+    else:
+        state.checkout_lease = None
+    assert ac.remint_repo_test_grants(event, auth) is None
+
+
 def enqueue(registry, run, **overrides):
     values = dict(
         repository="o/r", pull_request=9, head_sha="a" * 40, suite="unit",
@@ -74,6 +119,33 @@ async def test_pending_checkout_requires_exact_in_process_binding(tmp_path, case
         assert registry.has_pending_checkout(lease) is (case in {"queued", "delivered"})
     finally:
         await job.task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovered", [False, True])
+async def test_repo_test_completion_content_names_pr_without_snapshot_path(tmp_path, recovered):
+    delivered = AsyncMock(return_value=False)
+    registry = RepoTestJobRegistry(tmp_path / "jobs", delivered)
+
+    async def run(job):
+        registry.save(job, snapshot={"path": "/private/snapshot", "head_sha": "a" * 40})
+        return {"ok": True, "evidence": True}
+
+    queued = enqueue(registry, run)
+    await registry.jobs[queued["job_id"]].task
+    if recovered:
+        registry = RepoTestJobRegistry(registry.directory, delivered)
+        await registry.recover(AsyncMock())
+    event = delivered.call_args.args[0]
+    content = json.loads(event.content)
+    assert content["repository"] == "o/r"
+    assert content["pull_request"] == 9
+    assert content["snapshot"] == {"head_sha": "a" * 40}
+    assert "/private/snapshot" not in event.content
+    if recovered:
+        assert event.continuation_auth_context is None
+        assert event.extra["_repo_test_completion"].binding is None
+        assert not event.extra["_repo_test_completion"].evidence
 
 
 @pytest.mark.asyncio

@@ -3725,6 +3725,186 @@ async def test_repo_test_completion_bound_grants(tmp_path, monkeypatch, case):
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("repository_git_policy")
+@pytest.mark.parametrize("other_prs", [0, 1, 2])
+async def test_repo_test_completion_resumes_named_pr_after_other_pr_turns(
+    tmp_path, monkeypatch, other_prs,
+):
+    """Queue A, finish same-channel B turns, then resume A from its content only."""
+    from unittest.mock import AsyncMock
+
+    from mimir import access_control as ac, agent as agent_module, repo_test_jobs
+    from mimir.agent import Agent, _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge, policy as cultivate_policy
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    scope, lease = state.action_scope, state.checkout_lease
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    policy = selected_policy_registry()
+    protocol = policy.scoped_actions["cultivate"]
+    authority = ac.build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=ac.CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=tuple(policy.authority_profiles["github"]),
+        creation_path="mimir.pollers.run_poller", policy=policy, poller_owner="cultivate",
+    )
+    poller_event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity", source="poller",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": "github-activity", "items": []},
+    )
+
+    def turn_auth(review):
+        auth = ac.create_auth_context(
+            poller_event, enforce=True, ifc_labels=InformationFlowLabels(), policy=policy,
+        )
+        auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((review,)))
+        auth.scoped_pr_grants.issue(review.action_scope)
+        return auth
+
+    auth = turn_auth(state)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    token = ac.consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert ac.observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    (lease.path / "tracked.txt").write_text("tested local fix for A\n")
+    repository.RepoGitTools(state, auth_context=auth).execute(
+        repository.GitCommit(("tracked.txt",), "fix A"),
+    )
+    tested_head = state.git_expected_head
+    assert tested_head != scope.observed_head_sha
+    owner = SimpleNamespace(
+        _shell_jobs=SimpleNamespace(get=lambda _: None),
+        _dispatcher=SimpleNamespace(enqueue=AsyncMock(return_value=True)),
+        _shell_completion_batch_seconds=0,
+    )
+    monkeypatch.setattr(agent_module, "log_event", AsyncMock())
+    from mimir import event_logger
+
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_a, **_kw: None)
+    registry = repo_test_jobs.RepoTestJobRegistry(
+        tmp_path / "jobs", lambda event: Agent._on_repo_test_complete(owner, event),
+    )
+    monkeypatch.setattr(repo_test_jobs, "_REGISTRY", registry)
+    monkeypatch.setattr(forge, "_client", lambda _: object())
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _: SimpleNamespace(
+        get_pull_request_snapshot=lambda *_: SimpleNamespace(
+            state="open", head_sha=scope.observed_head_sha,
+        ),
+    ))
+    monkeypatch.setattr(forge, "_live_pr_head", lambda *_: scope.observed_head_sha)
+    monkeypatch.setattr(forge, "pr_trust_verdict", lambda *_: True)
+    monkeypatch.setattr(ac, "_github_repo_from_remote", lambda _: scope.canonical_repo)
+    # Fixture commits may have identical SHAs to sibling tests' agent pushes.
+    # Own the push-history cache used by evidence qualification.
+    monkeypatch.setattr(repository, "_ancestral_verified_pushes", type(repository._ancestral_verified_pushes)())
+    started, release = asyncio.Event(), asyncio.Event()
+    real_tests = repository.RepoProjectTests
+
+    async def runner(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return CollectedExecutionResult(
+            0, b"1 passed in 0.01s\n",
+            _lease_start(kwargs["identifier"], repository.time.monotonic()), False, False, 0, 0,
+        )
+
+    monkeypatch.setattr(repository, "RepoProjectTests", lambda review: real_tests(
+        review, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    queue_turn = _ifc_turn(auth)
+    queue_turn.turn_id = "queue-A"
+    turn_token = set_current_turn(queue_turn)
+    try:
+        queued = await repository.repo_test.coroutine(
+            scope.canonical_repo, scope.pr_number, runtime=SimpleNamespace(context=auth),
+        )
+    finally:
+        reset_current_turn(turn_token)
+    job = registry.jobs[queued["job_id"]]
+    await started.wait()
+    try:
+        for number in range(other_prs):
+            pr = 20 + number
+            ref = f"refs/heads/worklink/{pr}"
+            _git(Path(scope.canonical_origin), "update-ref", ref, scope.observed_head_sha)
+            other = RepoReviewState(replace(scope, pr_number=pr, destination_ref=ref))
+            other_auth = turn_auth(other)
+            assert other_auth.server_discovered_pr_states is not auth.server_discovered_pr_states
+            other_turn = _ifc_turn(other_auth)
+            other_turn.turn_id = f"other-{pr}"
+            turn_token = set_current_turn(other_turn)
+            try:
+                token = ac.consume_scoped_pr_checkout(other_auth, other.action_scope, "cultivate")
+                result = repository.repo_checkout.func(
+                    scope.canonical_repo, pr, runtime=SimpleNamespace(context=other_auth),
+                )
+                assert result["status"] in {"checked_out", "resumed"}
+                assert ac.observe_scoped_pr_checkout(
+                    other_auth, other.action_scope, other, token, "cultivate", protocol,
+                )
+            finally:
+                repository.cleanup_deferred_pr_checkouts(other_auth)
+                reset_current_turn(turn_token)
+            assert registry.pending_for_scope(scope.canonical_repo, scope.pr_number) is job
+            assert auth.repo_pr_scope_registry.resolve(scope.canonical_repo, scope.pr_number) is state
+            assert state.checkout_lease is lease and lease.last_turn_id == "queue-A"
+
+        # Both grant expiry (monotonic) and lease age (wall clock), without sleeping.
+        monotonic = repository.time.monotonic
+        later = datetime.now(UTC) + timedelta(minutes=70)
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return later
+
+        monkeypatch.setattr(ac.time, "monotonic", lambda: monotonic() + 70 * 60)
+        monkeypatch.setattr(repository, "datetime", Clock)
+        monkeypatch.setattr(cultivate_policy, "datetime", Clock)
+        assert auth.scoped_pr_grants.expires_at < ac.time.monotonic()
+    finally:
+        release.set()
+        await job.task
+    assert job.record["result"]["evidence"] is True, json.dumps(job.record["result"])
+    event = owner._dispatcher.enqueue.call_args.args[0]
+    # Like the model, recover the target from the queued follow-up, not extra,
+    # turn history, channel state, or the test's remembered scope.
+    content = json.loads(event.content.split("\n\n", 1)[1])
+    arguments = {name: content[name] for name in ("repository", "pull_request")}
+    assert arguments == {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    assert "path" not in content["snapshot"]
+    followup = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True,
+        ifc_labels=_initialize_ifc_labels(event, policy=policy), policy=policy,
+    )
+    checkout = ac.get_tool_registry().authorize_tool(
+        "repo_checkout", followup, enforce=True, arguments=arguments, policy=policy,
+    )
+    assert checkout.allowed, checkout.as_log_fields()
+    turn = _ifc_turn(followup)
+    turn.turn_id = "resume-A"
+    turn_token = set_current_turn(turn)
+    try:
+        token = ac.consume_scoped_pr_checkout(followup, scope, "cultivate")
+        result = repository.repo_checkout.func(**arguments, runtime=SimpleNamespace(context=followup))
+        assert result["status"] == "resumed"
+        assert state.git_expected_head == tested_head
+        assert ac.observe_scoped_pr_checkout(followup, scope, state, token, "cultivate", protocol)
+        for tool_name in ("repo_commit", "repo_push"):
+            decision = ac.get_tool_registry().authorize_tool(
+                tool_name, followup, enforce=True, arguments=arguments, policy=policy,
+            )
+            assert decision.allowed, decision.as_log_fields()
+        assert repository.repo_push.func(**arguments, runtime=SimpleNamespace(context=followup))["ok"]
+        assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) == tested_head
+    finally:
+        reset_current_turn(turn_token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("repository_git_policy")
 async def test_repo_test_checkout_ttl_chain_excludes_heavy_queue(tmp_path, monkeypatch):
     """Three real queue/handoff cycles; queue, run and delivery exceed the TTL."""
     from datetime import UTC, datetime, timedelta
