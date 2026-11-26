@@ -2331,6 +2331,30 @@ def test_re_setup_replaces_vulnerable_nextest_layer_and_rebuilds(setup_environme
     assert json.loads((deploy / "manifest.json").read_text())["layer_tag"] == old_manifest["layer_tag"]
 
 
+@pytest.mark.parametrize("path,encoded_path", [
+    (".github/workflows/a#b?c.yml", ".github/workflows/a%23b%3Fc.yml"),
+    (".github/workflows/x?ref=other&a.yml", ".github/workflows/x%3Fref%3Dother%26a.yml"),
+    (".github/actions/install 100%/action.yaml", ".github/actions/install%20100%25/action.yaml"),
+])
+def test_tool_pin_scan_quotes_content_paths(path, encoded_path):
+    text = "tool: cargo-nextest@0.9.151"
+    row = {"path": path, "type": "blob", "mode": "100644", "size": len(text)}
+    requests = []
+
+    def request(url, token):
+        requests.append((url, token))
+        # Literal expectations pin path escaping independently of the production
+        # quote helper, while retaining '/' as path separators and the real ref.
+        assert url == f"https://api.github.com/repos/org/repo/contents/{encoded_path}?ref=main"
+        assert token == "secret"
+        return 200, {"encoding": "base64", "content": base64.b64encode(text.encode()).decode()}
+
+    files = installer._tool_pin_files("org/repo", "main", "secret", [row], request)
+    assert len(requests) == 1
+    assert files == {path: text}
+    assert installer._tool_pin(files, "nextest", installer.DEFAULT_NEXTEST_VERSION) == "0.9.151"
+
+
 def test_tool_pin_scan_bounds_file_count_before_fetch():
     def request(*args):
         pytest.fail("must reject an oversized inventory before fetching files")
