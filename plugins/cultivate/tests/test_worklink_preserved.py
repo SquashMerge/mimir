@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -472,3 +473,97 @@ def test_dispatch_sweep_does_not_reselect_retention_pruned_attempt(rig, monkeypa
     for _ in range(10):
         orchestrator._sweep_retained_attempts(home, operator, 7, 2, runner=runner, comment=comment)
     assert len(comments) == 1 and events == ["worklink_attempt_preserved"]
+
+
+@pytest.mark.parametrize("only_unreadable", [False, True])
+def test_unreadable_untracked_is_omitted_and_reported_without_retries(rig, monkeypatch, only_unreadable):
+    home, operator, _, checkout, _ = rig
+    if not only_unreadable:
+        _change_everything(checkout)
+        # Worker filenames must never select files through pathspec magic.
+        (checkout / ":(glob)**").write_text("literal filename\n")
+    target = checkout / "target-ratchet" / "private.lock"
+    target.parent.mkdir()
+    target.write_bytes(b"private")
+    target.chmod(0o600)
+    original = Path.open
+
+    def denied(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError("worker-private lock")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", denied)
+    cycle, events, comments = _periodic_rig(rig, monkeypatch)
+    cycle()
+    record = _lifecycle(home)
+    assert record["status"] == "preserved" and record["failures"] == 0
+    assert record["omitted_paths"] == ["target-ratchet/private.lock"]
+    assert len(events) == 1 and events[0][0] == "worklink_attempt_preserved"
+    assert events[0][1]["omitted_paths"] == ["target-ratchet/private.lock"]
+    assert 'omitted_paths=["target-ratchet/private.lock"]' in comments[0]
+    names = _git(operator, "ls-tree", "-r", "--name-only", preserved_ref(7, 1)).splitlines()
+    assert "target-ratchet/private.lock" not in names
+    if not only_unreadable:
+        assert {"app.py", "committed.py", "untracked_module.py", ":(glob)**"} <= set(names)
+        assert "changed, uncommitted" in _git(operator, "show", f"{preserved_ref(7, 1)}:app.py")
+    for _ in range(10):
+        cycle()
+    assert len(events) == len(comments) == 1
+    assert _lifecycle(home) == record
+    assert target.exists()  # Omission never deletes worker work.
+
+
+def test_unreadable_tracked_work_is_not_silently_omitted(rig, monkeypatch):
+    home, operator, _, checkout, _ = rig
+    _change_everything(checkout)
+    original = preserved_mod.ControllerGitPublication.run
+
+    def denied(git, *args, **kwargs):
+        if args[:2] == ("add", "-u"):
+            return subprocess.CompletedProcess(args, 1, "", "app.py: Permission denied")
+        return original(git, *args, **kwargs)
+
+    monkeypatch.setattr(preserved_mod.ControllerGitPublication, "run", denied)
+    record = _preserve(home, operator, checkout)
+    assert record.status == "retry_pending"
+    assert record.ref is None and "app.py: Permission denied" in record.error
+    assert record.omitted_paths == []
+
+
+@pytest.mark.parametrize("operation", ["list", "add"])
+def test_untracked_git_errors_do_not_report_success(rig, monkeypatch, operation):
+    home, operator, _, checkout, _ = rig
+    _change_everything(checkout)
+    original = preserved_mod.ControllerGitPublication.run
+
+    def failed(git, *args, **kwargs):
+        if (operation == "list" and args[0] == "ls-files") or (
+            operation == "add" and args[:2] == ("--literal-pathspecs", "add")
+        ):
+            return subprocess.CompletedProcess(args, 1, "", "untracked work unavailable")
+        return original(git, *args, **kwargs)
+
+    monkeypatch.setattr(preserved_mod.ControllerGitPublication, "run", failed)
+    record = _preserve(home, operator, checkout)
+    assert record.status == "retry_pending"
+    assert record.ref is None and "untracked work unavailable" in record.error
+
+
+def test_staging_never_opens_special_untracked_files(tmp_path, monkeypatch):
+    target = tmp_path / "fifo"
+    os.mkfifo(target)
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "fifo\0" if args[0] == "ls-files" else "", "")
+
+    def unexpected_open(*args, **kwargs):
+        pytest.fail("opening a worker FIFO can block preservation indefinitely")
+
+    monkeypatch.setattr(Path, "open", unexpected_open)
+    omitted = []
+    preserved_mod._stage_attempt(SimpleNamespace(run=run), tmp_path, omitted)
+    assert omitted == ["fifo"]
+    assert calls == [("add", "-u"), ("ls-files", "-z", "--others", "--exclude-standard")]
