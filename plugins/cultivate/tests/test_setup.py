@@ -4224,6 +4224,35 @@ def worklink_script_config(tmp_path, monkeypatch):
     return home, provision
 
 
+@pytest.mark.parametrize('has_digest', [False, True])
+def test_worklink_job_setup_transports_without_broadening_payload_policy(worklink_script_config, has_digest):
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.daemon_sessions import session_permissions
+
+    home, provision = worklink_script_config
+    assert provision()
+    path = home / 'worklink.yaml'
+    expected = path.read_bytes()
+    assert b'# Installed OpenCode session permission: worklink-job *\n' in expected
+    config = yaml.safe_load(expected)
+    policy = config['backends']['opencode']['bash_allowlist']
+    assert 'worklink-job *' not in policy
+    request = SessionRequest('leaf', {'providerID': 'unit', 'id': 'unit'}, 'build', tuple(policy))
+    assert {'action': 'shell', 'resource': 'worklink-job *', 'effect': 'allow'} in session_permissions(
+        request, jobs_enabled=True)
+    # The rc9 header-less rendering remains a recognized generated deployment.
+    previous = yaml.safe_dump(config, sort_keys=False).encode()
+    path.write_bytes(previous)
+    digest = home / '.mimir/worklink-setup.sha256'
+    if has_digest:
+        digest.write_text(hashlib.sha256(previous).hexdigest() + '\n')
+    else:
+        digest.unlink()
+    assert provision()
+    assert path.read_bytes() == expected
+    assert not provision()
+
+
 @pytest.mark.parametrize('command, expected', [
     ('./tools/verify', ['git *', './tools/verify', './tools/verify *']),
     ('./verify.sh', ['git *', './verify.sh', './verify.sh *']),
