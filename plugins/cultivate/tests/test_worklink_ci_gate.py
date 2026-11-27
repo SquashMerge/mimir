@@ -866,3 +866,133 @@ async def test_foreign_move_before_repair_push_is_not_overwritten(tmp_path, monk
     assert forges[0].head == "c" * 40  # The repair push would have set B.
     assert forges[0].current[B] == 0
     assert forges[0].ready_calls == 0
+
+
+class MixedChecksForge(Forge):
+    """Keep macOS queued on the old head, alongside the primary Linux check."""
+
+    def __call__(self, args, **kwargs):
+        result = super().__call__(args, **kwargs)
+        if args[:2] == ["gh", "api"] and f"/commits/{A}/check-runs?" in args[-1]:
+            pages = json.loads(result.stdout)
+            pages[0]["check_runs"].append({
+                **check("success"), "id": 13, "name": "candidate (macos)",
+                "status": "queued", "conclusion": None, "details_url": None,
+            })
+            pages[0]["total_count"] += 1
+            result.stdout = json.dumps(pages)
+        return result
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "startup_failure"])
+def test_completed_failure_is_observed_while_other_checks_are_queued(monkeypatch, conclusion) -> None:
+    captured = []
+    monkeypatch.setattr(ci_gate, "capture_job_log", lambda repo, job_id, **kw:
+        captured.append(job_id) or (b"test failed in job log", ""))
+    forge = MixedChecksForge({A: [check(conclusion)]})
+    result = ci_gate._snapshot(forge, "acme/widget", PR, A)
+    assert result.outcome == ("infrastructure" if conclusion == "startup_failure" else "red")
+    assert result.rerun_ids == ((34,) if conclusion == "startup_failure" else ())
+    assert result.checks == (("candidate (linux)", conclusion), ("candidate (macos)", "queued"))
+    assert captured == [34]
+    assert "test failed in job log" in result.excerpt
+    assert "limitation" not in result.excerpt  # No attempt to fetch the queued job's log.
+    assert forge.current[A] == 1
+
+
+@pytest.mark.parametrize("conclusion", ["success", "neutral", "skipped", "cancelled"])
+def test_queued_checks_prevent_green_or_cancelled_repair(monkeypatch, conclusion) -> None:
+    monkeypatch.setattr(ci_gate, "capture_job_log", lambda *a, **kw:
+        pytest.fail("pending CI must not fetch failure logs"))
+    result = ci_gate._snapshot(MixedChecksForge({A: [check(conclusion)]}), "acme/widget", PR, A)
+    assert result.outcome == "pending"
+    assert not result.excerpt and not result.rerun_ids
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress"])
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "startup_failure"])
+def test_unfinished_failure_conclusions_do_not_trigger_early_repair(status, conclusion) -> None:
+    forge = MixedChecksForge({A: [{**check(conclusion), "status": status}]})
+    result = ci_gate._snapshot(forge, "acme/widget", PR, A)
+    assert result.outcome == "pending"
+    assert not result.excerpt and not result.rerun_ids
+
+
+def test_pending_commit_status_prevents_green() -> None:
+    forge = Forge({A: [check("success")]})
+
+    def run(args, **kwargs):
+        result = forge(args, **kwargs)
+        if args[:2] == ["gh", "api"] and "/statuses?" in args[-1]:
+            result.stdout = json.dumps([[{"context": "external-ci", "state": "pending"}]])
+        return result
+
+    result = ci_gate._snapshot(run, "acme/widget", PR, A)
+    assert result.outcome == "pending"
+
+
+@pytest.mark.parametrize("conclusion", ["success", "neutral", "skipped"])
+def test_all_completed_passing_checks_are_green(conclusion) -> None:
+    forge = MixedChecksForge({A: [check(conclusion)]})
+
+    def run(args, **kwargs):
+        result = forge(args, **kwargs)
+        if args[:2] == ["gh", "api"] and "check-runs?" in args[-1]:
+            pages = json.loads(result.stdout)
+            pages[0]["check_runs"][-1].update(status="completed", conclusion="success")
+            result.stdout = json.dumps(pages)
+        return result
+
+    result = ci_gate._snapshot(run, "acme/widget", PR, A)
+    assert result.outcome == "green"
+    assert len(result.checks) == 2
+
+
+@pytest.mark.parametrize("scenario", ["infrastructure", "registry"])
+@pytest.mark.asyncio
+async def test_queued_checks_preserve_infrastructure_rerun_once(tmp_path, monkeypatch, scenario) -> None:
+    monkeypatch.setitem(globals(), "Forge", MixedChecksForge)
+    await test_ci_publication_scenarios(tmp_path, monkeypatch, scenario)
+
+
+@pytest.mark.asyncio
+async def test_early_red_repairs_once_then_waits_for_new_head(tmp_path, monkeypatch) -> None:
+    forges = []
+
+    class RepairForge(MixedChecksForge):
+        lag_reads = 0
+
+        def __init__(self, heads, **kwargs):
+            # The repaired head must also wait for its own pending checks.
+            heads[B] = [
+                {**check("success"), "head_sha": B, "status": "in_progress", "conclusion": None},
+                {**check("success"), "head_sha": B},
+            ]
+            super().__init__(heads, **kwargs)
+            forges.append(self)
+
+        def __call__(self, args, **kwargs):
+            result = super().__call__(args, **kwargs)
+            if args[:3] == ["gh", "pr", "view"] and "headRefOid" in args[-1] and self.head == B:
+                if self.lag_reads == 0:
+                    data = json.loads(result.stdout)
+                    data["headRefOid"] = A
+                    result.stdout = json.dumps(data)
+                self.lag_reads += 1
+            return result
+
+    observed = []
+
+    async def fast_wait(*args, **kwargs):
+        result = await ci_gate.wait_for_ci(*args, **kwargs, poll_s=0)
+        observed.append((args[3], kwargs.get("previous_sha"), result.outcome))
+        return result
+
+    monkeypatch.setitem(globals(), "Forge", RepairForge)
+    monkeypatch.setattr(orchestrator, "wait_for_ci", fast_wait)
+    # Reuse the existing real finalization assertions: one repair, failed-job
+    # excerpts in its prompt, one ready transition, and successful publication.
+    await test_ci_publication_scenarios(tmp_path, monkeypatch, "repair")
+    assert observed == [(A, None, "red"), (B, A, "green")]
+    assert forges[0].current == {A: 1, B: 2}
+    assert forges[0].lag_reads >= 5

@@ -201,11 +201,18 @@ def _snapshot(
     pending = any(isinstance(row, Mapping) and row.get("status") != "completed" for row in checks) or any(
         isinstance(row, Mapping) and row.get("state") == "pending" for row in statuses
     )
-    if not names or pending:
+    failed = [
+        row for row in checks
+        if isinstance(row, Mapping) and row.get("status") == "completed"
+        and row.get("conclusion") not in ("success", "neutral", "skipped")
+    ]
+    # Definite completed failures can be repaired (or rerun) without waiting for
+    # queued jobs. Other conclusions, including cancellation, still wait as before.
+    early_failure = any(row.get("conclusion") in ("failure", "timed_out", "startup_failure") for row in failed)
+    if not names or (pending and not early_failure):
         return CIResult("pending", blocker or "CI checks pending", names)
     if blocker is None:
         return CIResult("green", "CI green", names)
-    failed = [row for row in checks if isinstance(row, Mapping) and row.get("conclusion") not in ("success", "neutral", "skipped")]
     excerpts: list[str] = []
     ids: list[int] = []
     infrastructure = any(row.get("conclusion") == "startup_failure" for row in failed)
