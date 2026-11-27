@@ -1971,6 +1971,27 @@ def test_changed_verified_wheel_refused_before_build(upgrade_setup):
     assert (deploy / 'manifest.json').read_bytes() == before
 
 
+@pytest.mark.parametrize('annotation', [
+    pytest.param('  active incident: failure_kind=operator_required signature=test '
+                 'occurrence_id=test-incident failed_at=2026-11-27T14:30:00Z', id='active-incident'),
+    pytest.param('  disagreement: tracker labels differ', id='disagreement'),
+    pytest.param('  future annotation: additional issue details', id='generic-annotation'),
+])
+def test_upgrade_allows_clean_worklink_status_annotations(upgrade_setup, annotation):
+    deploy, args, state, calls, invoke = upgrade_setup
+    args.mimir_version = '1.0.1'
+    state['status'] = ('ISSUE  STATE       ATTEMPT\n'
+                       '42     clean       1\n' + annotation)
+
+    invoke()
+
+    assert not args.force
+    assert any(argv[-3:] == ['mimir', 'worklink', 'status'] for argv in calls)
+    assert any(argv[-1] == installer._PR_LEASE_PROBE for argv in calls)
+    assert any(argv == ['docker', 'compose', 'up', '-d', 'agent'] for argv in calls)
+    assert json.loads((deploy / 'manifest.json').read_text())['mimir_version'] == '1.0.1'
+
+
 @pytest.mark.parametrize('activity,detail', [('worklink', 'Worklink #42 (running)'),
                                            ('lease', 'PR checkout lease org/repo#17')])
 @pytest.mark.parametrize('mode', ['reembed', 'no_start'])
@@ -1980,10 +2001,12 @@ def test_upgrade_refuses_in_flight_before_stop(upgrade_setup, activity, detail, 
     setattr(args, mode, True)  # A rerun that would explicitly stop the old agent.
     if activity == 'worklink':
         state['status'] = ('ISSUE  STATE       ATTEMPT  BACKEND           BRANCH                    CHECKOUT  ELAPSED\n'
-                           '42     running     1        opencode          main                      -         1m')
+                           '42     running     1        opencode          main                      -         1m\n'
+                           '  active incident: failure_kind=operator_required signature=test '
+                           'occurrence_id=test-incident failed_at=2026-11-27T14:30:00Z')
     else:
         state['leases'] = '["org/repo#17"]'
-    with pytest.raises(installer.SetupError, match=re.escape(detail)):
+    with pytest.raises(installer.SetupError, match='Agent is busy: ' + re.escape(detail)):
         invoke()
     assert not any(argv[-2:] == ['stop', 'agent'] for argv in calls)
     assert not any(argv[:2] == ['docker', 'build'] for argv in calls)
