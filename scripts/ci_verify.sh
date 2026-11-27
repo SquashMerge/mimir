@@ -6,7 +6,9 @@
 # CI_VERIFY_TIMEOUT_SECONDS defaults to 170 minutes, below factory's 180 minutes.
 # CI_VERIFY_START_TIMEOUT_SECONDS (10 minutes) bounds waiting for any required
 # check to appear; CI_VERIFY_POLL_SECONDS (30 seconds) controls polling frequency.
-# Network commands share the deadline; cleanup has a separate 15-second bound.
+# Network commands retry up to 10 consecutive transient failures within the
+# deadline (each attempt at most 60 seconds); success resets the count.
+# Cleanup has a separate 15-second bound.
 
 sha=$(git rev-parse HEAD) || exit 75
 ref="refs/heads/qualify/factory-$sha"
@@ -92,19 +94,56 @@ def remaining():
     return left
 
 
-def command(*args, limit=None):
-    try:
-        return subprocess.run(
-            args, check=True, capture_output=True, text=True,
-            timeout=min(remaining(), limit) if limit is not None else remaining(),
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1"},
-        ).stdout
-    except subprocess.TimeoutExpired:
-        if time.monotonic() >= deadline:
-            unavailable("deadline reached")
-        unavailable("no required checks started before command timeout")
-    except (OSError, subprocess.SubprocessError) as exc:
-        unavailable(f"{args[0]} could not run ({type(exc).__name__})")
+MAX_CONSECUTIVE_TRANSIENT_FAILURES = 10
+TRANSIENT_ERRORS = re.compile(
+    r"error connecting to api[.]github[.]com|could not resolve host|"
+    r"connection reset|timed out|"
+    r"(?:HTTP(?:/\d(?:[.]\d)?)?\s+|returned error:\s*)5\d\d\b",
+    re.IGNORECASE,
+)
+PERMANENT_HTTP_ERRORS = re.compile(
+    r"(?:HTTP(?:/\d(?:[.]\d)?)?\s+|returned error:\s*)4\d\d\b", re.IGNORECASE,
+)
+
+
+def command(*args, until=None):
+    # This counter spans retries of one operation, not the lifetime of verify:
+    # returning successfully resets it before the next push/poll operation.
+    consecutive = 0
+    command_deadline = min(deadline, until) if until is not None else deadline
+    while True:
+        left = min(remaining(), command_deadline - time.monotonic())
+        if left <= 0:
+            unavailable("no required checks started before command timeout")
+        try:
+            result = subprocess.run(
+                args, check=True, capture_output=True, text=True,
+                timeout=min(left, 60),
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1"},
+            )
+            remaining()
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            # A bounded network attempt timing out is transient, but cannot
+            # extend either the overall deadline or the initial-start bound.
+            pass
+        except subprocess.CalledProcessError as exc:
+            evidence = (exc.stderr or "") + "\n" + (exc.stdout or "")
+            if PERMANENT_HTTP_ERRORS.search(evidence) or not TRANSIENT_ERRORS.search(evidence):
+                unavailable(f"{args[0]} failed with a non-transient error")
+        except (OSError, subprocess.SubprocessError) as exc:
+            unavailable(f"{args[0]} could not run ({type(exc).__name__})")
+        remaining()
+        if time.monotonic() >= command_deadline:
+            unavailable("no required checks started before command timeout")
+        consecutive += 1
+        if consecutive >= MAX_CONSECUTIVE_TRANSIENT_FAILURES:
+            unavailable("consecutive transient failure limit reached")
+        print(
+            f"Retrying {args[0]} after transient failure {consecutive}/"
+            f"{MAX_CONSECUTIVE_TRANSIENT_FAILURES}", file=sys.stderr, flush=True,
+        )
+        time.sleep(min(poll_seconds, remaining(), max(0, command_deadline - time.monotonic())))
 
 
 # origin's fetch URL is a local sandbox path; only its push URL identifies GitHub.
@@ -129,7 +168,7 @@ while True:
     raw = command(
         "gh", "api", f"repos/{REPO}/commits/{sha}/check-runs?per_page=100&filter=all",
         "--paginate", "--slurp",
-        limit=None if seen_required else max(0.001, start_deadline - time.monotonic()),
+        until=None if seen_required else start_deadline,
     )
     remaining()
     try:

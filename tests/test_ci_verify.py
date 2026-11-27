@@ -57,6 +57,18 @@ with (root / "calls.jsonl").open("a") as log:
     log.write(json.dumps([tool, *args]) + "\\n")
 sha = os.environ["FAKE_CI_SHA"]
 ref = "refs/heads/qualify/factory-" + sha
+
+
+def sequence_error(kind):
+    count_file = root / (kind + "-errors-count")
+    count = int(count_file.read_text()) if count_file.exists() else 0
+    count_file.write_text(str(count + 1))
+    errors = json.loads(os.environ.get("FAKE_CI_" + kind.upper() + "_ERRORS", "[]"))
+    if count < len(errors) and errors[count] is not None:
+        print(errors[count], file=sys.stderr)
+        sys.exit(1)
+
+
 if tool == "git":
     if args == ["rev-parse", "HEAD"]:
         print(sha)
@@ -65,6 +77,7 @@ if tool == "git":
     elif args == ["remote", "get-url", "origin"]:
         print("/local/factory/source")  # deliberately not a GitHub fetch URL
     elif args == ["push", "origin", sha + ":" + ref]:
+        sequence_error("push")
         sys.exit(int(os.environ.get("FAKE_CI_PUSH_RC", "0")))
     elif args == ["push", "origin", ":" + ref]:
         sys.exit(int(os.environ.get("FAKE_CI_CLEANUP_RC", "0")))
@@ -77,6 +90,7 @@ elif tool == "gh":
     ]
     if args != expected:
         sys.exit("unexpected gh arguments: " + repr(args))
+    sequence_error("gh")
     time.sleep(float(os.environ.get("FAKE_CI_GH_DELAY", "0")))
     if os.environ.get("FAKE_CI_GH_RC"):
         sys.exit(int(os.environ["FAKE_CI_GH_RC"]))
@@ -203,6 +217,132 @@ def test_github_unreachable_or_hung_is_unavailable(ci: FakeCI, mode: str) -> Non
     ci.env["CI_VERIFY_TIMEOUT_SECONDS"] = "0.6"
     ci.env["FAKE_CI_GH_RC" if mode == "error" else "FAKE_CI_GH_DELAY"] = "15"
     assert ci.run().returncode == 75
+    ci.assert_cleanup()
+
+
+TRANSIENT_MESSAGES = [
+    "error connecting to api.github.com",
+    "fatal: Could not resolve host: github.com",
+    "connection reset by peer",
+    "request timed out",
+    "gh: service unavailable (HTTP 503)",
+    "fatal: unable to access remote: The requested URL returned error: 502",
+    "HTTP/2 500 Internal Server Error",
+]
+
+
+def network_calls(ci: FakeCI, kind: str) -> int:
+    if kind == "gh":
+        return sum(call[0] == "gh" for call in ci.calls())
+    return sum(call == [
+        "git", "push", "origin", f"{SHA}:refs/heads/qualify/factory-{SHA}",
+    ] for call in ci.calls())
+
+
+@pytest.mark.parametrize("kind", ["gh", "push"])
+@pytest.mark.parametrize("message", TRANSIENT_MESSAGES)
+def test_transient_error_then_success_recovers(ci: FakeCI, kind: str, message: str) -> None:
+    ci.env[f"FAKE_CI_{kind.upper()}_ERRORS"] = json.dumps([message])
+    proc = ci.run()
+    assert proc.returncode == 0, proc.stderr
+    assert network_calls(ci, kind) == 2
+    ci.assert_cleanup()
+
+
+@pytest.mark.parametrize("kind", ["gh", "push"])
+def test_ten_consecutive_transient_errors_hit_bound(ci: FakeCI, kind: str) -> None:
+    # A green response is available on call 11: removing only the retry bound
+    # would return 0, rather than failing for an unrelated process timeout.
+    ci.env[f"FAKE_CI_{kind.upper()}_ERRORS"] = json.dumps([TRANSIENT_MESSAGES[0]] * 10)
+    proc = ci.run()
+    assert proc.returncode == 75, proc.stderr
+    assert "consecutive transient failure limit reached" in proc.stderr
+    assert network_calls(ci, kind) == 10
+    if kind == "push":
+        assert network_calls(ci, "gh") == 0
+    ci.assert_cleanup()
+
+
+def test_successful_poll_resets_consecutive_failure_count(ci: FakeCI) -> None:
+    ci.env["FAKE_CI_GH_ERRORS"] = json.dumps(
+        [TRANSIENT_MESSAGES[0]] * 9 + [None] + [TRANSIENT_MESSAGES[0]] * 9,
+    )
+    pending = green_checks()
+    pending[0].update(status="in_progress", conclusion=None)
+    proc = ci.run(responses=[[{"check_runs": pending}], [{"check_runs": green_checks()}]])
+    assert proc.returncode == 0, proc.stderr
+    assert network_calls(ci, "gh") == 20
+    ci.assert_cleanup()
+
+
+@pytest.mark.parametrize("kind", ["gh", "push"])
+@pytest.mark.parametrize("message", [
+    "HTTP 401 Bad credentials", "HTTP 403 Forbidden", "HTTP 404 Not Found",
+    "HTTP 403 Forbidden: upstream timed out", "unrecognized error",
+])
+def test_non_transient_error_exits_immediately(ci: FakeCI, kind: str, message: str) -> None:
+    ci.env[f"FAKE_CI_{kind.upper()}_ERRORS"] = json.dumps([message])
+    proc = ci.run()
+    assert proc.returncode == 75, proc.stderr
+    assert network_calls(ci, kind) == 1
+    ci.assert_cleanup()
+
+
+@pytest.mark.parametrize("kind", ["gh", "push"])
+def test_transient_retries_obey_overall_deadline(ci: FakeCI, kind: str) -> None:
+    ci.env[f"FAKE_CI_{kind.upper()}_ERRORS"] = json.dumps([TRANSIENT_MESSAGES[0]] * 10)
+    ci.env["CI_VERIFY_TIMEOUT_SECONDS"] = "0.6"
+    ci.env["CI_VERIFY_POLL_SECONDS"] = "1"
+    proc = ci.run()
+    assert proc.returncode == 75
+    assert "deadline reached" in proc.stderr
+    assert network_calls(ci, kind) < 10
+    ci.assert_cleanup()
+
+
+def test_transient_polls_obey_start_deadline(ci: FakeCI) -> None:
+    ci.env["FAKE_CI_GH_ERRORS"] = json.dumps([TRANSIENT_MESSAGES[0]] * 10)
+    ci.env["CI_VERIFY_START_TIMEOUT_SECONDS"] = "0.6"
+    ci.env["CI_VERIFY_POLL_SECONDS"] = "1"
+    proc = ci.run()
+    assert proc.returncode == 75
+    assert "no required checks started" in proc.stderr
+    assert network_calls(ci, "gh") < 10
+    ci.assert_cleanup()
+
+
+def test_recovered_network_does_not_hide_check_failure(ci: FakeCI) -> None:
+    ci.env["FAKE_CI_GH_ERRORS"] = json.dumps([TRANSIENT_MESSAGES[0]])
+    checks = green_checks()
+    checks[0]["conclusion"] = "failure"
+    proc = ci.run(checks)
+    assert proc.returncode == 1, proc.stderr
+    assert network_calls(ci, "gh") == 2
+    ci.assert_cleanup()
+
+
+@pytest.mark.parametrize("mutation", ["all-errors-fatal", "no-consecutive-bound"])
+def test_retry_regressions_distinguish_targeted_mutations(ci: FakeCI, mutation: str) -> None:
+    source = SCRIPT.read_text()
+    if mutation == "all-errors-fatal":
+        old = "if PERMANENT_HTTP_ERRORS.search(evidence) or not TRANSIENT_ERRORS.search(evidence):"
+        new = "if True:"
+        errors = [TRANSIENT_MESSAGES[0]]
+        expected = 0
+    else:
+        old = "if consecutive >= MAX_CONSECUTIVE_TRANSIENT_FAILURES:"
+        new = "if False:"
+        errors = [TRANSIENT_MESSAGES[0]] * 10
+        expected = 75
+    assert source.count(old) == 1
+    mutant = ci.path / "mutant.sh"
+    mutant.write_text(source.replace(old, new))
+    ci.env["FAKE_CI_GH_ERRORS"] = json.dumps(errors)
+    proc = ci.run(script=mutant)
+    assert proc.returncode != expected, proc.stderr
+    # Both mutants terminate normally with the opposite outcome; timeout or a
+    # syntax error is not accepted as a mutation kill.
+    assert proc.returncode == (75 if mutation == "all-errors-fatal" else 0)
     ci.assert_cleanup()
 
 
