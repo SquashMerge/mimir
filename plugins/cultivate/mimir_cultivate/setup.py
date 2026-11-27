@@ -1272,7 +1272,7 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         allowlist.append(entry['test_command'] + ' *')
 
     def render(section: dict | None, *, legacy_exact_script: bool = False,
-               legacy_toolchain_allowlist: bool = False) -> str:
+               legacy_toolchain_allowlist: bool = False, legacy_job_helper: bool = False) -> str:
         rendered = dict(config)
         if legacy_exact_script and script_arguments:
             rendered['backends'] = {'opencode': {
@@ -1288,7 +1288,13 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
             rendered['backends'] = backends
         if section:
             rendered['tracker'] = section
-        return yaml.safe_dump(rendered, sort_keys=False)
+        # This transport rule is installed by SessionController for every leaf,
+        # including operator-managed allowlists. Keeping it out of the payload
+        # policy prevents the helper from authorizing itself recursively.
+        header = ("" if legacy_job_helper else
+                  "# Installed OpenCode session permission: worklink-job *\n"
+                  "# Job payloads must still match the bash_allowlist below.\n")
+        return header + yaml.safe_dump(rendered, sort_keys=False)
 
     text = render(tracker)
     data = text.encode()
@@ -1310,8 +1316,10 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         unedited = (hashlib.sha256(current).hexdigest() == recorded if recorded
                     else current in tuple(
                         render(section, legacy_exact_script=legacy,
-                               legacy_toolchain_allowlist=old_toolchain).encode()
+                               legacy_toolchain_allowlist=old_toolchain,
+                               legacy_job_helper=old_job).encode()
                         for section in (previous_tracker, None)
+                        for old_job in (False, True)
                         for legacy, old_toolchain in ((False, False), (False, True), (True, True))))
         if not unedited:
             print(_WORKLINK_EDITED, flush=True)
