@@ -868,6 +868,7 @@ def session_environment(pass_env: object, *, home: Path, git_settings: object,
     from mimir.otel_credentials import is_sensitive_otlp_env
     from ..contained_execution import heavy_lock_environment
     from .compute import _validate_dynamic_worker_name, _validate_worker_value
+    from .network_environment import network_retry_environment
     from .pytest_environment import pytest_session_environment
 
     if not isinstance(pass_env, dict) or len(pass_env) > 128:
@@ -894,6 +895,8 @@ def session_environment(pass_env: object, *, home: Path, git_settings: object,
                 or any(part in name.upper() for part in ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "BASE_URL"))):
             raise ValueError("sensitive session pass_env refused")
         environment[name] = value
+    for name, value in network_retry_environment().items():
+        environment.setdefault(name, value)
     if not isinstance(git_settings, (tuple, list)) or len(git_settings) > 32:
         raise ValueError("invalid session git settings")
     settings = [("safe.directory", str(home)), *git_settings]

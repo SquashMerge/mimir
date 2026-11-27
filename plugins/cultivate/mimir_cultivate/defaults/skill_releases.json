@@ -1,4 +1,9 @@
 {
+  "2242-transient-network-retries": {
+    "prompt_templates": {
+      "worklink-order.md": "dc3056a2a6fa2508221baa29dec4037ab018481cfb91f9886e0fd40878aee59f"
+    }
+  },
   "e52e30daced64c5c5ad0ea266c27a5be07ef299e": {
     "github-poller": {
       "SKILL.md": "fbdf96e35f4c4a14ed2ae00fc6f1c7e5e74271eec6a05a37a3371bbd16034de1",

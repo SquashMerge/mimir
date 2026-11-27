@@ -1654,6 +1654,7 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
     from ..contained_execution import heavy_lock_environment
     from .daemon_config import SESSION_HELPER_TIMEOUT_S, PublishingCredentials, parse_launch_snapshot
     from .daemon_service import PYTHON, UID_HELPER, RuntimePaths, read_json
+    from .network_environment import network_retry_environment
 
     common = {"version", "op", "executor_identity", "issue", "attempt", "device", "inode", "path", "generation"}
     create = request["op"] == "session_create"
@@ -1703,9 +1704,11 @@ def _handle_session(connection: socket.socket, request: dict[str, Any], fds: lis
     environment = {
         "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
         # The helper builds shell environments from its own env, not ours.
-        # Forward only validated lease settings, never ambient credentials or
-        # MIMIR_HEAVY_LOCK_HELD (a builder must acquire its own lease).
+        # Forward only validated lease settings and allowlisted retry settings,
+        # never ambient credentials or MIMIR_HEAVY_LOCK_HELD (a builder must
+        # acquire its own lease).
         **heavy_lock_environment(),
+        **network_retry_environment(),
     }
     environment.update(PublishingCredentials(snapshot.bot_token, snapshot.publishing_identity).environment())
     if create:

@@ -488,7 +488,9 @@ def _local_child_env() -> dict[str, str]:
     Infra vars + provider-credential families from the parent process; nothing
     else (no bridge/operator secrets). Mirrors ``tools.registry`` spawn-env
     philosophy on the worklink compute path."""
-    env: dict[str, str] = _heavy_lock_environment()
+    from .network_environment import network_retry_environment
+
+    env: dict[str, str] = {**_heavy_lock_environment(), **network_retry_environment()}
     for key in _LOCAL_ENV_INFRA:
         val = os.environ.get(key)
         if val is not None:
@@ -635,6 +637,10 @@ def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
         from .pytest_environment import pytest_session_environment
 
         env.update(pytest_session_environment(env["PATH"]))
+    from .network_environment import network_retry_environment
+
+    for name, value in network_retry_environment().items():
+        env.setdefault(name, value)
     return filter_otlp_env(env)
 
 
