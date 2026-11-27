@@ -152,6 +152,7 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
         timeout_s: int = 5
         backend_config: dict | None = None
         factory_credential_settings: tuple[tuple[str, str], ...] = ()
+        builder_lease_credit: bool = False
 
     class Backend:
         name = "opencode"
@@ -165,6 +166,8 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
 
     class Compute:
         async def launch(self, spec):
+            # CI repair builders receive the same queue-time credit as initial builds.
+            assert spec.builder_lease_credit is True
             return LaunchHandle("local_subprocess", "42")
 
         async def wait(self, handle, timeout):
