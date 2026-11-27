@@ -1691,6 +1691,8 @@ def shell_gate_environment() -> Iterator[dict[str, str]]:
     the controller's home. This bounds environment inheritance, not filesystem
     access: the local gate still executes repository code as the current uid.
     """
+    from .browser_environment import browser_environment
+
     with tempfile.TemporaryDirectory(prefix="worklink-gate-home-") as text:
         home = Path(text)
         uid = os.getuid()
@@ -1713,6 +1715,7 @@ def shell_gate_environment() -> Iterator[dict[str, str]]:
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "HOME": str(home),
+            **browser_environment(),
             **{name: str(path) for name, path in paths.items()},
         }
 

@@ -635,6 +635,9 @@ def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
         from .pytest_environment import pytest_session_environment
 
         env.update(pytest_session_environment(env["PATH"]))
+    from .browser_environment import browser_environment
+
+    env.update(browser_environment({**os.environ, **env}))
     return filter_otlp_env(env)
 
 

@@ -76,6 +76,28 @@ def test_legacy_setup_renderer_bytes_and_modes(setup_environment, monkeypatch, p
     assert expected["scaffold-workspace"]["text"].count(pinned) == 1
     expected["scaffold-workspace"]["text"] = expected["scaffold-workspace"]["text"].replace(
         pinned, f"\nARG FACTORY_VERSION={FACTORY_VERSION}\n")
+    # Authorize only the browser-cache addition to the legacy Compose oracle.
+    compose = yaml.safe_load(expected["compose.yml"]["text"])
+    agent_env = compose["services"]["agent"]["environment"]
+    keys = list(agent_env)
+    keys.insert(keys.index("MIMIR_ACP_ENABLED"), "PLAYWRIGHT_BROWSERS_PATH")
+    agent_env["PLAYWRIGHT_BROWSERS_PATH"] = "/var/cache/mimir-playwright"
+    agent_env["MIMIR_SHELL_PASS_ENV"] = "PLAYWRIGHT_BROWSERS_PATH"
+    compose["services"]["agent"]["environment"] = {key: agent_env[key] for key in keys}
+    for service in ("agent", "init"):
+        mounts = compose["services"][service]["volumes"]
+        mounts.insert(mounts.index("worklink-daemon:/var/lib/mimir-worklink/daemon") + 1,
+                      "playwright:/var/cache/mimir-playwright")
+    compose["services"]["init"]["command"][0] = compose["services"]["init"]["command"][0].replace(
+        "&& chmod 0755 /workspace/.worklink",
+        "&& chmod 0755 /workspace/.worklink"
+        " && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-playwright")
+    compose["volumes"]["playwright"] = None
+    old_digest = hashlib.sha256(expected["compose.yml"]["text"].encode()).hexdigest()
+    header = expected["compose.yml"]["text"].split("services:\n", 1)[0]
+    expected["compose.yml"]["text"] = header + yaml.safe_dump(compose, sort_keys=False)
+    new_digest = hashlib.sha256(expected["compose.yml"]["text"].encode()).hexdigest()
+    expected["manifest.json"]["text"] = expected["manifest.json"]["text"].replace(old_digest, new_digest)
     import difflib
     differences = []
     for name in sorted(actual.keys() | expected.keys()):
@@ -1089,7 +1111,9 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert compose["services"]["agent"]["environment"]["XDG_CACHE_HOME"] == "/home/mimir/.cache"
     assert "cache:/home/mimir/.cache" in compose["services"]["agent"]["volumes"]
     assert compose["services"]["agent"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
-    assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon"}
+    assert set(compose["volumes"]) == {
+        "home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon", "playwright",
+    }
     assert "worklink-daemon:/var/lib/mimir-worklink/daemon" in compose["services"]["agent"]["volumes"]
     assert any('MIMIR_VERSION=' + VERSION in part for argv in calls for part in argv)
     assert sum("docker" == argv[0] and "exec" in argv and argv[-1] != installer._OPENCODE_DAEMON_PROBE
@@ -3384,8 +3408,9 @@ def test_sccache_compose_persists_private_worker_cache_and_opt_out():
     from mimir.scaffold_docker import render_compose_yml
     template = render_compose_yml(service_name='agent', web_port=8123, mode='pypi')
     uncached = installer.render_compose(template, 'image:sha', 'rust', 'repo', sccache=False)
+    # Includes the all-toolchain Playwright volume, even with sccache disabled.
     assert hashlib.sha256(uncached.encode()).hexdigest() == (
-        '708b7d181ba5b7b81ea9da9fc759b7a2fdc73915f188d511b71292db520e214e')
+        '97a8a160da4d2ce15adbe93d693b8a304ffe7d24835ce18c0cd03d4141fa7c21')
     cached = yaml.safe_load(installer.render_compose(template, 'image:sha', 'rust', 'repo'))
     plain = yaml.safe_load(uncached)
     for service in ('agent', 'init'):
@@ -3395,7 +3420,7 @@ def test_sccache_compose_persists_private_worker_cache_and_opt_out():
     command = cached['services']['init']['command'][0]
     assert command.endswith(' && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-sccache')
     assert cached['services']['agent']['environment']['MIMIR_SHELL_PASS_ENV'].endswith(
-        ',RUSTC_WRAPPER,SCCACHE_DIR,SCCACHE_CACHE_SIZE')
+        ',RUSTC_WRAPPER,SCCACHE_DIR,SCCACHE_CACHE_SIZE,PLAYWRIGHT_BROWSERS_PATH')
     for kind in ('node', 'python'):
         assert installer.render_compose(template, 'image:sha', kind, 'repo') == (
             installer.render_compose(template, 'image:sha', kind, 'repo', sccache=False))

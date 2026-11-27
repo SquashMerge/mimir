@@ -152,6 +152,9 @@ class OpenCodeBackend:
         model_home = order.env.get("MIMIR_HOME") or os.environ.get("MIMIR_HOME")
         configured = model_spec_at_call_time(Path(model_home) if model_home else None)
         values = {**os.environ, **order.env}
+        from ..browser_environment import browser_environment
+
+        test_env = {**browser_environment(values), **self.test_env}
         values.setdefault("MIMIR_MODEL_SPEC", configured)
         reference = resolve_daemon_model(values)
         model = f"{reference['providerID']}/{reference['id']}"
@@ -164,8 +167,8 @@ class OpenCodeBackend:
             "variant_source": ("none" if "variant" not in reference else
                                "model_spec" if "#" in values["MIMIR_MODEL_SPEC"] else
                                "worklink_override" if values.get("MIMIR_WORKLINK_REASONING_EFFORT") else "agent"),
-            "test_env": dict(self.test_env),
-            "pass_env": tuple(self.test_env),
+            "test_env": test_env,
+            "pass_env": tuple(test_env),
         }
         return WorkSpec(
             issue_id=order.issue_id,
@@ -178,7 +181,7 @@ class OpenCodeBackend:
             test_command=test_command,
             backend=self.name,
             timeout_s=order.timeout_s,
-            env=dict(self.test_env),
+            env=dict(test_env),
             backend_config=backend_config,
             local_checkout=order.checkout,
             session_request=SessionRequest("leaf", reference, prompt, allowlist),
@@ -326,7 +329,7 @@ def validate_test_env(value: object) -> None:
         raise ValueError(f"{label} must be a mapping")
     for key, text in value.items():
         if key not in {"PYTEST_ADDOPTS", "RUSTUP_HOME", "CARGO_HOME", "UV_PYTHON_INSTALL_DIR",
-                       "RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE"}:
+                       "RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE", "PLAYWRIGHT_BROWSERS_PATH"}:
             raise ValueError(f"{label} key {key!r} is not allowed")
         if not isinstance(text, str) or any(not char.isprintable() for char in text):
             raise ValueError(f"{label}.{key} must be plain text without newlines or control characters")
