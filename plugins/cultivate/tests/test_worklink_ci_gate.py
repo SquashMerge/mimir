@@ -704,3 +704,165 @@ async def test_forge_read_failure_publication_and_comment(tmp_path, monkeypatch,
         comment = next(text for text in forge.comments if text.startswith("WORKLINK_EVIDENCE"))
         assert "CI was not observed" in comment
         assert PR in comment and A in comment
+
+
+@pytest.fixture
+def propagation_clock(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    now = [1000.0]
+
+    async def sleep(delay):
+        now[0] += delay
+
+    # Replace only the CI gate's clock/sleep, not the event loop's clock.
+    monkeypatch.setattr(ci_gate, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(ci_gate, "asyncio", SimpleNamespace(to_thread=asyncio.to_thread, sleep=sleep))
+    return now
+
+
+@pytest.mark.parametrize("infrastructure_rerun", [False, True])
+@pytest.mark.asyncio
+async def test_repair_push_propagates_before_green_and_ready(
+    tmp_path, monkeypatch, infrastructure_rerun,
+) -> None:
+    forges = []
+
+    class LaggingForge(Forge):
+        lag_reads = 0
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            forges.append(self)
+
+        def __call__(self, args, **kwargs):
+            result = super().__call__(args, **kwargs)
+            if args[:3] == ["gh", "pr", "view"] and "headRefOid" in args[-1] and self.head == B:
+                if self.lag_reads == 0:
+                    data = json.loads(result.stdout)
+                    data["headRefOid"] = A
+                    result.stdout = json.dumps(data)
+                self.lag_reads += 1
+            return result
+
+    wait = ci_gate.wait_for_ci
+    observed_previous = []
+
+    async def fast_wait(*args, **kwargs):
+        observed_previous.append(kwargs.get("previous_sha"))
+        result = await wait(*args, **kwargs, poll_s=0)
+        if infrastructure_rerun and args[3] == B and kwargs.get("previous_sha") is not None:
+            assert result.outcome == "green"
+            return ci_gate.CIResult("infrastructure", "registry unavailable", rerun_ids=(34,))
+        return result
+
+    monkeypatch.setattr(orchestrator, "wait_for_ci", fast_wait)
+    monkeypatch.setitem(globals(), "Forge", LaggingForge)
+    # Reuse the full publication/repair fixture and its completed/ready assertions.
+    await test_ci_publication_scenarios(tmp_path, monkeypatch, "repair")
+    assert observed_previous == ([None, A, None] if infrastructure_rerun else [None, A])
+    assert forges[0].lag_reads >= 3
+    assert forges[0].ready_calls == 1
+    assert forges[0].current[B] == (2 if infrastructure_rerun else 1)
+    assert forges[0].reruns == int(infrastructure_rerun)
+
+
+@pytest.mark.parametrize("head_read", [1, 2, 3])
+@pytest.mark.parametrize("observed", [A, "c" * 40])
+def test_propagation_head_checks_remain_exact(
+    monkeypatch, propagation_clock, head_read, observed,
+) -> None:
+    forge = Forge({B: [{**check("failure"), "head_sha": B}]})
+    forge.head = B
+
+    def run(args, **kwargs):
+        result = forge(args, **kwargs)
+        if args[:3] == ["gh", "pr", "view"] and forge.reads == head_read:
+            data = json.loads(result.stdout)
+            data["headRefOid"] = observed
+            result.stdout = json.dumps(data)
+        return result
+
+    result = ci_gate._snapshot(
+        run, "acme/widget", PR, B, previous_sha=A, settle_deadline=1120,
+    )
+    assert result.outcome == ("pending" if observed == A else "moved")
+    assert forge.reads == head_read
+
+
+@pytest.mark.asyncio
+async def test_unknown_head_moves_immediately_during_propagation(propagation_clock) -> None:
+    forge = Forge({B: [check("success")]})
+    forge.head = "c" * 40
+    result = await ci_gate.wait_for_ci(
+        forge, "acme/widget", PR, B, previous_sha=A,
+        timeout_s=300, stopped=lambda: False,
+    )
+    assert result.outcome == "moved"
+    assert forge.reads == 1
+    assert propagation_clock[0] == 1000
+    assert forge.current[B] == 0
+
+
+@pytest.mark.asyncio
+async def test_previous_head_moves_at_settle_window_bound(propagation_clock) -> None:
+    forge = Forge({A: [check("success")], B: [check("success")]})
+    result = await ci_gate.wait_for_ci(
+        forge, "acme/widget", PR, B, previous_sha=A,
+        timeout_s=300, stopped=lambda: False, poll_s=10,
+    )
+    assert result.outcome == "moved"
+    assert propagation_clock[0] == 1120
+    assert forge.reads == 13
+    assert forge.current == {A: 0, B: 0}
+    assert not forge.ready
+
+
+@pytest.mark.parametrize("head_read", [1, 2, 3])
+def test_settle_deadline_is_checked_on_every_head_read(propagation_clock, head_read) -> None:
+    forge = Forge({B: [{**check("failure"), "head_sha": B}]})
+    forge.head = B
+
+    def run(args, **kwargs):
+        result = forge(args, **kwargs)
+        if args[:3] == ["gh", "pr", "view"] and forge.reads == head_read:
+            propagation_clock[0] = 1120
+            data = json.loads(result.stdout)
+            data["headRefOid"] = A
+            result.stdout = json.dumps(data)
+        return result
+
+    result = ci_gate._snapshot(run, "acme/widget", PR, B, previous_sha=A, settle_deadline=1120)
+    assert result.outcome == "moved"
+    assert forge.reads == head_read
+
+
+@pytest.mark.asyncio
+async def test_foreign_move_before_repair_push_is_not_overwritten(tmp_path, monkeypatch) -> None:
+    forges = []
+
+    class MovedBeforePushForge(Forge):
+        repair_pushes = 0
+
+        def __setattr__(self, name, value):
+            if name == "head" and value == B:
+                self.repair_pushes += 1
+            super().__setattr__(name, value)
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            forges.append(self)
+
+        def __call__(self, args, **kwargs):
+            # The initial red snapshot reads three times; the fourth is pre-push.
+            if args[:3] == ["gh", "pr", "view"] and "headRefOid" in args[-1] and self.reads == 3:
+                self.head = "c" * 40
+            return super().__call__(args, **kwargs)
+
+    monkeypatch.setitem(globals(), "Forge", MovedBeforePushForge)
+    await test_ci_publication_scenarios(tmp_path, monkeypatch, "exhausted")
+    assert forges[0].repair_pushes == 0
+    assert forges[0].head == "c" * 40  # The repair push would have set B.
+    assert forges[0].current[B] == 0
+    assert forges[0].ready_calls == 0
