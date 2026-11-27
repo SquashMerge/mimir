@@ -17,6 +17,7 @@ from tests.opencode_fixtures import opencode_binary
 @pytest.fixture(autouse=True)
 def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
 
 
 def _write_native_files(home: Path) -> None:
@@ -85,8 +86,9 @@ def test_enabled_opencode_spec_has_typed_session_and_no_auth_projection(
     assert spec.session_request.kind == "leaf"
     assert spec.session_request.model["providerID"] == "openai"
     assert spec.session_request.shell_allowlist == ("git *", "uv *")
-    assert spec.backend_config["pass_env"] == ()
-    assert spec.env == {}
+    assert spec.backend_config["pass_env"] == ("PLAYWRIGHT_BROWSERS_PATH",)
+    assert spec.env == {"PLAYWRIGHT_BROWSERS_PATH": "/var/cache/mimir-playwright"}
+    assert spec.backend_config["test_env"] == spec.env
     assert spec.local_argv is None
     assert "referenced" not in repr(spec)
 
@@ -124,7 +126,8 @@ def test_disabled_opencode_spec_never_falls_back_to_direct_execution(
 
     assert "worker_projections" not in spec.backend_config
     assert spec.local_checkout == tmp_path / ".worklink" / "repo" / "1410-1"
-    assert spec.env == {}
+    assert spec.env == {"PLAYWRIGHT_BROWSERS_PATH": "/var/cache/mimir-playwright"}
+    assert spec.backend_config["test_env"] == spec.env
     assert spec.local_argv is None
     assert spec.session_request.kind == "leaf"
 
