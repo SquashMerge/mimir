@@ -127,6 +127,9 @@ class WorklinkEvidence:
     gate_mode: str = "local"
     ci_repair_rounds: int = 0
     ci_checks: tuple[tuple[str, str], ...] = ()
+    builder_lease_wait_s: float = 0.0
+    builder_lease_extension_s: float = 0.0
+    builder_elapsed_s: float = 0.0
     # Commit pushed for this completed attempt. Recovery uses it to detect PR
     # branch updates made after Worklink finished.
     head_sha: str | None = None
@@ -1276,6 +1279,7 @@ async def _run_compute_gate_command(
         backend_config={key: value for key, value in work_spec.backend_config.items()
                         if key not in {"worker_identifier", "worker_projections"}},
         session_request=None,
+        builder_lease_credit=False,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
         timeout_s=min(work_spec.timeout_s, 60) if diagnostic else work_spec.timeout_s,

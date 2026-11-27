@@ -46,6 +46,9 @@
 #   MIMIR_HEAVY_TIMEOUT_TOOL    override gtimeout (macOS) / timeout (Linux)
 #   MIMIR_HEAVY_GTIMEOUT        legacy timeout-tool override, still honored
 #   MIMIR_HEAVY_PYTHON          Python 3 interpreter (default python3)
+# Worklink alone supplies WORKLINK_LEASE_SOCKET/AUTH: its controller acquires
+# the unchanged lease and measures queue time on private pipes. Other callers
+# continue using the ordinary helper and the same overall timeout.
 set -eu
 
 if [ "$#" -eq 0 ]; then

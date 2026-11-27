@@ -103,12 +103,14 @@ Audit slow tests with `uv run --extra dev pytest --durations=20`. If a test
 legitimately needs more than five minutes, add `@pytest.mark.timeout(seconds)`
 with a comment explaining why; do not raise or disable the default globally.
 
-A scoped run is not evidence. Before submitting a test, run it alone **and** in
-the full suite:
+For Worklink issue builds, run focused tests locally, directly without xdist
+or the heavy lease; PR CI (both legs, all checks) supplies full-suite evidence.
+Keep the PR draft until CI is green. Outside that CI-gated workflow, before
+submitting a test, run it alone **and** in the full suite:
 
 ```bash
-uv run pytest -q tests/test_<file>.py   # your file alone
-uv run pytest -q                        # the whole suite
+uv run env PYTEST_ADDOPTS='' pytest -o addopts='' -q tests/test_<file>.py
+sh scripts/heavy_run.sh uv run pytest -q # the whole suite
 ```
 
 The shared autouse session fixture in `tests/isolation_fixtures.py` filters

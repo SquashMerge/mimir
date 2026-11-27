@@ -357,9 +357,11 @@ def discover_associations(home: Path, issue: IssueSnapshot) -> AssociationDecisi
             if evidence_issue != issue.issue_id or attempt != int(name.group("attempt")):
                 raise ClosureReadError("active evidence identity mismatch")
             status = payload.get("status")
-            if status not in {"completed", "blocked", "failed"}:
+            if status not in {"completed", "blocked", "failed", "lease_wait"}:
                 raise ClosureReadError("active evidence has invalid status")
             ready = payload.get("review_ready")
+            if status == "lease_wait" and (payload.get("pr_url") is not None or ready is True):
+                raise ClosureReadError("lease wait release cannot carry publication evidence")
             if ready is not None and not isinstance(ready, bool):
                 raise ClosureReadError("active evidence has invalid review_ready")
             active_base = payload.get("base_ref")

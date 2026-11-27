@@ -65,6 +65,8 @@ OPERATOR_STOP_PREFIX = "WORKLINK_STOPPED "
 QUOTA_HOLD_PREFIX = "WORKLINK_QUOTA_HOLD "
 # Credit only the matching pre-checkout claim; ordinals still advance.
 BASE_FETCH_DEFERRED_PREFIX = "WORKLINK_BASE_FETCH_DEFERRED "
+LEASE_WAIT_PREFIX = "WORKLINK_LEASE_WAIT_TIMEOUT "
+MAX_LEASE_WAIT_RELEASES = 2
 # A planned restart must not consume the ordinary retry budget, but repeated
 # restarts must not turn max_attempts into an infinite-retry loophole.
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
@@ -259,7 +261,7 @@ def _parse_dt(value: str) -> datetime:
 
 def _scan_claim_history(
     comments: Iterable[str],
-) -> tuple[list[ClaimRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], int]:
+) -> tuple[list[ClaimRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], int]:
     """Parse every claim record with its reset generation, plus the final one.
 
     Scans in comment order, so a ``WORKLINK_CLAIM_RESET`` marker advances the
@@ -281,6 +283,7 @@ def _scan_claim_history(
     aborts: list[ShutdownAbortRecord] = []
     stops: list[ShutdownAbortRecord] = []
     deferrals: list[ShutdownAbortRecord] = []
+    lease_waits: list[ShutdownAbortRecord] = []
     seen_claims: set[tuple[int, int, str, datetime]] = set()
     generation = 0
     for comment in comments:
@@ -293,6 +296,7 @@ def _scan_claim_history(
                 prefix = next((p for p in (
                     SHUTDOWN_ABORT_PREFIX, OPERATOR_STOP_PREFIX, QUOTA_HOLD_PREFIX,
                     BASE_FETCH_DEFERRED_PREFIX,
+                    LEASE_WAIT_PREFIX,
                 ) if line.startswith(p)), None)
                 if prefix is None:
                     continue
@@ -312,7 +316,8 @@ def _scan_claim_history(
                     continue
                 target = (
                     aborts if prefix == SHUTDOWN_ABORT_PREFIX else
-                    deferrals if prefix == BASE_FETCH_DEFERRED_PREFIX else stops
+                    deferrals if prefix == BASE_FETCH_DEFERRED_PREFIX else
+                    lease_waits if prefix == LEASE_WAIT_PREFIX else stops
                 )
                 target.append(replace(abort, generation=generation))
                 continue
@@ -324,11 +329,11 @@ def _scan_claim_history(
             seen_claims.add(
                 (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
             )
-    return records, aborts, stops, deferrals, generation
+    return records, aborts, stops, deferrals, lease_waits, generation
 
 
 def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], int]:
-    records, _aborts, _stops, _deferrals, generation = _scan_claim_history(comments)
+    records, _aborts, _stops, _deferrals, _lease_waits, generation = _scan_claim_history(comments)
     return records, generation
 
 
@@ -1156,7 +1161,7 @@ class ChainlinkClaims:
         history forgive their matching claims. Attempt ordinals still advance,
         preventing checkout/branch/evidence collisions.
         """
-        records, aborts, stops, deferrals, generation = _scan_claim_history(comments)
+        records, aborts, stops, deferrals, lease_waits, generation = _scan_claim_history(comments)
         claim_keys = {
             (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
             for record in records
@@ -1187,6 +1192,15 @@ class ChainlinkClaims:
                 break
             deferred_keys.add(key)
         forgiven.update(deferred_keys)
+        lease_keys: set[tuple[int, int, str, datetime]] = set()
+        for hold in lease_waits:
+            key = (hold.issue_id, hold.attempt, hold.agent_id, hold.claimed_at)
+            if hold.generation != generation or key not in active_claims or key in lease_keys:
+                continue
+            if len(lease_keys) >= MAX_LEASE_WAIT_RELEASES:
+                break
+            lease_keys.add(key)
+        forgiven.update(lease_keys)
         home = home_path if home_path is not None else self.home_path
         clean_parks = {
             key for record in records

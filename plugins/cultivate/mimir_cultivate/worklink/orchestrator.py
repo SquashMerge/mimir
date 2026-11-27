@@ -1063,9 +1063,22 @@ def _demote_template_invalid_ready_leaf(
 
 def render_work_order(
     issue: IssueContext, *, template_path: Path, backend_name: str, test_command: str,
-    prior_attempts: str | None = None,
+    prior_attempts: str | None = None, gate_mode: str = "local",
 ) -> str:
     template = template_path.read_text(encoding="utf-8")
+    gate_instructions = (
+        "- Gate: PR CI (no local gate). Run focused tests for the code you changed "
+        "(touched test files or a `-k` selection), directly, without `-n` or "
+        "`scripts/heavy_run.sh`. Clear inherited/configured xdist addopts for focused "
+        "runs. Do NOT run the whole suite locally. PR CI runs "
+        "both legs and all checks on the draft PR; repair red CI and keep it draft "
+        "until CI is green."
+        if gate_mode == "ci" else
+        "- You are NOT done until the gate command below passes when YOU run it. "
+        "Run it yourself before finishing and fix everything it surfaces — even "
+        "failures in code you did not write. If it fails when the orchestrator "
+        "re-runs it, the attempt fails and nothing is pushed:\n  " + (test_command or "")
+    )
     rendered = template.format(
         issue_id=issue.issue_id,
         title=issue.title,
@@ -1074,6 +1087,7 @@ def render_work_order(
         parent_id=issue.parent_id if issue.parent_id is not None else "(none)",
         backend=backend_name,
         test_command=test_command,
+        gate_instructions=gate_instructions,
     )
     # After the spec: reference only, never part of what the leaf must do.
     return f"{rendered.rstrip()}\n\n{prior_attempts}\n" if prior_attempts else rendered
@@ -1221,6 +1235,7 @@ class WorklinkRunner:
                 template_path=template_path,
                 backend_name=selected_name,
                 test_command=(test_cmd or "PR CI (no local gate)") if gate_mode == "ci" else test_cmd,
+                gate_mode=gate_mode,
             )
             order = WorkOrder(
                 issue_id=issue.issue_id,
@@ -1465,6 +1480,7 @@ class WorklinkRunner:
                 template_path=template_path,
                 backend_name=selected_name,
                 test_command=(test_cmd or "PR CI (no local gate)") if gate_mode == "ci" else test_cmd,
+                gate_mode=gate_mode,
                 prior_attempts=_prior_attempts(self.home, issue, record.attempt),
             )
             order = WorkOrder(
@@ -1497,7 +1513,7 @@ class WorklinkRunner:
             )
             if report_env:
                 spec = with_worker_environment(spec, report_env)
-            spec = replace(spec, env=filter_otlp_env(spec.env))
+            spec = replace(spec, env=filter_otlp_env(spec.env), builder_lease_credit=True)
             invocation_model = spec.backend_config.get("model")
             _log_event(
                 "worklink_backend_invocation",
@@ -1987,6 +2003,59 @@ class WorklinkRunner:
                 evidence_path=evidence_path, checkout=lease.path, branch=lease.branch,
             )
         raw = await backend.interpret(order, compute_result)
+        if compute_result.lease_wait_s:
+            _log_event(
+                "worklink_builder_lease_wait", issue_id=issue.issue_id, attempt=attempt,
+                lease_wait_s=compute_result.lease_wait_s,
+                extension_s=compute_result.lease_extension_s,
+                elapsed_s=compute_result.run_duration_s,
+            )
+        if (compute_result.timed_out and compute_result.run_duration_s > 0
+                and compute_result.lease_wait_s >= compute_result.run_duration_s * 0.5):
+            from .claims import LEASE_WAIT_PREFIX
+            from .dispatch_failures import record_lease_wait_backoff, dispatch_failure_state_dir
+            hold = ShutdownAbortRecord(
+                issue_id=issue.issue_id, attempt=attempt, agent_id=claim_record.agent_id,
+                claimed_at=claim_record.claimed_at, aborted_at=datetime.now(UTC),
+            )
+            marker = LEASE_WAIT_PREFIX + hold.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
+            history = claims._issue_comments(issue.issue_id, strict=True)
+            # History accounting owns the finite allowance. Persist credit before
+            # releasing; saturated releases take the ordinary incident path.
+            if claims.attempts_used([*history, marker]) < claims.attempts_used(history):
+                evidence = WorklinkEvidence(
+                    issue=issue.issue_id, attempt=attempt, backend=selected_name,
+                    branch=lease.branch, checkout=str(lease.path),
+                    started_at=started.astimezone(UTC).isoformat(),
+                    finished_at=datetime.now(UTC).isoformat(), files_changed=[],
+                    diff_stat="", commands=[], tests=None, pr_url=None,
+                    status="lease_wait", diff_observed=False,
+                    failure_reason="builder deadline dominated by heavy lease queueing",
+                    builder_lease_wait_s=compute_result.lease_wait_s,
+                    builder_lease_extension_s=compute_result.lease_extension_s,
+                    builder_elapsed_s=compute_result.run_duration_s,
+                )
+                evidence_path = _write_evidence(self.home, evidence, review_ready=False)
+                record_lease_wait_backoff(dispatch_failure_state_dir(self.home), issue.issue_id, attempt)
+                claims._run("issue", "comment", str(issue.issue_id), marker
+                            + f"\nWORKLINK_EVIDENCE issue={issue.issue_id} attempt={attempt}"
+                            + f" status=lease_wait evidence={evidence_path}")
+                claims.transition_issue(issue.issue_id, status="lease_wait", review_ready=False)
+                terminal_release.label_transition_applied = True
+                terminal_release.retain_for_recovery = False
+                if not terminal_release():
+                    return WorklinkRunResult(
+                        issue.issue_id, attempt, "failed",
+                        reason="lease wait claim release unconfirmed",
+                        evidence_path=evidence_path, checkout=lease.path, branch=lease.branch,
+                    )
+                _log_event("worklink_lease_wait_timeout", issue_id=issue.issue_id, attempt=attempt,
+                           lease_wait_s=compute_result.lease_wait_s,
+                           extension_s=compute_result.lease_extension_s,
+                           elapsed_s=compute_result.run_duration_s, attempt_consumed=False)
+                return WorklinkRunResult(issue.issue_id, attempt, "lease_wait",
+                                         evidence_path=evidence_path, checkout=lease.path,
+                                         branch=lease.branch)
         if compute_result.timed_out:
             # The deadline owns the outcome, even if the worker exited zero or
             # printed another status before its terminal result was collected.
@@ -2080,7 +2149,10 @@ class WorklinkRunner:
                 on_gate_launch=persist_gate_handle,
             )
             observed = replace(observed, evidence=replace(
-                observed.evidence, opencode_session_id=raw.opencode_session_id))
+                observed.evidence, opencode_session_id=raw.opencode_session_id,
+                builder_lease_wait_s=compute_result.lease_wait_s,
+                builder_lease_extension_s=compute_result.lease_extension_s,
+                builder_elapsed_s=compute_result.run_duration_s))
             if snapshot is None:
                 return observed
             after = _gate_checkout_snapshot(
@@ -2288,7 +2360,7 @@ class WorklinkRunner:
                         repair_order, attempt=attempt, repo_url=spec.repo_url,
                         base_ref=spec.base_ref, branch=lease.branch, test_command=test_cmd or "",
                     )
-                    repair_spec = replace(repair_spec, factory_credential_settings=spec.factory_credential_settings, backend_config={
+                    repair_spec = replace(repair_spec, builder_lease_credit=True, factory_credential_settings=spec.factory_credential_settings, backend_config={
                         **repair_spec.backend_config, "test_env": spec.backend_config.get("test_env", {}),
                     })
                     handle = None
@@ -6983,7 +7055,7 @@ def _leaf_publication(home: Path, issue_id: int, attempt: int) -> Iterator[_Publ
                 continue
             payload = json.loads(evidence_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict) or payload.get("status") not in {
-                "completed", "failed", "blocked", "stopped",
+                "completed", "failed", "blocked", "stopped", "lease_wait",
             }:
                 raise WorklinkError(f"publication evidence unavailable: {evidence_path}")
             if payload.get("pr_url") is not None and not (
