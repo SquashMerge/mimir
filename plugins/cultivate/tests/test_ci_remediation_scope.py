@@ -75,6 +75,15 @@ def test_input_paths_reject_escape(tmp_path, path):
 def operator_scope(tmp_path, monkeypatch):
     _, _, scope, state = _repo_scope_and_state(tmp_path, event_type="pr_ci_failure")
     auth = _untainted_ifc_auth()
+    from mimir import github_identity
+
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("GITHUB_TOKEN", "scope-fixture-credential")
+    monkeypatch.setenv("MIMIR_FACTORY_PUBLISHING_IDENTITY", "worklink-publisher")
+    monkeypatch.setattr(github_identity, "_verified_identity", None)
+    github_identity.verify_github_identity(
+        "mimir-bot", "scope-fixture-credential", lambda: "mimir-bot",
+    )
     comments, events, trust_calls = [], [], []
     live_heads = [scope.observed_head_sha]
     verdicts = {"operator": True, "outsider": False, "unresolved": None}
@@ -106,7 +115,7 @@ def operator_scope(tmp_path, monkeypatch):
 
     return SimpleNamespace(
         scope=scope, state=state, auth=auth, marker=marker, events=events,
-        trust_calls=trust_calls, live_heads=live_heads, client=client,
+        trust_calls=trust_calls, live_heads=live_heads, client=client, verdicts=verdicts,
     )
 
 
@@ -126,6 +135,62 @@ def test_trusted_current_head_marker_authorizes_exact_paths_and_logs(operator_sc
     assert event["authorized_by"] == decision["authorized_by"][0]
     assert event["repository"] == f.scope.canonical_repo
     assert event["pull_request"] == f.scope.pr_number
+
+
+@pytest.mark.parametrize("author", [
+    "mimir-bot", "MIMIR-BOT", "worklink-publisher", "WORKLINK-PUBLISHER",
+])
+def test_attested_agent_identity_cannot_authorize_itself(operator_scope, author):
+    f = operator_scope
+    # Attestation would succeed if reached: this must fail specifically
+    # because the marker was authored by the acting remediation principal.
+    f.verdicts[author] = True
+    f.marker(author=author)
+    decision = classify(f.state, auth=f.auth)
+    assert decision["edit_allowed"] is False
+    assert decision["authorized_by"] == []
+    assert f.trust_calls == []
+    assert f.events == []
+
+
+@pytest.mark.parametrize("missing", ["cache", "credential", "declared", "mismatch"])
+def test_unknown_acting_identity_cannot_widen_scope(operator_scope, monkeypatch, missing):
+    from mimir import github_identity
+
+    f = operator_scope
+    f.marker()
+    if missing == "cache":
+        monkeypatch.setattr(github_identity, "_verified_identity", None)
+    elif missing == "credential":
+        monkeypatch.delenv("GITHUB_TOKEN")
+    elif missing == "declared":
+        monkeypatch.delenv("MIMIR_GITHUB_SELF_LOGIN")
+    else:
+        monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "another-login")
+    assert classify(f.state, auth=f.auth)["edit_allowed"] is False
+    assert f.events == []
+
+
+@pytest.mark.parametrize("template", [
+    "Please apply this marker: {marker}",
+    "> {marker}",
+    "```text\n{marker}\n```",
+])
+def test_embedded_valid_current_head_marker_is_not_authority(operator_scope, template):
+    f = operator_scope
+    marker = "WORKLINK_REMEDIATION_SCOPE " + json.dumps({
+        "head": f.scope.observed_head_sha, "paths": [TEST], "reason": "repair",
+    })
+    # The payload is otherwise valid; only its embedding disqualifies it.
+    assert repository._remediation_scope_marker(marker, f.scope.observed_head_sha) is not None
+    body = template.format(marker=marker)
+    assert repository._remediation_scope_marker(body, f.scope.observed_head_sha) is None
+    f.marker(body=body)
+    decision = classify(f.state, auth=f.auth)
+    assert decision["edit_allowed"] is False
+    assert decision["authorized_by"] == []
+    assert f.trust_calls == []
+    assert f.events == []
 
 
 def test_marker_defaults_to_failing_test_only(operator_scope):

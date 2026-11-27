@@ -4330,11 +4330,18 @@ class RepoGitTools:
         """Read authority only from forge comments and existing author attestation."""
         from .forge import _author_verdict, _client, _live_pr_head
         from mimir.event_logger import log_event_sync
+        from mimir.github_identity import confirm_github_identity, own_conflict_pr_author
 
         if self._auth_context is None:
             return {}
         scope = self._scope
         try:
+            # Collaborator attestation does not make the agent an operator.
+            # Confirm the actual credential identity; missing or mismatched
+            # process identity must not silently disable the self-exclusion.
+            acting_login = confirm_github_identity(
+                os.environ.get("MIMIR_GITHUB_SELF_LOGIN", ""),
+            )
             client = _client(scope)
             if _live_pr_head(client, scope) != scope.observed_head_sha:
                 return {}
@@ -4342,6 +4349,8 @@ class RepoGitTools:
             for comment in client.list_comments(scope):
                 marker = _remediation_scope_marker(comment.body, scope.observed_head_sha)
                 if marker is None:
+                    continue
+                if own_conflict_pr_author(comment.author, acting_login):
                     continue
                 # Do not accept vouched-for text or a payload's trust claim.
                 if _author_verdict(self._auth_context, scope, comment.author, client) is not True:
