@@ -861,7 +861,7 @@ def test_session_environment_refuses_untrusted_overrides(tmp_path, name, value):
 
 
 def test_session_environment_is_closed(tmp_path, monkeypatch):
-    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/var/cache/mimir-playwright")
     monkeypatch.setenv("OPENAI_API_KEY", "fragment-" + "not-in-session")
     monkeypatch.setenv("GIT_CONFIG_COUNT", "99")
     env = session_environment({"CFLAGS": "-O2"}, home=tmp_path, git_settings=(), credentials={})

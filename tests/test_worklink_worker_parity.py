@@ -1051,7 +1051,7 @@ async def test_closed_worker_direct_parity_inventory(
 
 
 def test_enabled_environment_is_exact_and_closed(monkeypatch) -> None:
-    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/var/cache/mimir-playwright")
     identifier = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     work = spec(
         env={"OPENCODE_PERMISSION": '{"edit":"allow"}', "ANTHROPIC_API_KEY": "selected"},

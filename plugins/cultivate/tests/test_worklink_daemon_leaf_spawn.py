@@ -70,7 +70,7 @@ async def leaf(tmp_path, daemon, client, *, text="done", error=None):
 
 
 async def test_leaf_production_create_prompt_model_and_permissions(tmp_path, monkeypatch):
-    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/var/cache/mimir-playwright")
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         spec, result, raw = await leaf(tmp_path, daemon, client)
         create = next(body for method, route, _, body in daemon.requests if method == "POST" and route == "/api/session")

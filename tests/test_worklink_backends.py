@@ -1235,6 +1235,7 @@ def test_opencode_test_env_reaches_pytest_through_bash(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool, opencode_binary: Path
 ) -> None:
     monkeypatch.setattr(opencode_module, "_coding_enabled", lambda: enabled)
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/worker/browser-override")
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
         'backends:\n  opencode:\n    test_env:\n      PYTEST_ADDOPTS: "-n 2"\n',

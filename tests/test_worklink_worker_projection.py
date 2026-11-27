@@ -17,7 +17,7 @@ from tests.opencode_fixtures import opencode_binary
 @pytest.fixture(autouse=True)
 def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
-    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/var/cache/mimir-playwright")
 
 
 def _write_native_files(home: Path) -> None:

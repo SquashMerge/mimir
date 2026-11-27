@@ -917,7 +917,8 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
         if kind == "rust" and sccache:
             passthrough += ",RUSTC_WRAPPER,SCCACHE_DIR,SCCACHE_CACHE_SIZE"
         passthrough = ",".join(filter(None, (passthrough, PLAYWRIGHT_ENV)))
-        environment.setdefault(PLAYWRIGHT_ENV, PLAYWRIGHT_CACHE_DIR)
+        # Do not turn the implicit default into an operator override: runtime
+        # checks the volume's worker ownership and privacy before exporting it.
         environment.update({"MIMIR_ACP_ENABLED": "1", "MIMIR_PR_CHECKOUT_LEASE_ROOT": "/workspace/pr-leases",
                             "MIMIR_SHELL_PASS_ENV": passthrough, "MIMIR_ENABLE_CLAUDE_CODE": "0",
                             "MIMIR_HOME": "/home/mimir/agent", "MIMIR_PLUGINS": "cultivate",

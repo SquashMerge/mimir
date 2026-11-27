@@ -79,11 +79,7 @@ def test_legacy_setup_renderer_bytes_and_modes(setup_environment, monkeypatch, p
     # Authorize only the browser-cache addition to the legacy Compose oracle.
     compose = yaml.safe_load(expected["compose.yml"]["text"])
     agent_env = compose["services"]["agent"]["environment"]
-    keys = list(agent_env)
-    keys.insert(keys.index("MIMIR_ACP_ENABLED"), "PLAYWRIGHT_BROWSERS_PATH")
-    agent_env["PLAYWRIGHT_BROWSERS_PATH"] = "/var/cache/mimir-playwright"
     agent_env["MIMIR_SHELL_PASS_ENV"] = "PLAYWRIGHT_BROWSERS_PATH"
-    compose["services"]["agent"]["environment"] = {key: agent_env[key] for key in keys}
     for service in ("agent", "init"):
         mounts = compose["services"][service]["volumes"]
         mounts.insert(mounts.index("worklink-daemon:/var/lib/mimir-worklink/daemon") + 1,
@@ -3409,7 +3405,13 @@ def test_sccache_compose_persists_private_worker_cache_and_opt_out():
     template = render_compose_yml(service_name='agent', web_port=8123, mode='pypi')
     uncached = installer.render_compose(template, 'image:sha', 'rust', 'repo', sccache=False)
     # Includes the all-toolchain Playwright volume, even with sccache disabled.
-    assert hashlib.sha256(uncached.encode()).hexdigest() == (
+    # Authorize only removal of the formerly unconditional default. Keep all
+    # other bytes pinned by reconstructing the previous rendering for hashing.
+    anchor = '      MIMIR_ACP_ENABLED:'
+    assert uncached.count(anchor) == 1
+    previous = uncached.replace(anchor,
+        '      PLAYWRIGHT_BROWSERS_PATH: /var/cache/mimir-playwright\n' + anchor)
+    assert hashlib.sha256(previous.encode()).hexdigest() == (
         '97a8a160da4d2ce15adbe93d693b8a304ffe7d24835ce18c0cd03d4141fa7c21')
     cached = yaml.safe_load(installer.render_compose(template, 'image:sha', 'rust', 'repo'))
     plain = yaml.safe_load(uncached)

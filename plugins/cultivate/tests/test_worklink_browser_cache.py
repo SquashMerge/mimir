@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
+from types import SimpleNamespace
 import subprocess
 import sys
 
@@ -11,6 +13,7 @@ import yaml
 
 from mimir.scaffold_docker import render_compose_yml
 from mimir_cultivate import setup
+from mimir_cultivate.worklink import browser_environment as browser_module
 from mimir_cultivate.worklink import evidence
 from mimir_cultivate.worklink.backends import opencode
 from mimir_cultivate.worklink.backends.base import ComputeResult, LaunchHandle, WorkOrder, WorkSpec
@@ -20,9 +23,41 @@ from mimir_cultivate.worklink.daemon_sessions import session_environment
 
 
 @pytest.fixture(autouse=True)
-def owned_environment(monkeypatch):
+def clean_environment(monkeypatch):
     monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
     monkeypatch.delenv("MIMIR_HEAVY_LOCK_FILE", raising=False)
+
+
+@pytest.fixture
+def owned_environment(monkeypatch, tmp_path):
+    cache = tmp_path / "provisioned-browser-cache"
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o700)
+    monkeypatch.setattr(browser_module, "PLAYWRIGHT_CACHE_DIR", str(cache))
+    monkeypatch.setattr(browser_module, "get_identities",
+                        lambda: SimpleNamespace(worklink_uid=os.getuid()))
+    return cache
+
+
+def configure_cache(cache, state, monkeypatch):
+    if state == "missing":
+        cache.rmdir()
+    elif state == "wrong-owner":
+        monkeypatch.setattr(browser_module, "get_identities",
+                            lambda: SimpleNamespace(worklink_uid=os.getuid() + 1))
+    elif state.startswith("mode-"):
+        cache.chmod(int(state.removeprefix("mode-"), 8))
+    elif state == "symlink":
+        target = cache.with_name("symlink-target")
+        cache.rename(target)
+        cache.symlink_to(target, target_is_directory=True)
+    elif state == "file":
+        cache.rmdir()
+        cache.write_text("not a directory")
+    elif state == "identity-unavailable":
+        def unavailable():
+            raise RuntimeError("required account 'worklink' is missing")
+        monkeypatch.setattr(browser_module, "get_identities", unavailable)
 
 
 def leaf_spec(tmp_path, monkeypatch, test_env=None):
@@ -35,21 +70,30 @@ def leaf_spec(tmp_path, monkeypatch, test_env=None):
     )
 
 
+@pytest.mark.parametrize("state", [
+    "private", "missing", "wrong-owner", "mode-755", "mode-710", "mode-701",
+    "mode-600", "symlink", "file", "identity-unavailable",
+])
 @pytest.mark.parametrize("override", [None, "/worker/browser-override"])
-async def test_browser_cache_builder_and_gate_env_match(tmp_path, monkeypatch, override):
+async def test_browser_cache_builder_and_gate_env_match(
+    tmp_path, monkeypatch, owned_environment, state, override,
+):
+    configure_cache(owned_environment, state, monkeypatch)
     if override:
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", override)
     spec = leaf_spec(tmp_path, monkeypatch, {"RUSTUP_HOME": "/opt/rustup"})
-    expected = override or "/var/cache/mimir-playwright"
-    assert spec.env["PLAYWRIGHT_BROWSERS_PATH"] == expected
-    assert spec.backend_config["test_env"]["PLAYWRIGHT_BROWSERS_PATH"] == expected
-    assert "PLAYWRIGHT_BROWSERS_PATH" in spec.backend_config["pass_env"]
+    expected = override or (str(owned_environment) if state == "private" else None)
+    assert spec.env.get("PLAYWRIGHT_BROWSERS_PATH") == expected
+    assert spec.backend_config["test_env"].get("PLAYWRIGHT_BROWSERS_PATH") == expected
+    assert ("PLAYWRIGHT_BROWSERS_PATH" in spec.backend_config["pass_env"]) == (expected is not None)
+    if expected is None:
+        assert "PLAYWRIGHT_BROWSERS_PATH" not in spec.env
     # The privileged session helper has a closed ambient env. The override must
     # reach the daemon via pass_env, not depend on helper env inheritance.
     monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
     home = tmp_path / "builder-home"
     builder = session_environment(dict(spec.env), home=home, git_settings=(), credentials={})
-    assert builder["PLAYWRIGHT_BROWSERS_PATH"] == expected
+    assert builder.get("PLAYWRIGHT_BROWSERS_PATH") == expected
     assert builder["HOME"] == str(home)
     assert builder["TMPDIR"] == str(home / "tmp")
     seen = []
@@ -71,30 +115,49 @@ async def test_browser_cache_builder_and_gate_env_match(tmp_path, monkeypatch, o
         "tools/verify", checkout=tmp_path, work_spec=spec, compute=Compute(),
     )
     gate = seen.pop()
-    assert gate["PLAYWRIGHT_BROWSERS_PATH"] == builder["PLAYWRIGHT_BROWSERS_PATH"]
+    assert gate.get("PLAYWRIGHT_BROWSERS_PATH") == builder.get("PLAYWRIGHT_BROWSERS_PATH")
+    if expected is None:
+        assert "PLAYWRIGHT_BROWSERS_PATH" not in builder
+        assert "PLAYWRIGHT_BROWSERS_PATH" not in gate
     assert gate["RUSTUP_HOME"] == builder["RUSTUP_HOME"]
     assert gate["HOME"] != builder["HOME"]
     await evidence._run_compute_gate_command(
         "tools/verify", checkout=tmp_path,
         work_spec=replace(spec, env={}, backend_config={"pass_env": ()}), compute=Compute(),
     )
-    assert seen.pop()["PLAYWRIGHT_BROWSERS_PATH"] == "/var/cache/mimir-playwright"
+    minimal_gate = seen.pop()
+    if state == "private":
+        assert minimal_gate["PLAYWRIGHT_BROWSERS_PATH"] == str(owned_environment)
+    else:
+        assert "PLAYWRIGHT_BROWSERS_PATH" not in minimal_gate
 
 
+@pytest.mark.parametrize("state", [
+    "private", "missing", "wrong-owner", "mode-755", "mode-710", "mode-701",
+    "mode-600", "symlink", "file", "identity-unavailable",
+])
 @pytest.mark.parametrize("override", [None, "/worker/explicit-cache"])
-def test_session_environment_and_shell_gate_browser_defaults(tmp_path, monkeypatch, override):
+def test_session_environment_and_shell_gate_browser_defaults(
+    tmp_path, monkeypatch, owned_environment, state, override,
+):
+    configure_cache(owned_environment, state, monkeypatch)
     if override:
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", override)
-    expected = override or "/var/cache/mimir-playwright"
+    expected = override or (str(owned_environment) if state == "private" else None)
     builder = session_environment({}, home=tmp_path, git_settings=(), credentials={})
-    assert builder["PLAYWRIGHT_BROWSERS_PATH"] == expected
+    assert builder.get("PLAYWRIGHT_BROWSERS_PATH") == expected
     with evidence.shell_gate_environment() as env:
-        assert env["PLAYWRIGHT_BROWSERS_PATH"] == expected
+        assert env.get("PLAYWRIGHT_BROWSERS_PATH") == expected
+        if expected is None:
+            assert "PLAYWRIGHT_BROWSERS_PATH" not in builder
+            assert "PLAYWRIGHT_BROWSERS_PATH" not in env
         assert Path(env["HOME"]) != tmp_path
         assert env["XDG_CACHE_HOME"] == str(Path(env["HOME"]) / ".cache")
 
 
-def test_browser_cache_explicit_test_env_override(tmp_path, monkeypatch):
+@pytest.mark.parametrize("state", ["private", "missing", "wrong-owner", "mode-755", "symlink"])
+def test_browser_cache_explicit_test_env_override(tmp_path, monkeypatch, owned_environment, state):
+    configure_cache(owned_environment, state, monkeypatch)
     monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/worker/ambient")
     spec = leaf_spec(tmp_path, monkeypatch, {"PLAYWRIGHT_BROWSERS_PATH": "/worker/configured"})
     builder = session_environment(dict(spec.env), home=tmp_path, git_settings=(), credentials={})
@@ -135,7 +198,9 @@ def test_browser_cache_setup_volume_is_worker_private(kind, host):
         assert "playwright:/var/cache/mimir-playwright" in doc["services"][service]["volumes"]
     agent = doc["services"]["agent"]
     assert agent["depends_on"]["init"]["condition"] == "service_completed_successfully"
-    assert agent["environment"]["PLAYWRIGHT_BROWSERS_PATH"] == "/var/cache/mimir-playwright"
+    # Only runtime can verify the mounted volume. Setup must not turn the
+    # implicit default into an explicit override which bypasses that check.
+    assert "PLAYWRIGHT_BROWSERS_PATH" not in agent["environment"]
     assert "PLAYWRIGHT_BROWSERS_PATH" in agent["environment"]["MIMIR_SHELL_PASS_ENV"].split(",")
     init = doc["services"]["init"]
     assert init["user"] == "root"
