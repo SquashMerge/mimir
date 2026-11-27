@@ -16,6 +16,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts/ci_verify.sh"
+HANG_GUARD_SECONDS = 30
 SHA = "1234567890abcdef1234567890abcdef12345678"
 # Independent fixture, not imported from the implementation under test.
 REQUIRED = [
@@ -130,11 +131,20 @@ elif tool == "gh":
             start_new_session=True,
         )
         try:
-            stdout, stderr = proc.communicate(timeout=4)
+            # Hang guard, not a latency assertion: loaded macOS runners may
+            # need time to launch the many CLI stubs. Deadline tests assert
+            # the script's own reported reason and exit status instead.
+            stdout, stderr = proc.communicate(timeout=HANG_GUARD_SECONDS)
         except subprocess.TimeoutExpired:
             # A removed-deadline mutation must fail without leaving an orphaned
             # poller (killing only the shell would leave its Python child alive).
-            os.killpg(proc.pid, signal.SIGKILL)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                # The group may already be gone/reaping on macOS. Check the
+                # direct child and kill it if needed; preserve the guard error.
+                if proc.poll() is None:
+                    proc.kill()
             proc.communicate()
             raise
         return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
@@ -151,6 +161,64 @@ elif tool == "gh":
 @pytest.fixture
 def ci(tmp_path: Path) -> FakeCI:
     return FakeCI(tmp_path)
+
+
+@pytest.mark.parametrize("group_error", [ProcessLookupError, PermissionError])
+@pytest.mark.parametrize("already_exited", [True, False])
+def test_hang_guard_preserves_timeout_when_group_kill_races(
+    ci: FakeCI, monkeypatch: pytest.MonkeyPatch,
+    group_error: type[OSError], already_exited: bool,
+) -> None:
+    script = ci.path / "child.sh"
+    # exec keeps the live fallback case to a single fixture-owned process.
+    script.write_text(
+        "exit 0\n" if already_exited
+        else "exec python3 -c 'import time; time.sleep(300)'\n"
+    )
+    proc = subprocess.Popen(
+        ["sh", str(script)], env=ci.env, cwd=ROOT,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    communicate = proc.communicate
+    kill = proc.kill
+    guard_timeout = subprocess.TimeoutExpired(proc.args, HANG_GUARD_SECONDS)
+    calls = []
+
+    def communicate_with_guard(timeout=None):
+        calls.append(("communicate", timeout))
+        if len(calls) == 1:
+            assert timeout == HANG_GUARD_SECONDS
+            if already_exited:
+                proc.wait(timeout=HANG_GUARD_SECONDS)
+                assert proc.returncode == 0
+            raise guard_timeout
+        return communicate(timeout=timeout)
+
+    def group_gone(pid, sig):
+        assert (pid, sig) == (proc.pid, signal.SIGKILL)
+        calls.append(("killpg", sig))
+        raise group_error("process group already gone")
+
+    def kill_child():
+        calls.append(("kill", None))
+        kill()
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(proc, "communicate", communicate_with_guard)
+    monkeypatch.setattr(proc, "kill", kill_child)
+    monkeypatch.setattr(os, "killpg", group_gone)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired) as exc:
+            ci.run(script=script)
+        assert exc.value is guard_timeout
+        assert proc.returncode is not None
+        assert (("kill", None) in calls) == (not already_exited)
+        assert calls[-1] == ("communicate", None)
+    finally:
+        # Also reap the fixture if a cleanup regression makes the assertion fail.
+        kill()
+        communicate(timeout=HANG_GUARD_SECONDS)
 
 
 def test_all_required_green_and_exact_sha_push_and_poll(ci: FakeCI) -> None:
