@@ -68,6 +68,8 @@ with tempfile.TemporaryDirectory(prefix='sccache') as directory:
         'SCCACHE_TMPDIR = "/var/tmp/mimir-sccache"', f"SCCACHE_TMPDIR = {str(short_socket_dir)!r}"))
     compiler = executable(tmp_path / "rustc", """
 import json, os, pathlib, sys
+with (pathlib.Path(os.environ['SCCACHE_DIR']) / 'compiler-calls').open('a') as calls:
+    calls.write('compile\\n')
 if '--fail' in sys.argv:
     print('fixture compiler rejected the source', file=sys.stderr)
     sys.exit(17)
@@ -181,6 +183,17 @@ sys.exit(2)
     assert warning["level"] == "warning"
     assert expected in warning["cause"]
     assert (cache.stat().st_uid, cache.stat().st_mode) == (before.st_uid, before.st_mode)
+
+
+def test_sccache_healthy_cache_preserves_compiler_failure_once(launcher):
+    _, _, compiler, env, cache, _ = launcher
+    result = subprocess.run([env["RUSTC_WRAPPER"], str(compiler), "--fail"],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 17
+    assert (cache / "launch.json").is_file(), "the working cache must run the compiler"
+    assert (cache / "compiler-calls").read_text().splitlines() == ["compile"]
+    assert result.stderr.count("fixture compiler rejected the source") == 1
+    assert "worklink_sccache_fallback" not in result.stderr
 
 
 def test_sccache_fallback_preserves_compiler_failure(launcher, tmp_path):

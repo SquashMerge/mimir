@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import stat
 import subprocess
 import sys
@@ -16,7 +15,7 @@ SCCACHE = "/usr/local/libexec/sccache"
 SCCACHE_TMPDIR = "/var/tmp/mimir-sccache"
 
 
-def run_cache(args: list[str]) -> tuple[int, str]:
+def run_cache(args: list[str]) -> tuple[int, str, bool]:
     # sccache 0.20.1 creates <TMPDIR>/sccacheXXXXXX/sock even when its
     # *server* listens on TCP or SCCACHE_SERVER_UDS. Never use the long worker
     # home here. Setup provisions this short, uid-private directory separately
@@ -29,13 +28,23 @@ def run_cache(args: list[str]) -> tuple[int, str]:
     with tempfile.TemporaryFile(dir=SCCACHE_TMPDIR) as errors:
         result = subprocess.run([SCCACHE, *args], env=env, stderr=errors, check=False)
         errors.seek(0)
-        shutil.copyfileobj(errors, sys.stderr.buffer)
+        # sccache returns the compiler's nonzero status too. Only its own
+        # diagnostic prefix identifies a cache failure; never retry an ordinary
+        # compiler error. Scan all stderr (not just the bounded warning tail),
+        # preserving output once and keeping memory bounded even for long lines.
+        marker = b"\nsccache: error:"
+        overlap = b"\n"
+        cache_failed = False
+        tail = b""
+        while chunk := errors.read(65536):
+            sys.stderr.buffer.write(chunk)
+            window = overlap + chunk
+            cache_failed |= marker in window
+            overlap = window[-(len(marker) - 1):]
+            tail = (tail + chunk)[-1024:]
         sys.stderr.flush()
-        # Preserve diagnostics without holding unbounded compiler output in
-        # memory or copying it all into the warning event.
-        errors.seek(max(0, errors.tell() - 1024))
-        cause = errors.read().decode("utf-8", errors="replace").strip()
-    return result.returncode, cause
+        cause = tail.decode("utf-8", errors="replace").strip()
+    return result.returncode, cause, cache_failed
 
 
 def main() -> int:
@@ -44,9 +53,9 @@ def main() -> int:
     # to execute an option as a compiler (and never pretend --version worked).
     compile_request = bool(args) and not args[0].startswith("-")
     try:
-        status, diagnostics = run_cache(args)
-        if status == 0:
-            return 0
+        status, diagnostics, cache_failed = run_cache(args)
+        if status == 0 or (compile_request and not cache_failed):
+            return status if status >= 0 else 128 - status
         cause = f"sccache exited with status {status}"
         if diagnostics:
             cause += f": {diagnostics}"
