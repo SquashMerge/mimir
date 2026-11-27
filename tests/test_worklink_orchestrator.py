@@ -3319,6 +3319,75 @@ def test_bounded_timeout_routes_failure_before_releasing_lock(tmp_path: Path) ->
     assert load_run_state(tmp_path, 441) is None
 
 
+@pytest.mark.parametrize("wait_s,prior_releases,elapsed_s,expected", [
+    (0, 0, 10, "failed"), (4.99, 0, 10, "failed"), (5, 0, 10, "lease_wait"),
+    (9, 2, 10, "failed"), (0, 0, 0, "failed"),
+])
+def test_builder_lease_timeout_classification_and_release_closure(
+    tmp_path, monkeypatch, wait_s, prior_releases, elapsed_s, expected,
+):
+    import mimir_cultivate.worklink.orchestrator as orch
+    from mimir_cultivate.worklink.claims import LEASE_WAIT_PREFIX, SHUTDOWN_ABORT_PREFIX, ShutdownAbortRecord
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state, pending_failure_alerts
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    calls, base_runner = _orchestrator_runner(tmp_path / "repo", checkout)
+    comments = []
+    for attempt in range(1, prior_releases + 1):
+        prior = ClaimRecord(441, attempt, "agent", datetime.now(UTC))
+        hold = ShutdownAbortRecord(441, attempt, "agent", prior.claimed_at, datetime.now(UTC))
+        comments += [prior.to_comment(), LEASE_WAIT_PREFIX + hold.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)]
+    attempt = prior_releases + 1
+    claim = ClaimRecord(441, attempt, "agent", datetime.now(UTC))
+    comments.append(claim.to_comment())
+
+    def runner(args, **kwargs):
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            comments.append(args[-1])
+        return base_runner(args, **kwargs)
+
+    events = []
+    monkeypatch.setattr(orch, "_log_event", lambda event, **fields: events.append((event, fields)))
+    claims = ChainlinkClaims(chainlink_bin="chainlink", agent_id="agent", runner=runner, home_path=tmp_path)
+    monkeypatch.setattr(claims, "_issue_comments", lambda *_, **__: list(comments))
+    terminal = orch._TerminalClaimRelease(claims, tmp_path, 441, attempt)
+    backend = FakeBackend()
+    order = WorkOrder(441, checkout, "build", None, 1, transcript_root=tmp_path / "transcripts")
+    spec = backend.work_spec(order, attempt=attempt, repo_url="", base_ref="main",
+                             branch="issue/441", test_command="echo ok")
+    lease = CheckoutLease(441, attempt, tmp_path / "repo", checkout, "issue/441", "main", isolated_checkout=True)
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path / "repo", runner=runner)._finalize(
+        issue=IssueContext(441, "Build", "Criteria", set()), claims=claims, claim_record=claim,
+        attempt=attempt, config=WorklinkConfig(), backend=backend, compute=FakeCompute(),
+        compute_result=ComputeResult(124, "", "", timed_out=True, lease_wait_s=wait_s,
+                                     lease_extension_s=min(wait_s, 3), run_duration_s=elapsed_s),
+        order=order, lease=lease, spec=spec, started=datetime.now(UTC), test_cmd="echo ok",
+        root_dirty_before=(), runner=runner, terminal_release=terminal, autonomous=True,
+    ))
+    assert result.status == expected
+    state = load_failure_state(dispatch_failure_state_dir(tmp_path))
+    ledger = (state["issues"]["441"] if expected == "failed" else state["lease_wait_backoffs"]["441"])
+    assert ledger["attempt_consumed"] is (expected == "failed")
+    assert ledger["active"] is (expected == "failed")
+    assert claims.attempts_used(comments) == (0 if expected == "lease_wait" else 1)
+    release = ["chainlink", "locks", "release", "441"]
+    route = ["chainlink", "issue", "unlabel", "441", "worklink:in-progress"]
+    assert calls.index(route) < calls.index(release)
+    assert load_run_state(tmp_path, 441) is None
+    assert result.evidence_path is not None
+    evidence = json.loads(result.evidence_path.read_text())
+    assert evidence["builder_lease_wait_s"] == wait_s
+    if expected == "lease_wait":
+        assert ledger["failure_kind"] == "lease_wait_timeout"
+        assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path))[1] == []
+        assert any(event == "worklink_lease_wait_timeout" for event, _ in events)
+        assert not result.incident_recorded
+    else:
+        assert ledger["failure_kind"] == "operator_required"
+        assert any(event == "worklink_run_failed" for event, _ in events)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux factory executor uses SOCK_SEQPACKET")
 @pytest.mark.parametrize("worker_state,deadline,exit_code", [
     pytest.param("exited", True, 0, id="exited-timeout"),

@@ -363,6 +363,7 @@ def _acquire(base: str, tier: str, stale: float, interval: float, hb: Heartbeat)
     ticket, tfd = queue.enqueue()
     hb.held[ticket] = tfd
     _hold(tfd, tier, "ticket")
+    _report("queued")
     next_beat = time.monotonic() + interval
 
     def take(lease: Lease, role: str) -> bool:
@@ -452,7 +453,53 @@ def _probe_stale(lease: Lease) -> None:
         os.close(fd)
 
 
+def _report(event: str) -> None:
+    # Opt-in private controller pipe; never interpreted from worker stdout.
+    if os.environ.get("MIMIR_HEAVY_REPORT_FD"):
+        os.write(int(os.environ["MIMIR_HEAVY_REPORT_FD"]), (event + "\n").encode())
+
+
+def _relay_run(command: list[str]) -> int:
+    """Worklink owns acquisition; the worker owns only command execution."""
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.connect(os.environ["WORKLINK_LEASE_SOCKET"])
+        connection.sendall((json.dumps({
+            "auth": os.environ["WORKLINK_LEASE_AUTH"],
+            "tier": os.environ.get("MIMIR_HEAVY_TIER", "large") or "large",
+        }) + "\n").encode())
+        with connection.makefile("rb") as source:
+            if source.readline(64) != b"acquired\n":
+                raise ValueError("controller refused heavy lease")
+        child = None
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, _interrupt)
+        try:
+            child = subprocess.Popen(command, start_new_session=True,
+                                     env={**os.environ, "MIMIR_HEAVY_LOCK_HELD": "1"})
+            while True:
+                _check_signal()
+                try:
+                    status = child.wait(timeout=0.1)
+                    return status if status >= 0 else 128 - status
+                except subprocess.TimeoutExpired:
+                    pass
+        except Interrupted as exc:
+            return 128 + exc.signum
+        finally:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, signal.SIG_IGN)
+            if child is not None:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+            # Closing the connection releases only after the command is reaped.
+
+
 def run(command: list[str]) -> int:
+    if os.environ.get("WORKLINK_LEASE_SOCKET"):
+        return _relay_run(command)
     base = os.environ["MIMIR_HEAVY_LOCK_FILE"]
     tier = os.environ.get("MIMIR_HEAVY_TIER", "large") or "large"
     if tier not in TIERS:
@@ -473,6 +520,7 @@ def run(command: list[str]) -> int:
         signal.signal(sig, _interrupt)
     try:
         _acquire(base, tier, stale, interval, hb)
+        _report("acquired")
         _check_signal()
         child = subprocess.Popen(command, start_new_session=True,
                                  env={**os.environ, "MIMIR_HEAVY_LOCK_HELD": "1"})

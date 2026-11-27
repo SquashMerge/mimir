@@ -111,6 +111,7 @@ class WorkSpec:
     factory_credential_settings: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     session_request: SessionRequest | None = None
     execution: ExecutionPolicy = field(default_factory=ExecutionPolicy)
+    builder_lease_credit: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,7 @@ class ComputeResult:
     lease_wait_timed_out: bool = False
     lease_wait_s: float = 0.0
     run_duration_s: float = 0.0
+    lease_extension_s: float = 0.0
 
 
 class ComputeLaunchError(RuntimeError):

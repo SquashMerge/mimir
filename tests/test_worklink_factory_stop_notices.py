@@ -65,6 +65,7 @@ LEAF_ENDING_NOTICES = {
     "failed": "incident",  # leaf_result and reattach incidents already prompt.
     "stopped": None,  # Explicit operator stop.
     "quota_hold": None,  # Scheduled quota retry, no decision needed.
+    "lease_wait": None,  # Bounded scheduled lease retry; no operator decision.
     "attempts_exhausted": "leaf_attempts_exhausted",
     "template_invalid": "leaf_template_invalid",
     "claim_reaped": "leaf_claim_reaped",
@@ -95,7 +96,7 @@ def test_leaf_ending_inventory_is_closed():
         if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
     }
     assert evidence_statuses == {"completed", "blocked", "failed"}
-    assert final_statuses == {"review_ready", "blocked", "failed", "stopped", "quota_hold"}
+    assert final_statuses == {"review_ready", "blocked", "failed", "stopped", "quota_hold", "lease_wait"}
     assert set(LEAF_ENDING_NOTICES) == final_statuses | {
         "completed", "attempts_exhausted", "template_invalid", "claim_reaped",
     }
