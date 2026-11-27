@@ -162,8 +162,14 @@ def test_credit_cap_is_minimum_of_configured_timeout_and_four_hours(lease_enviro
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("forgery", ["wrong_auth", "reported_wait", "reported_acquired", "bad_tier"])
-async def test_forged_builder_wait_reports_grant_no_extension(lease_environment, forgery):
+@pytest.mark.parametrize("forgery", [
+    "wrong_auth", "reported_wait", "reported_acquired", "bad_tier", "garbage_tier",
+])
+async def test_forged_builder_wait_reports_grant_no_extension(lease_environment, forgery, monkeypatch):
+    # An invalid tier can also be refused by the installed helper itself. Zero
+    # credit alone therefore cannot prove that the relay validated the request.
+    spawn = AsyncMock(wraps=asyncio.create_subprocess_exec)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     relay = LeaseRelay(lease_environment)
     await relay.start()
     try:
@@ -172,6 +178,8 @@ async def test_forged_builder_wait_reports_grant_no_extension(lease_environment,
             request["auth"] = "another-run"
         elif forgery == "bad_tier":
             request["tier"] = "unknown"
+        elif forgery == "garbage_tier":
+            request["tier"] = "large; echo forged"
         else:
             request[forgery] = 14400
         reader, writer = await asyncio.open_unix_connection(relay.path)
@@ -181,6 +189,7 @@ async def test_forged_builder_wait_reports_grant_no_extension(lease_environment,
         # until some later timeout.
         assert await asyncio.wait_for(reader.readline(), 2) == b""
         assert relay.wait_s == 0 and relay.credit_s == 0
+        spawn.assert_not_called()
         writer.close()
         await writer.wait_closed()
     finally:

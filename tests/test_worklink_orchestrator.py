@@ -415,10 +415,21 @@ class FakeBackend:
         )
 
 
-def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path: Path) -> None:
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_orchestrator_passes_configured_compute_backend_to_tool_backend(
+    tmp_path: Path, diagnostic: bool,
+) -> None:
+    from mimir_cultivate.worklink.evidence import _run_compute_gate_command
+
+    class ComputeWithGate(FakeCompute):
+        async def _launch_contained(self, spec: WorkSpec, argv: tuple[str, ...]) -> LaunchHandle:
+            self.gate_spec = spec
+            assert argv == tuple(spec.local_argv)
+            return LaunchHandle(self.name, "gate")
+
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
-    compute = FakeCompute(shared_filesystem=True)
+    compute = ComputeWithGate(shared_filesystem=True)
     calls: list[Sequence[str] | str] = []
 
     def runner(
@@ -521,7 +532,24 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
     assert compute.specs[0].test_command == "echo ok"
     assert compute.specs[0].local_checkout == worktree
     assert compute.specs[0].env["MIMIR_HOME"] == str(tmp_path)
+    # Inspect the actual orchestrator launch, not a WorkSpec constructed with
+    # credit already enabled: removing its production on-switch must fail here.
+    assert len(compute.specs) == 1
+    builder_spec = compute.specs[0]
+    assert builder_spec.builder_lease_credit is True
     assert compute.cleaned == [LaunchHandle("fake_compute", "job-1")]
+
+    # Feed that same enabled builder spec through the production gate-spec
+    # constructor. Gates and diagnostic commands must explicitly clear credit,
+    # rather than accidentally inheriting it from the originating builder.
+    gate_result = asyncio.run(_run_compute_gate_command(
+        "echo ok", checkout=worktree, work_spec=builder_spec,
+        compute=compute, diagnostic=diagnostic,
+    ))
+    assert gate_result.exit_code == 0
+    assert compute.gate_spec.builder_lease_credit is False
+    assert compute.gate_spec.local_argv == ("/bin/sh", "-c", "echo ok")
+    assert compute.cleaned[-1] == LaunchHandle("fake_compute", "gate")
 
 
 def test_stuck_cancellation_stops_heartbeat_and_releases_claim(
