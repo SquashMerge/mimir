@@ -88,6 +88,27 @@ unrelated PR's branch. Prior-turn dirty leases are automatically archived under
 untracked tar, history bundle and metadata. If safe archival cannot complete,
 `dirty_lease_from_prior_turn` preserves drafts in place; report that refusal.
 
+For changes-requested and CI-failure PR remediation, run focused tests for the
+changed code with `repo_test` selectors. Scoped tests must pass before pushing.
+Commit before the turn ends; if the turn might end before tests finish, commit
+locally first. Never leave a repair uncommitted across a turn boundary:
+uncommitted lease work is archived and reset at the next turn's checkout.
+After focused tests pass, commit, push to the PR branch, and re-request review
+only when the scope grants `pr.rerequest`; otherwise report the need via
+`pr_comment` or operator escalation. Do not queue a default-suite `repo_test`
+before pushing for remediation. Do not produce mutation evidence; reviewers
+run mutation checks. PR CI is the full-suite gate: all required checks, both
+core and `MIMIR_PLUGINS=cultivate` legs, must pass at the published head.
+A completed failing run with counts observed and `failed_tests` non-empty
+blocks publication. An incomplete full-suite run (`test_timeout` or infrastructure
+refusal) is NOT a publication blocker after scoped tests pass; report that it
+**did not complete**, not "failed", and rely on PR CI.
+This overrides agent-local green-full-suite pre-push guidance, not authorization,
+branch protection, required checks, or required review. It does not apply to
+`pr_mergeability_conflicting`: follow github-poller's unchanged requirement for
+the configured default suite's full core and `MIMIR_PLUGINS=cultivate` legs to
+pass at the exact merge commit before `repo_push`.
+
 Optional enrichment: call `ci_run(repository, run_id)` for run metadata,
 `ci_run_jobs(repository, run_id)` for jobs and failed steps, and
 `ci_recent_runs(repository, branch)` to compare recent runs on the branch.

@@ -169,19 +169,29 @@ For each repo in `GITHUB_REPOS`:
   bounded attempt series and a one-shot give-up signal; because queued emissions
   are not proof of delivery, an unchanged unresolved PR starts a fresh series
   after a 24-hour backstop rather than staying silent forever.
-  For changes-requested remediation, read the latest review, inline, and PR
+  For changes-requested and CI-failure remediation (including feedback and
+  `repo_test_complete` continuations), read the latest review, inline, and PR
   comments on the bound PR. Honour explicit reviewer publication instructions
   ("push", "CI is the gate") on the next turn, subject to passing scoped tests.
-  Attempt the full suite, but a full-suite `repo_test` `test_timeout` or
-  infrastructure refusal (snapshot unavailable, runner unavailable) is NOT a
-  publication blocker. Only a completed failing full-suite run with counts
-  observed and `failed_tests` non-empty blocks publication; scoped tests must
-  still pass. On incomplete full-suite validation, commit, push to the PR branch,
-  and re-request review without waiting for another contained full-suite run.
-  State in the PR comment that the in-runner full suite **did not complete**, not
-  "failed", and that CI is the validation surface. This takes precedence over
-  agent-local green-full-suite pre-push guidance, not authorization, branch
-  protection, required checks, or required review on main.
+  Run focused tests for the changed code with `repo_test` selectors.
+  Scoped tests must pass before pushing. Commit before the turn ends; if the
+  turn might end before tests finish, commit locally first. Never leave a repair
+  uncommitted across a turn boundary: uncommitted lease work is archived and
+  reset at the next turn's checkout.
+  After focused tests pass, commit, push to the PR branch, and re-request review
+  only when the scope grants `pr.rerequest`; otherwise report the need via
+  `pr_comment` or operator escalation. Do not queue a default-suite `repo_test`
+  before pushing for remediation. Do not produce mutation evidence; reviewers
+  run mutation checks. PR CI is the full-suite gate: all required checks, both
+  core and `MIMIR_PLUGINS=cultivate` legs, must pass at the published head.
+  A completed failing run with counts observed and `failed_tests` non-empty
+  blocks publication. An incomplete full-suite run (`test_timeout` or
+  infrastructure refusal) is NOT a publication blocker after scoped tests pass;
+  report that it **did not complete**, not "failed", and rely on PR CI.
+  This takes precedence over agent-local green-full-suite pre-push guidance,
+  not authorization, branch protection, required checks, or required review on
+  main. It does not apply to `pr_mergeability_conflicting`, whose full-suite
+  requirement below is unchanged.
 - **Mergeability of your own PRs** — GitHub's per-PR `mergeable` result is
   reconciled with the declared base/head comparison. A clean branch behind its
   base emits `pr_mergeability_rebase`, which uses the existing scoped checkout,
@@ -231,6 +241,8 @@ For each repo in `GITHUB_REPOS`:
   baselined and remains quiet until its head or failure set changes. Open-PR
   discovery is intentionally bounded to the 100 most recently updated PRs; a
   newly completed check normally refreshes the affected PR into that window.
+  Follow the focused-tests-then-push remediation policy above; PR CI supplies
+  full-suite evidence, not a local default-suite run before publication.
 
 ### CI remediation scope
 
