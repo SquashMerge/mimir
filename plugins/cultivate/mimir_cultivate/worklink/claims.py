@@ -867,6 +867,8 @@ class ChainlinkClaims:
 
         Archived ``.json.closed-unmerged`` evidence is intentionally excluded by
         the shared finder, so operator-approved re-attempts remain admissible.
+        Explicit publication releases likewise retire only the exact attempt/PR
+        association, without editing or archiving its evidence.
         """
         effective_home = Path(home_path) if home_path is not None else self.home_path
         if effective_home is None:
@@ -877,6 +879,10 @@ class ChainlinkClaims:
             return None
         path, payload = found
         if payload.get("status") != "completed" or not payload.get("pr_url"):
+            return None
+        from .publication_release import publication_is_released
+
+        if publication_is_released(effective_home, path, payload["pr_url"]):
             return None
         return ReviewReadyEvidence(path=path, payload=payload)
 

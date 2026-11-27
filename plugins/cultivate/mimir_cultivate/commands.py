@@ -56,6 +56,14 @@ def add_argparse(
     stop_p.add_argument("issue_id", type=int, help="Chainlink issue id to stop.")
     stop_p.add_argument("--home", type=Path, default=None, help="Agent home.")
 
+    release_p = worklink_sub.add_parser(
+        "release-publication", help="Release an attempt's closed, unmerged PR publication."
+    )
+    release_p.add_argument("issue_id", type=int)
+    release_p.add_argument("--attempt", type=int, required=True)
+    release_p.add_argument("--reason", required=True, help="Why this publication is being released.")
+    release_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
     leaf_p = worklink_sub.add_parser(
         "clear-leaf-state", help="Clear retained leaf state only after verified worker retirement."
     )
@@ -201,6 +209,9 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     if args.worklink_action == "stop":
         return _stop(args)
+
+    if args.worklink_action == "release-publication":
+        return _release_publication(args)
 
     if args.worklink_action == "clear-leaf-state":
         return _clear_leaf_state(args)
@@ -563,6 +574,57 @@ def _emit_work_item(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     sys.stdout.write(payload)
+    return 0
+
+
+def _release_publication(args: argparse.Namespace) -> int:
+    from datetime import UTC, datetime
+
+    from mimir._atomic import atomic_write_json
+    from mimir.event_logger import init_logger
+    from .worklink.autonomy import chainlink_bin
+    from .worklink.control import _claim_mutex, _runner
+    from .worklink.merge_closure import read_pr_snapshot
+    from .worklink.publication_release import publication_release_path
+
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    run, binary = _runner(home), chainlink_bin()
+    try:
+        if args.issue_id < 1 or args.attempt < 1 or not args.reason.strip():
+            raise ValueError("positive issue/attempt and a nonempty --reason are required")
+        with _claim_mutex(home):
+            _require_incident_quiescent(home, args.issue_id, run, binary)
+            evidence_path = home / "state/worklink/evidence" / f"{args.issue_id}-{args.attempt}.json"
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("status") not in {
+                "completed", "failed", "blocked", "stopped",
+            }:
+                raise ValueError("terminal publication evidence is required")
+            pr_url = payload.get("pr_url")
+            snapshot = read_pr_snapshot(pr_url, gh_bin="gh", runner=run)
+            if snapshot.state != "closed":
+                raise ValueError("recorded PR is not CLOSED")
+            if snapshot.merged:
+                raise ValueError("recorded PR is merged")
+            record = {
+                "issue_id": args.issue_id, "attempt": args.attempt, "pr_url": pr_url,
+                "reason": args.reason.strip(), "released_at": datetime.now(UTC).isoformat(),
+            }
+            init_logger(home / "logs/events.jsonl", session_id=f"worklink-release-{args.issue_id}")
+            # Audit before activating the release. Delivery failures leave the
+            # fence closed; retries may repeat an audit, never bypass it.
+            log_durable_event_sync("worklink_publication_released", **record)
+            comment = run([
+                binary, "issue", "comment", str(args.issue_id),
+                f"WORKLINK_PUBLICATION_RELEASED {json.dumps(record, sort_keys=True)}",
+            ])
+            if comment.returncode != 0:
+                raise RuntimeError("Chainlink release comment failed")
+            atomic_write_json(publication_release_path(home, evidence_path), record)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+        print(f"release-publication refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"worklink #{args.issue_id} attempt {args.attempt}: publication released")
     return 0
 
 
