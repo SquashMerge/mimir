@@ -20,6 +20,7 @@ import re
 import stat
 import subprocess
 import time
+import uuid
 from typing import Any, Callable, Iterable, Sequence
 
 from .checkout import _default_runner
@@ -28,6 +29,7 @@ from .dispatch_failures import _find_latest_evidence_file_for_issue, record_leaf
 from .factory_state import (
     FactoryRecordError, FactoryRunRecord, _require_safe_directory,
     factory_issue_resource_lock, load_factory_record, load_factory_records_for_issue,
+    _read_factory_record_path,
 )
 from .run_state import run_state_path
 from mimir._atomic import atomic_write_json
@@ -50,6 +52,7 @@ DEFAULT_MAX_CLAIM_ATTEMPTS = 3
 #:
 #: Add with:  chainlink issue comment <id> 'WORKLINK_CLAIM_RESET {"reason": "..."}'
 CLAIM_RESET_PREFIX = "WORKLINK_CLAIM_RESET "
+ATTEMPT_GRANT_PREFIX = "WORKLINK_ATTEMPT_GRANTED "
 
 #: How many resets one issue may be granted. Unbounded forgiveness would let a
 #: genuinely stuck leaf loop forever by resetting itself — the comment carries no
@@ -623,7 +626,20 @@ class ChainlinkClaims:
             attempt = self.next_attempt(comments)
             budget = self.attempt_budget(comments, home_path=claim_home)
             attempts_used = budget.charged
-            if attempts_used >= self.max_attempts:
+            try:
+                grants = self._attempt_grants(claim_home, issue_id, budget.generation)
+                if grants:
+                    # A stale caller snapshot must not spend a granted ordinal
+                    # twice after the first worker releases its claim.
+                    current_comments = self._issue_comments(issue_id, strict=True)
+                    attempt = self.next_attempt(current_comments)
+                    budget = self.attempt_budget(current_comments, home_path=claim_home)
+                    attempts_used = budget.charged
+                    grants = self._attempt_grants(claim_home, issue_id, budget.generation)
+            except Exception:
+                self.release_issue(issue_id)
+                raise
+            if attempts_used >= self.max_attempts and attempt not in grants:
                 generation = budget.generation
                 self.release_issue(issue_id)
                 self._attempts_exhausted(
@@ -1185,6 +1201,59 @@ class ChainlinkClaims:
             budget.charged, budget.clean_parks, len(active_claims & forgiven),
         )
         return budget
+
+    def _attempt_grants(self, home: Path | None, issue_id: int, generation: int) -> tuple[int, ...]:
+        # Reuse the bounded, no-symlink, same-owner JSON reader. Comments alone
+        # are not authority for unlimited operator grants (unlike bounded resets).
+        if home is None:
+            return ()
+        loaded = _read_factory_record_path(
+            home / "state/worklink/attempt-grants" / f"{issue_id}.json",
+        )
+        if loaded is None:
+            return ()
+        payload, _raw = loaded
+        if (type(payload.get("issue_id")) is not int or payload["issue_id"] != issue_id
+                or type(payload.get("generation")) is not int or payload["generation"] < 0
+                or not isinstance(payload.get("attempts"), list)
+                or any(type(attempt) is not int or attempt < 1 for attempt in payload["attempts"])):
+            raise ValueError("invalid per-leaf attempt grant record")
+        return tuple(payload["attempts"]) if payload["generation"] == generation else ()
+
+    def grant_attempt(self, issue_id: int, *, reason: str) -> int:
+        """Grant one credit after the operator CLI serializes and proves quiescence.
+
+        Activation is last: neither an unaudited grant nor a bare Chainlink
+        comment changes admission. Audit failures leave the budget unchanged.
+        """
+        if self.home_path is None or self.event_logger is None:
+            raise ValueError("attempt grants require an operator home and durable event logger")
+        if issue_id <= 0 or not reason.strip():
+            raise ValueError("a positive issue id and non-empty reason are required")
+        comments = self._issue_comments(issue_id, strict=True)
+        labels = self._issue_labels(issue_id, strict=True)
+        if WORKLINK_EPIC_LABEL in labels or "worklink:in-progress" in labels:
+            raise ValueError("grant-attempt requires a non-running leaf")
+        budget = self.attempt_budget(comments)
+        attempt = self.next_attempt(comments)
+        grants = self._attempt_grants(self.home_path, issue_id, budget.generation)
+        if budget.charged < self.max_attempts or attempt in grants:
+            raise ValueError("leaf still has claim attempts left")
+        # Bind the credit to one monotonic ordinal, rather than raising a limit.
+        # This also works when historical usage already exceeds today's limit.
+        granted_attempts = [*grants, attempt]
+        payload = {
+            "issue_id": issue_id, "generation": budget.generation, "attempts": granted_attempts,
+            "attempt": attempt,
+            "grant_id": str(uuid.uuid4()), "reason": reason.strip(),
+            "granted_at": self.clock().isoformat(),
+        }
+        path = self.home_path / "state/worklink/attempt-grants" / f"{issue_id}.json"
+        _require_safe_directory(path.parent, create=True)
+        self._run("issue", "comment", str(issue_id), ATTEMPT_GRANT_PREFIX + json.dumps(payload, sort_keys=True))
+        self.event_logger("worklink_attempt_granted", **payload)
+        atomic_write_json(path, payload, mode=0o600)
+        return len(granted_attempts)
 
     def attempts_used(self, comments: Iterable[str], *, home_path: Path | None = None) -> int:
         return self.attempt_budget(comments, home_path=home_path).charged
