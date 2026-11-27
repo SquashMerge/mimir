@@ -76,10 +76,21 @@ explicit timeout/transport/state-write limitation. Failures still emit normally.
 
 For PR CI remediation, classify before editing with
 `repo_diff(mode='base', failing_test=<test path>,
-imported_modules=<repo-relative module paths imported by that test>)`.
+imported_modules=<repo-relative module paths imported by that test>,
+inputs=<repo-relative data/config/fixture/resource files read by that test>)`.
 Remediate when the failing test or an imported module is in the PR's changed
-paths. When both the failing test and its imported modules are outside those
-paths, report the unrelated failure using `pr_comment` or operator escalation
+paths, or any `inputs` file is changed there. All evidence paths must be
+repository-relative without traversal; local drafts never count.
+A trusted collaborator can authorize an otherwise out-of-diff repair with a
+whole PR comment `WORKLINK_REMEDIATION_SCOPE {"head": "<full sha>",
+"paths": ["tests/test_x.py"], "reason": "why this repair is needed"}`.
+Call the classifier again with `paths=<exact intended edit paths>` (defaults to
+the failing test only). Every requested path must be listed literally; no globs
+or traversal. The tool attests the author using forge-trust rules, checks the
+current live head, logs authorization and returns `authorized_by` and
+`matched_paths`. Edit only those exact authorized paths. Stale-head, untrusted,
+or malformed markers never widen scope. Without changed evidence or exact
+authorization, report the unrelated failure using `pr_comment` or operator escalation
 and leave the PR unchanged. Report insufficient evidence rather than drafting
 a speculative fix. Main-branch failures belong in a separate issue, not an
 unrelated PR's branch. Prior-turn dirty leases are automatically archived under

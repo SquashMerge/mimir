@@ -1207,5 +1207,41 @@
       "pollers.json": "7771c3d953de5a4a299053d523a34695205888a5bb83e7e9f7fc250125ba407d",
       "scripts/poller.py": "74cc9b90e4eac061fcd758f3facf1e9deb40150917fa8560be4540639253452e"
     }
+  },
+  "2235-ci-remediation-scope": {
+    "github-poller": {
+      "SKILL.md": "005163a41b6f7c906597655d6fd73bc76f9c171f89f8673a2f21674347903948",
+      "pollers.json": "c26cb2dd3a4c29560a8660ad7a3f703bd9e9a3282fb0612c9d3c5f6f340e7089",
+      "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
+      "scripts/poller.py": "2ba83ab6835fafaf1201e00de93ddad95791ba9b7230bfd7d825f5e9ec2b54e3",
+      "tests/conftest.py": "1f437551f8d130a352983136fdf7e6e4d25c3e50301d872d18c90d653c195d05",
+      "tests/github_poller_test_support.py": "43bba3c7a2dc4f741aa090dd4c23bb01a2457413ff7a3e4bd6d552aa57756fab",
+      "tests/test_github_poller_auto_review.py": "fe468ac55b21f14bee08a5ee3cc765f9a466d10a8b4e678d6a8f852990e752ba",
+      "tests/test_github_poller_changes_requested.py": "14eada4ed0f1eb0ae1b9b6e2288e77f9bd2cc8a64b87e97891d5a0eaff1a00d3",
+      "tests/test_github_poller_ci_failures.py": "4891026c488e1af09df22164f27e1e5a8accceec6ec451571b56a4648eab8604",
+      "tests/test_github_poller_ci_logs.py": "fdeefc12d4483cbcd658f6a460fcc5c6f4c5d41f26f56cfd16a5b6c3014d1ce9",
+      "tests/test_github_poller_event_coalescing.py": "d19afeeeaca68e5fdd458b1f6f9e257cc0e45ec732ca571e83694f557bd7c75a",
+      "tests/test_github_poller_issue_notices.py": "8bf270a5fc30e418c425d46ad1d9dd54b96f4e2f26681a3e8c7230152f97e61f",
+      "tests/test_github_poller_mergeability.py": "c624d2af87026b15d8938021e4ea1f01fae2b95c8c91c22b6597be2a27308e48",
+      "tests/test_github_poller_own_feedback.py": "d8fd2e333d0d1ccd0b1717a9244e24aa2a38822d59b50eb6ab7a479773b461fc",
+      "tests/test_github_poller_pr_pushes.py": "87b943017ceaa621c60747944c3a48383f4aa0d8559dd6aa47b1ca36aca5d6eb",
+      "tests/test_github_poller_pr_scope_snapshot.py": "005137dbb24dff5cfe3892ff83d09efbb710ac2b02d8aacdacc7b444902b0094",
+      "tests/test_github_poller_pr_trust.py": "58fade4ccb673e234cc75e514afc7712cc9b8c0ca9dba919d44d1e80153a7af4",
+      "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
+      "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
+      "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
+    },
+    "github-ci-watch": {
+      "SKILL.md": "f5258130138b8a0dced32bc7dba5b92d4dbce554ac4bce147ae44a79cbcf56ef",
+      "pollers.json": "cf12bace495179efb472e5d1d8d65a7dd3a2a4dccd17c5f312dfdbc6a639bcd2",
+      "scripts/ci_logs.py": "897902c578741b17b8987da7bd4126a9f918198df05148f4f981c6b012f68c87",
+      "scripts/poller.py": "8f600defe469eea2d0445136a5da31ae430b9a65cab054b9a1bcbd9b5eec8c14",
+      "tests/conftest.py": "0ad004f92857df903eb394bdd197d1d7a946cd1a40a82e2e3c07510e911437da",
+      "tests/github_ci_test_support.py": "02b3334cfeb6a73641cdeeb8ad413fdbc5716fda63b94122cff2b0d6b356cf87",
+      "tests/test_ci_logs.py": "ea1b6bd17544651441d4b1aff24716d479aed0e1057298a8bf4832fe39320a77",
+      "tests/test_ci_state.py": "19967b370dacfe8a65829637e3c9d6ba0b4991cd6b538aec5a6d6f17b85b3964",
+      "tests/test_ci_watch_attention.py": "941aada8f3b8f02187dd54ef3369b32f89be260f8734e9dc926263fee03b7a1d",
+      "tests/test_github_ci_watch.py": "aa1d9cba4f82e4c72c84a511c94bb51d031a348b77057624f7390856f366e43d"
+    }
   }
 }
