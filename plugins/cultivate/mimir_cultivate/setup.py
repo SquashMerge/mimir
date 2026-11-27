@@ -1131,9 +1131,10 @@ def _check_in_flight(deploy: Path, run) -> None:
     elif rows and rows[0].startswith("ISSUE  STATE "):
         active = []
         for row in rows[1:]:
-            fields = row.split()
-            if row.startswith("  disagreement:"):
+            # Indented rows annotate the preceding issue, not in-flight work.
+            if row.startswith("  "):
                 continue
+            fields = row.split()
             if len(fields) < 2 or not fields[0].isdigit():
                 raise SetupError("Cannot read Worklink status; retry after inspecting the agent.")
             if fields[1] != "clean":
