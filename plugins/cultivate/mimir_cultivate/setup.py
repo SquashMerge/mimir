@@ -828,6 +828,17 @@ def render_layer(kind: str, version: str, root_image: str, *,
                 f"RUN set -eu; install -d -o worklink -g worklink -m 0700 {SCCACHE_DIR}\n"
                 + "ENV " + " ".join(f"{key}={env[key]}" for key in
                                     ("RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE")) + "\n")
+            # Leave the checksum-verified install above and all public env
+            # values intact. The launcher covers every consumer of sccache,
+            # including builder sessions, Rust gates and evidence commands.
+            launcher = resources.files("mimir_cultivate").joinpath("docker/worklink-sccache").read_bytes()
+            encoded = base64.b64encode(launcher).decode("ascii")
+            install += (
+                "RUN set -eu; install -d -o worklink -g worklink -m 0700 /var/tmp/mimir-sccache\n"
+                "RUN set -eu; install -d -o root -g root -m 0755 /usr/local/libexec && "
+                "mv /usr/local/bin/sccache /usr/local/libexec/sccache && "
+                f"printf %s {encoded} | base64 -d > /usr/local/bin/sccache && "
+                "chown root:root /usr/local/bin/sccache && chmod 0755 /usr/local/bin/sccache\n")
     elif kind == "node":
         install = (f"RUN set -eu; arch=$(dpkg --print-architecture); case $arch in amd64) arch=x64;; arm64) ;; *) exit 2;; esac && "
                     "apt-get update && apt-get install -y --no-install-recommends g++ make python3 && "
