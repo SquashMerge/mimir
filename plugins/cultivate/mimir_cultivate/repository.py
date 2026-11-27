@@ -3391,6 +3391,7 @@ class GitDiff:
     paths: tuple[str, ...] = ()
     failing_test: str | None = None
     imported_modules: tuple[str, ...] = ()
+    inputs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3679,6 +3680,36 @@ def _out_of_scope_paths_message(paths: set[str]) -> str:
     names = ", ".join(repr(path) for path in shown)
     more = len(paths) - len(shown)
     return f"{names} … and {more} more" if more else names
+
+
+def _remediation_scope_marker(body: str, head: str) -> dict[str, Any] | None:
+    """Parse an explicit whole-comment marker; never interpret prose as authority."""
+    prefix = "WORKLINK_REMEDIATION_SCOPE "
+    if not body.startswith(prefix):
+        return None
+    try:
+        marker = json.loads(body[len(prefix):])
+        if (
+            not isinstance(marker, dict)
+            or marker.get("head") != head
+            or not isinstance(marker.get("reason"), str)
+            or not marker["reason"].strip()
+            or not isinstance(marker.get("paths"), list)
+            or not all(isinstance(path, str) for path in marker["paths"])
+        ):
+            return None
+        paths = _validated_paths(tuple(marker["paths"]), required=True)
+        # Unlike Git's literal pathspecs, authorizations must name canonical
+        # individual paths, never globs, directories, or normalized aliases.
+        if any(
+            any(token in path for token in "*?[]")
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            for path in paths
+        ):
+            return None
+        return marker
+    except (ValueError, GitRefusal):
+        return None
 
 
 class RepoGitTools:
@@ -4295,6 +4326,44 @@ class RepoGitTools:
         if pending:
             self._command(("add", "--", *pending))
 
+    def _ci_remediation_authorizations(self) -> dict[str, dict[str, Any]]:
+        """Read authority only from forge comments and existing author attestation."""
+        from .forge import _author_verdict, _client, _live_pr_head
+        from mimir.event_logger import log_event_sync
+
+        if self._auth_context is None:
+            return {}
+        scope = self._scope
+        try:
+            client = _client(scope)
+            if _live_pr_head(client, scope) != scope.observed_head_sha:
+                return {}
+            accepted = []
+            for comment in client.list_comments(scope):
+                marker = _remediation_scope_marker(comment.body, scope.observed_head_sha)
+                if marker is None:
+                    continue
+                # Do not accept vouched-for text or a payload's trust claim.
+                if _author_verdict(self._auth_context, scope, comment.author, client) is not True:
+                    continue
+                accepted.append((comment, marker))
+            # A head change during comment/trust reads invalidates every marker.
+            if _live_pr_head(client, scope) != scope.observed_head_sha:
+                return {}
+            authorized = {}
+            for comment, marker in accepted:
+                identity = {"author": comment.author, "comment_id": comment.id, "head": marker["head"]}
+                log_event_sync(
+                    "repo_ci_remediation_scope_authorized",
+                    repository=scope.canonical_repo, pull_request=scope.pr_number,
+                    authorized_by=identity, paths=marker["paths"], reason=marker["reason"],
+                )
+                for path in marker["paths"]:
+                    authorized[path] = identity
+            return authorized
+        except Exception:  # Forge/trust/logging unavailability must never widen scope.
+            return {}
+
     def execute(self, operation: GitOperation) -> GitOperationResult:
         """Authorize one typed operation and execute only server-built argv."""
         recovery = self._state.checkout_lease.interrupted_operation if self._state is not None else None
@@ -4372,7 +4441,8 @@ class RepoGitTools:
                 if operation.mode != "base" or self._retained:
                     raise GitRefusal("invalid_shape", "CI failure classification requires a PR base diff")
                 evidence = _validated_paths(
-                    (operation.failing_test, *operation.imported_modules), required=True,
+                    (operation.failing_test, *operation.imported_modules, *operation.inputs),
+                    required=True,
                 )
                 # Use the published immutable PR diff, not local drafts, an
                 # optional path filter, or commits produced during remediation.
@@ -4380,13 +4450,30 @@ class RepoGitTools:
                     "diff", "--name-only", "-z", "--no-renames",
                     f"{self._scope.observed_base_sha}...{self._scope.observed_head_sha}", "--",
                 )).stdout.split("\0")
-                related = bool(set(evidence).intersection(changed))
+                matched = set(evidence).intersection(changed)
+                authorized = self._ci_remediation_authorizations() if not matched else {}
+                # For out-of-diff repairs, paths are exact requested edit targets;
+                # without paths only the failing test itself is being authorized.
+                targets = set(paths or (operation.failing_test,))
+                authorized_matches = targets.intersection(authorized)
+                allowed_by_operator = targets.issubset(authorized)
+                related = bool(matched) or allowed_by_operator
+                authorized_by = []
+                if allowed_by_operator:
+                    for path in sorted(authorized_matches):
+                        if authorized[path] not in authorized_by:
+                            authorized_by.append(authorized[path])
                 decision = {
                     "action": "remediate" if related else "report",
                     "edit_allowed": related,
-                    "matched_paths": sorted(set(evidence).intersection(changed)),
+                    "matched_paths": sorted(matched | authorized_matches),
+                    "authorized_by": authorized_by,
                     "guidance": (
-                        "Remediate the related failure, verify, and push with a lease."
+                        (
+                            "Remediate only the exact authorized matched_paths, verify, and push with a lease."
+                            if allowed_by_operator else
+                            "Remediate the related failure, verify, and push with a lease."
+                        )
                         if related else
                         "Report the unrelated failure with pr_comment or operator escalation; leave the PR unchanged."
                     ),
@@ -6428,8 +6515,11 @@ def repo_checkout(
     before reset and cleanup; preserved_prior_work names the artifact. A
     dirty_lease_from_prior_turn refusal preserves drafts if safe archival cannot
     complete. After checkout, classify CI failures using
-    repo_diff(mode='base', failing_test=..., imported_modules=...). Remediate
-    failures related to the PR's changed paths; report unrelated failures with
+    repo_diff(mode='base', failing_test=..., imported_modules=..., inputs=...).
+    inputs names repository-relative data/config/fixture/resource files read by
+    the test (no traversal). Remediate failures related to the PR's changed paths
+    or exact paths authorized by a trusted WORKLINK_REMEDIATION_SCOPE comment
+    for the current head; report unrelated failures with
     pr_comment or operator escalation and leave the PR unchanged.
     """
     if _retained_scope(runtime, repository, pull_request) is not None:
@@ -7165,6 +7255,7 @@ def repo_diff(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
     failing_test: str | None = None,
     imported_modules: tuple[str, ...] = (),
+    inputs: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Read a bounded working, staged, or base diff from the bound checkout.
 
@@ -7173,16 +7264,27 @@ def repo_diff(
     retained scopes do not support ``mode='base'``.
 
     Before CI remediation, classify with mode='base', failing_test=<test path>
-    and imported_modules=<repo-relative module paths imported by that test>.
+    and imported_modules=<repo-relative module paths imported by that test>,
+    inputs=<repo-relative data/config/fixture/resource files read by that test>.
+    All evidence paths must be repository-relative, without traversal.
     Remediate when the failing test or an imported module is in the published
-    PR's changed paths. When both are outside those paths, report the unrelated
+    PR's changed paths, or when an inputs file is changed there. Local drafts
+    never supply relevance. A trusted collaborator can post a whole PR comment:
+    WORKLINK_REMEDIATION_SCOPE {"head": "<full sha>", "paths": ["tests/test_x.py"],
+    "reason": "why this repair is needed"}. Author attestation and the current live
+    head must match; stale/untrusted/malformed markers never widen scope.
+    For an out-of-diff repair, pass paths=<exact intended edit paths> (defaults
+    to the failing test only). Every requested path must be explicitly listed;
+    globs/traversal are forbidden. Authorization is logged and returned in
+    authorized_by and matched_paths; it permits only those exact edits.
+    Without changed evidence or exact authorization, report the unrelated
     failure using pr_comment or operator escalation and leave the PR unchanged.
     Unknown or insufficient evidence calls for reporting, not a speculative edit.
     Classification returns action and edit_allowed in stdout JSON.
     """
     return _execute(
         runtime, repository, pull_request,
-        GitDiff(mode, paths, failing_test, imported_modules),
+        GitDiff(mode, paths, failing_test, imported_modules, inputs),
     )
 
 
