@@ -126,22 +126,21 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     assert set(data) == {
         "resolve",
         "verify",
+        "verify_unavailable_exit",
+        "verify_scope",
         "verify_timeout_ms",
         "bootstrap",
         "max_retries",
         "pr_draft",
     }
-    # uv supplies Python for the portable lease helper. Configured leases fail
-    # closed on unusable paths/missing timeout tools, on both macOS and Linux.
-    assert data["verify"] == "uv run sh scripts/heavy_run.sh uv run pytest -q --tb=short"
-    # `verify_timeout_ms` is declared because the factory default of 900000 (15 min) is
-    # shorter than this suite. A canonical run reached ~79% of 8937 tests before the
-    # factory sent SIGTERM, and that surfaces as a numeric test failure rather than a
-    # timeout -- which then blocks relaunching the run on the same SHA. The factory's
-    # timeout also covers the time a verify spends queued on the heavy-run lock, which
-    # another host workload can hold for over an hour, so it sits above the wrapper's
-    # 7200 s hang backstop rather than above the suite's own runtime.
-    assert data["verify_timeout_ms"] == 7500000
+    # Factory >=0.14.3 distinguishes unavailable CI from failed tests and verifies
+    # once, on the integrated SHA. No local heavy lease or full-suite fallback.
+    assert data["verify"] == "sh scripts/ci_verify.sh"
+    assert data["verify_unavailable_exit"] == 75
+    assert data["verify_scope"] == "integration"
+    # 180 minutes covers macOS queue time and leaves room for the script's own
+    # 170-minute deadline plus bounded branch cleanup before factory kills it.
+    assert data["verify_timeout_ms"] == 10800000
     assert (
         isinstance(data["max_retries"], int)
         and not isinstance(data["max_retries"], bool)

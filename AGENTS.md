@@ -50,6 +50,15 @@ review, re-run it on the unmodified base and compare the dependency pin.
 or worktree it is correct and expected. Against a running deployment it recreates
 the venv underneath the live process. Use `.venv/bin/python` directly there.
 
+### Factory runs: targeted acceptance tests only
+
+For feature-factory runs, the test-verifier at Gate 3 runs only the targeted
+acceptance tests, directly, without `-n` or `scripts/heavy_run.sh`. Do not run the
+full suite locally. This overrides the local full-suite evidence rules above and
+in CONTRIBUTING.md: leave full-suite evidence to integration `verify` (CI) and
+the PR's own CI. If CI verify is unavailable (exit 75), pause; never fall back to
+the local heavy run.
+
 ## Reading outside the diff
 
 **Stay inside the repository.** An unscoped search rooted at `$HOME` wedged a run
