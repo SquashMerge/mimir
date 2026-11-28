@@ -26,8 +26,8 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2247-rust-focused-tests"
-CI_WATCH_RELEASE = "2247-rust-focused-tests"
+GITHUB_POLLER_RELEASE = "2247-merged-rust-focused-tests"
+CI_WATCH_RELEASE = "2247-merged-rust-focused-tests"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.
 IDENTITY_EXCEPTIONS: dict[str, set[str]] = {}
@@ -172,7 +172,10 @@ def test_current_chainlink_orchestrator_release_inventory_is_complete():
                if item.name == "chainlink-orchestrator"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     assert skill_inventory(skill) == releases["2216-empty-ready-queue"]["chainlink-orchestrator"]
-    assert next(key for key in reversed(releases) if "chainlink-orchestrator" in releases[key]) == "2216-empty-ready-queue"
+    # The historical 2236 aggregate release repeated this unchanged inventory.
+    # Preserve that evidence; the merged release advances only the two pollers.
+    assert next(key for key in reversed(releases) if "chainlink-orchestrator" in releases[key]) == "1.0.0rc8-2236"
+    assert releases["1.0.0rc8-2236"]["chainlink-orchestrator"] == releases["2216-empty-ready-queue"]["chainlink-orchestrator"]
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.
