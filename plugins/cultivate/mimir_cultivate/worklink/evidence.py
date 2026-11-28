@@ -1691,6 +1691,8 @@ def shell_gate_environment() -> Iterator[dict[str, str]]:
     the controller's home. This bounds environment inheritance, not filesystem
     access: the local gate still executes repository code as the current uid.
     """
+    from .network_environment import network_retry_environment
+
     with tempfile.TemporaryDirectory(prefix="worklink-gate-home-") as text:
         home = Path(text)
         uid = os.getuid()
@@ -1706,6 +1708,7 @@ def shell_gate_environment() -> Iterator[dict[str, str]]:
         for path in paths.values():
             path.mkdir(parents=True, mode=0o700)
         yield {
+            **network_retry_environment(),
             "USER": username,
             "LOGNAME": username,
             "SHELL": "/bin/sh",
@@ -1721,7 +1724,11 @@ def _run(
     args: Sequence[str] | str, *, cwd: Path | None = None, timeout: float = 1800,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    from .network_environment import network_retry_environment
+
     env = filter_otlp_env(os.environ)
+    for name, value in network_retry_environment().items():
+        env.setdefault(name, value)
     env.pop("MIMIR_MODEL_SPEC", None)
     if isinstance(args, str):
         # Shell syntax supports configured commands and the report env prefix.
