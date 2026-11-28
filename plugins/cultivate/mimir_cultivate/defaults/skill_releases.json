@@ -1309,7 +1309,7 @@
   },
   "2236-merged-remediation-guidance": {
     "github-poller": {
-      "SKILL.md": "11284a096ac9ba8216dfe9e34291f8a33d7fb28b8abc8493fa67376911e7a644",
+      "SKILL.md": "57ee0dfe1fbdf7c8aad57777e77eab183ea9f41c75e9c6e21aaa720a772a2750",
       "pollers.json": "c26cb2dd3a4c29560a8660ad7a3f703bd9e9a3282fb0612c9d3c5f6f340e7089",
       "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
       "scripts/poller.py": "5ed7a7290fbdc90dc24a827be6c58b82807cb97ec6846c627ed7c943c822a183",
