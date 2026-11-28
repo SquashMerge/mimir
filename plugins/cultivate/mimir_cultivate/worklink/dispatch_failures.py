@@ -25,7 +25,7 @@ MAX_NOTIFIED_SIGNATURES = 32
 MERGE_RETRY_PASSES = 3
 # A fresh attempt can repair a failing gate; spec and operational incidents
 # require changed external state and therefore remain operator-gated.
-AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed", "quota_exhausted", "base_fetch_transient"})
+AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed", "quota_exhausted", "base_fetch_transient", "lease_wait_timeout"})
 MAX_CONSECUTIVE_QUOTA_HOLDS = 4
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 FACTORY_STOP_KINDS = frozenset({"factory_needs_human", "factory_blocked", "factory_partial"})
@@ -138,6 +138,9 @@ def autonomous_dispatch_block_reason(
         return str(exc)
     if state is None:
         return None
+    hold = state.get("lease_wait_backoffs", {}).get(str(issue_id))
+    if hold is not None and _incident_blocks_dispatch(hold, now):
+        return "heavy lease queue backoff blocks fresh autonomous dispatch"
     entry = state["issues"].get(str(issue_id))
     if entry is None:
         return None
@@ -148,6 +151,18 @@ def autonomous_dispatch_block_reason(
     if entry["active"] and _incident_blocks_dispatch(entry, now):
         return "an unresolved Worklink incident blocks fresh autonomous dispatch"
     return None
+
+
+def record_lease_wait_backoff(state_dir: Path, issue_id: int, attempt: int) -> None:
+    """Scheduled release, not an active incident or an intervention notice."""
+    with failure_state_transaction(state_dir) as state:
+        # Separate from incidents: a resumed test failure may still be active
+        # and must not be erased just because its next builder had to queue.
+        state.setdefault("lease_wait_backoffs", {})[str(issue_id)] = {
+            "issue_id": issue_id, "attempt": attempt, "active": False,
+            "failure_kind": "lease_wait_timeout", "attempt_consumed": False,
+            "retry_after": (datetime.now(UTC) + timedelta(minutes=INITIAL_BACKOFF_MINUTES)).isoformat(),
+        }
 
 
 def current_failure_identity(state_dir: Path, issue_id: int) -> tuple[str, str] | None:
@@ -858,6 +873,9 @@ def pending_failure_alerts(
     backed_off: set[int] = set()
     alerts: list[dict[str, object]] = []
     with failure_state_transaction(state_dir) as state:
+        for issue_id, hold in state.get("lease_wait_backoffs", {}).items():
+            if _incident_blocks_dispatch(hold, now):
+                backed_off.add(int(issue_id))
         for entry in state["issues"].values():
             if not isinstance(entry, dict) or (
                 entry.get("active") is not True and entry.get("failure_kind") != "base_fetch_transient"

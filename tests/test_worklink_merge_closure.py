@@ -582,6 +582,25 @@ def test_evidence_association_selects_latest_publication(tmp_path: Path) -> None
     assert association.pr_url == "https://github.com/example/project/pull/43"
 
 
+@pytest.mark.parametrize("invalid", [None, "pr_url", "review_ready"])
+def test_lease_wait_ending_is_unpublished_and_does_not_poison_later_merge(tmp_path, invalid):
+    issue = closure.IssueSnapshot(7, "open", frozenset({"worklink:review"}), (), None)
+    path = evidence(tmp_path, 7, attempt=1, url=None, review_ready=False)
+    payload = json.loads(path.read_text())
+    payload["status"] = "lease_wait"
+    if invalid is not None:
+        payload[invalid] = PR_URL if invalid == "pr_url" else True
+    path.write_text(json.dumps(payload))
+    latest = evidence(tmp_path, 7, attempt=2, url=PR_URL, review_ready=True)
+    if invalid is not None:
+        with pytest.raises(closure.ClosureReadError, match="lease wait release cannot"):
+            closure.discover_associations(tmp_path, issue)
+    else:
+        association = closure.discover_associations(tmp_path, issue)
+        assert association.pr_url == PR_URL
+        assert association.completed_evidence_paths == (latest,)
+
+
 def test_latest_attempt_uses_number_not_filename_order(tmp_path: Path) -> None:
     issue = closure.IssueSnapshot(7, "open", frozenset({"worklink:review"}), (), None)
     evidence(tmp_path, 7, attempt=2, url=PR_URL, review_ready=True)

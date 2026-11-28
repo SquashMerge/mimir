@@ -1971,6 +1971,27 @@ def test_changed_verified_wheel_refused_before_build(upgrade_setup):
     assert (deploy / 'manifest.json').read_bytes() == before
 
 
+@pytest.mark.parametrize('annotation', [
+    pytest.param('  active incident: failure_kind=operator_required signature=test '
+                 'occurrence_id=test-incident failed_at=2026-11-27T14:30:00Z', id='active-incident'),
+    pytest.param('  disagreement: tracker labels differ', id='disagreement'),
+    pytest.param('  future annotation: additional issue details', id='generic-annotation'),
+])
+def test_upgrade_allows_clean_worklink_status_annotations(upgrade_setup, annotation):
+    deploy, args, state, calls, invoke = upgrade_setup
+    args.mimir_version = '1.0.1'
+    state['status'] = ('ISSUE  STATE       ATTEMPT\n'
+                       '42     clean       1\n' + annotation)
+
+    invoke()
+
+    assert not args.force
+    assert any(argv[-3:] == ['mimir', 'worklink', 'status'] for argv in calls)
+    assert any(argv[-1] == installer._PR_LEASE_PROBE for argv in calls)
+    assert any(argv == ['docker', 'compose', 'up', '-d', 'agent'] for argv in calls)
+    assert json.loads((deploy / 'manifest.json').read_text())['mimir_version'] == '1.0.1'
+
+
 @pytest.mark.parametrize('activity,detail', [('worklink', 'Worklink #42 (running)'),
                                            ('lease', 'PR checkout lease org/repo#17')])
 @pytest.mark.parametrize('mode', ['reembed', 'no_start'])
@@ -1980,10 +2001,12 @@ def test_upgrade_refuses_in_flight_before_stop(upgrade_setup, activity, detail, 
     setattr(args, mode, True)  # A rerun that would explicitly stop the old agent.
     if activity == 'worklink':
         state['status'] = ('ISSUE  STATE       ATTEMPT  BACKEND           BRANCH                    CHECKOUT  ELAPSED\n'
-                           '42     running     1        opencode          main                      -         1m')
+                           '42     running     1        opencode          main                      -         1m\n'
+                           '  active incident: failure_kind=operator_required signature=test '
+                           'occurrence_id=test-incident failed_at=2026-11-27T14:30:00Z')
     else:
         state['leases'] = '["org/repo#17"]'
-    with pytest.raises(installer.SetupError, match=re.escape(detail)):
+    with pytest.raises(installer.SetupError, match='Agent is busy: ' + re.escape(detail)):
         invoke()
     assert not any(argv[-2:] == ['stop', 'agent'] for argv in calls)
     assert not any(argv[:2] == ['docker', 'build'] for argv in calls)
@@ -3384,11 +3407,12 @@ def test_sccache_compose_persists_private_worker_cache_and_opt_out():
     from mimir.scaffold_docker import render_compose_yml
     template = render_compose_yml(service_name='agent', web_port=8123, mode='pypi')
     uncached = installer.render_compose(template, 'image:sha', 'rust', 'repo', sccache=False)
-    assert hashlib.sha256(uncached.encode()).hexdigest() == (
-        '708b7d181ba5b7b81ea9da9fc759b7a2fdc73915f188d511b71292db520e214e')
     cached = yaml.safe_load(installer.render_compose(template, 'image:sha', 'rust', 'repo'))
     plain = yaml.safe_load(uncached)
+    assert plain['volumes']['cargo'] is None
+    assert 'sccache' not in uncached
     for service in ('agent', 'init'):
+        assert 'cargo:/var/cache/mimir-cargo' in plain['services'][service]['volumes']
         mounts = cached['services'][service]['volumes']
         assert mounts == [*plain['services'][service]['volumes'], 'sccache:/var/cache/mimir-sccache']
     assert cached['volumes'] == {**plain['volumes'], 'sccache': None}
@@ -3397,8 +3421,113 @@ def test_sccache_compose_persists_private_worker_cache_and_opt_out():
     assert cached['services']['agent']['environment']['MIMIR_SHELL_PASS_ENV'].endswith(
         ',RUSTC_WRAPPER,SCCACHE_DIR,SCCACHE_CACHE_SIZE')
     for kind in ('node', 'python'):
+        assert 'cargo' not in yaml.safe_load(
+            installer.render_compose(template, 'image:sha', kind, 'repo'))['volumes']
         assert installer.render_compose(template, 'image:sha', kind, 'repo') == (
             installer.render_compose(template, 'image:sha', kind, 'repo', sccache=False))
+    assert hashlib.sha256(uncached.encode()).hexdigest() == (
+        '3aa6761a9ec0f5166b5744a077cee96b270896e23e91bad7d18157402c603cb2')
+
+
+@pytest.mark.parametrize('sccache', [False, True])
+def test_rust_cache_volume_init_repairs_owner_mode_and_preserves_contents(tmp_path, sccache):
+    from mimir.scaffold_docker import render_compose_yml
+
+    template = render_compose_yml(service_name='agent', web_port=8123, mode='pypi')
+    init = yaml.safe_load(installer.render_compose(
+        template, 'image:sha', 'rust', 'repo', sccache=sccache))['services']['init']
+    assert init['user'] == 'root'
+    command = init['command'][0]
+    caches = ['/var/cache/mimir-cargo']
+    if sccache:
+        caches.append(installer.SCCACHE_DIR)
+    # Run the rendered init without Docker or host accounts. Only paths and
+    # account resolution are mapped; install/chown/chmod are the real utilities.
+    worker_uid = 1002 if os.geteuid() == 0 else os.geteuid()
+    worker_gid = 1002 if os.geteuid() == 0 else os.getegid()
+    command = command.replace('chown -R 1001:1001', f'chown -R {os.geteuid()}:{os.getegid()}')
+    command = command.replace('-o worklink -g worklink', f'-o {worker_uid} -g {worker_gid}')
+    for path in ['/workspace', '/home/mimir', *caches]:
+        command = command.replace(path, str(tmp_path / path.lstrip('/')))
+    for cache in caches:
+        (tmp_path / cache.lstrip('/')).mkdir(parents=True, mode=0o755)
+    for attempt in range(2):  # Fresh volume, then an upgrade/re-run with contents.
+        result = subprocess.run([*init['entrypoint'], command], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        for cache in caches:
+            directory = tmp_path / cache.lstrip('/')
+            info = directory.stat()
+            assert (info.st_uid, info.st_gid, info.st_mode & 0o777) == (worker_uid, worker_gid, 0o700)
+            marker = directory / 'persisted-crate'
+            if attempt:
+                assert marker.read_bytes() == b'cached data'
+            else:
+                marker.write_bytes(b'cached data')
+                # Upgrade must repair a volume root, not rely on image metadata.
+                directory.chmod(0o755)
+                if os.geteuid() == 0:
+                    os.chown(directory, 0, 0)
+    for cache in caches:
+        assert f'install -d -o worklink -g worklink -m 0700 {cache}' in init['command'][0]
+
+
+@pytest.mark.parametrize('cache', ['/var/cache/mimir-cargo', installer.SCCACHE_DIR])
+def test_rust_cache_volume_init_fails_closed_on_permission_error(cache):
+    from mimir.scaffold_docker import render_compose_yml
+
+    template = render_compose_yml(service_name='agent', web_port=8123, mode='pypi')
+    init = yaml.safe_load(installer.render_compose(template, 'image:sha', 'rust', 'repo'))['services']['init']
+    # Inject an install failure without touching host paths or needing root.
+    functions = ('mkdir() { :; }; chown() { :; }; chmod() { :; }; '
+                 'install() { echo "$*"; case "$*" in *' + cache + ') return 23;; esac; }; ')
+    result = subprocess.run([*init['entrypoint'], functions + init['command'][0]],
+                            capture_output=True, text=True)
+    assert result.returncode == 23
+    assert result.stdout.splitlines()[-1].endswith(cache)
+
+
+@pytest.mark.parametrize('sccache', [False, True])
+@pytest.mark.parametrize('no_start', [False, True])
+def test_rust_cache_volume_upgrade_from_previous_rendering(setup_environment, monkeypatch, sccache, no_start):
+    deploy, args, state, calls, invoke = setup_environment
+    state['repository_files'] = {'rust-toolchain.toml': '[toolchain]\nchannel = "1.99.1"'}
+    args.sccache = sccache
+    args.no_start = no_start
+    render = installer.render_compose
+
+    def previous_rendering(*a, **kw):
+        # Model a release with cache directories only in the image layer.
+        doc = yaml.safe_load(render(*a, **kw))
+        for name, path in [('cargo', '/var/cache/mimir-cargo'), ('sccache', installer.SCCACHE_DIR)]:
+            doc['volumes'].pop(name, None)
+            for service in ('agent', 'init'):
+                mounts = doc['services'][service]['volumes']
+                if f'{name}:{path}' in mounts:
+                    mounts.remove(f'{name}:{path}')
+            doc['services']['init']['command'][0] = doc['services']['init']['command'][0].replace(
+                f' && install -d -o worklink -g worklink -m 0700 {path}', '')
+        return yaml.safe_dump(doc, sort_keys=False)
+
+    with monkeypatch.context() as old:
+        old.setattr(installer, 'render_compose', previous_rendering)
+        invoke()
+    previous_compose = (deploy / 'compose.yml').read_bytes()
+    args.mimir_version = '1.0.1'
+    assert args.force is False
+    for _ in range(2):
+        calls.clear()
+        invoke()  # Upgrade, then same-release re-run; neither requires --force.
+        compose = (deploy / 'compose.yml').read_bytes()
+        assert compose != previous_compose
+        manifest = json.loads((deploy / 'manifest.json').read_text())
+        assert manifest['generated_sha256']['compose.yml'] == hashlib.sha256(compose).hexdigest()
+        doc = yaml.safe_load(compose)
+        for service in ('agent', 'init'):
+            assert 'cargo:/var/cache/mimir-cargo' in doc['services'][service]['volumes']
+            assert ('sccache:' + installer.SCCACHE_DIR in doc['services'][service]['volumes']) is sccache
+        assert ['docker', 'compose', 'run', '--rm', 'init'] in calls
+        assert not any('down' in argv or 'volume' in argv or '-v' in argv for argv in calls)
+        assert (['docker', 'compose', 'up', '-d', 'agent'] in calls) is not no_start
 
 
 def test_sccache_layer_pins_both_architectures_and_root_owned_binary():
@@ -4222,6 +4351,35 @@ def worklink_script_config(tmp_path, monkeypatch):
             git_auth=['git', '-c', 'credential.helper=fixture'], **options)
 
     return home, provision
+
+
+@pytest.mark.parametrize('has_digest', [False, True])
+def test_worklink_job_setup_transports_without_broadening_payload_policy(worklink_script_config, has_digest):
+    from mimir_cultivate.worklink.backends.base import SessionRequest
+    from mimir_cultivate.worklink.daemon_sessions import session_permissions
+
+    home, provision = worklink_script_config
+    assert provision()
+    path = home / 'worklink.yaml'
+    expected = path.read_bytes()
+    assert b'# Installed OpenCode session permission: worklink-job *\n' in expected
+    config = yaml.safe_load(expected)
+    policy = config['backends']['opencode']['bash_allowlist']
+    assert 'worklink-job *' not in policy
+    request = SessionRequest('leaf', {'providerID': 'unit', 'id': 'unit'}, 'build', tuple(policy))
+    assert {'action': 'shell', 'resource': 'worklink-job *', 'effect': 'allow'} in session_permissions(
+        request, jobs_enabled=True)
+    # The rc9 header-less rendering remains a recognized generated deployment.
+    previous = yaml.safe_dump(config, sort_keys=False).encode()
+    path.write_bytes(previous)
+    digest = home / '.mimir/worklink-setup.sha256'
+    if has_digest:
+        digest.write_text(hashlib.sha256(previous).hexdigest() + '\n')
+    else:
+        digest.unlink()
+    assert provision()
+    assert path.read_bytes() == expected
+    assert not provision()
 
 
 @pytest.mark.parametrize('command, expected', [

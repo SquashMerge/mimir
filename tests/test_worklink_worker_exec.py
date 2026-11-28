@@ -319,8 +319,27 @@ def session_lease(request, monkeypatch):
     return (lease if lease.get("MIMIR_HEAVY_LOCK_FILE") else {}), invalid
 
 
-def test_session_executor_clean_exec_uses_only_launch_snapshot(tmp_path, monkeypatch, session_lease):
+@pytest.mark.parametrize("retry_settings", [
+    pytest.param(None, id="cargo-defaults"),
+    pytest.param({"CARGO_NET_RETRY": "7", "CARGO_HTTP_TIMEOUT": "20"}, id="cargo-operator"),
+])
+def test_session_executor_clean_exec_uses_only_launch_snapshot(
+    tmp_path, monkeypatch, session_lease, retry_settings,
+):
     from mimir_cultivate.worklink import daemon_service
+
+    # Pin the allowlisted retry inputs independently of the host environment.
+    # Keep the exact environment assertion below: unrelated ambient settings
+    # and credentials must still be excluded from the helper's clean exec.
+    for name in ("CARGO_NET_RETRY", "CARGO_HTTP_TIMEOUT"):
+        monkeypatch.delenv(name, raising=False)
+    if retry_settings is not None:
+        for name, value in retry_settings.items():
+            monkeypatch.setenv(name, value)
+    expected_retries = (
+        {"CARGO_NET_RETRY": "5", "CARGO_HTTP_TIMEOUT": "30"}
+        if retry_settings is None else retry_settings
+    )
 
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -360,6 +379,7 @@ def test_session_executor_clean_exec_uses_only_launch_snapshot(tmp_path, monkeyp
     assert run.call_args.kwargs["env"] == {
         "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "GH_TOKEN": token, "GITHUB_TOKEN": token,
         **lease,
+        **expected_retries,
     }
     assert json.loads(run.call_args.kwargs["input"]) == request
     assert run.call_args.kwargs["cwd"] == "/"

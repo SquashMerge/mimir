@@ -127,6 +127,9 @@ class WorklinkEvidence:
     gate_mode: str = "local"
     ci_repair_rounds: int = 0
     ci_checks: tuple[tuple[str, str], ...] = ()
+    builder_lease_wait_s: float = 0.0
+    builder_lease_extension_s: float = 0.0
+    builder_elapsed_s: float = 0.0
     # Commit pushed for this completed attempt. Recovery uses it to detect PR
     # branch updates made after Worklink finished.
     head_sha: str | None = None
@@ -1276,6 +1279,7 @@ async def _run_compute_gate_command(
         backend_config={key: value for key, value in work_spec.backend_config.items()
                         if key not in {"worker_identifier", "worker_projections"}},
         session_request=None,
+        builder_lease_credit=False,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
         timeout_s=min(work_spec.timeout_s, 60) if diagnostic else work_spec.timeout_s,
@@ -1687,6 +1691,8 @@ def shell_gate_environment() -> Iterator[dict[str, str]]:
     the controller's home. This bounds environment inheritance, not filesystem
     access: the local gate still executes repository code as the current uid.
     """
+    from .network_environment import network_retry_environment
+
     with tempfile.TemporaryDirectory(prefix="worklink-gate-home-") as text:
         home = Path(text)
         uid = os.getuid()
@@ -1702,6 +1708,7 @@ def shell_gate_environment() -> Iterator[dict[str, str]]:
         for path in paths.values():
             path.mkdir(parents=True, mode=0o700)
         yield {
+            **network_retry_environment(),
             "USER": username,
             "LOGNAME": username,
             "SHELL": "/bin/sh",
@@ -1717,7 +1724,11 @@ def _run(
     args: Sequence[str] | str, *, cwd: Path | None = None, timeout: float = 1800,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    from .network_environment import network_retry_environment
+
     env = filter_otlp_env(os.environ)
+    for name, value in network_retry_environment().items():
+        env.setdefault(name, value)
     env.pop("MIMIR_MODEL_SPEC", None)
     if isinstance(args, str):
         # Shell syntax supports configured commands and the report env prefix.

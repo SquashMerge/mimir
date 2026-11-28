@@ -6,27 +6,83 @@ deliberately removing its environment or using Python's -I/-S startup bypasses.
 from __future__ import annotations
 
 import os
+import configparser
 from pathlib import Path
+import shlex
 import shutil
 import sys
+import tomllib
 
 from worklink_pytest_args import pytest_arguments
 
 
-def single_node(arguments: list[str]) -> bool:
-    # Unknown options (including -n, --pyargs, response files, repeats, option
-    # values and extra paths) conservatively take the lease. PYTEST_ADDOPTS can
-    # expand even a single node into distributed/repeated work.
-    if os.environ.get("PYTEST_ADDOPTS"):
+def configured_options(arguments: list[str]) -> list[str]:
+    """Account for xdist/repeat options inherited from repository configuration."""
+    override = None
+    for index, arg in enumerate(arguments[:-1]):
+        if arg in {"-o", "--override-ini"} and arguments[index + 1].startswith("addopts="):
+            override = arguments[index + 1].split("=", 1)[1]
+    if override is not None:
+        return shlex.split(override)
+    for directory in (Path.cwd(), *Path.cwd().parents):
+        for name, section in (("pytest.ini", "pytest"), (".pytest.ini", "pytest"),
+                              ("pyproject.toml", ""), ("tox.ini", "pytest"), ("setup.cfg", "tool:pytest")):
+            path = directory / name
+            if not path.is_file():
+                continue
+            if not section:
+                options = tomllib.loads(path.read_text()).get("tool", {}).get("pytest", {}).get("ini_options")
+                if options is not None:
+                    return shlex.split(options.get("addopts", ""))
+            else:
+                config = configparser.ConfigParser(interpolation=None)
+                config.read(path)
+                if config.has_section(section) or name in {"pytest.ini", ".pytest.ini"}:
+                    return shlex.split(config.get(section, "addopts", fallback=""))
+    return []
+
+
+def focused_run(arguments: list[str]) -> bool:
+    """One/few files or a -k selection, never xdist/repeats/unknown options."""
+    try:
+        options = configured_options(arguments) + shlex.split(os.environ.get("PYTEST_ADDOPTS", "")) + arguments
+    except (OSError, ValueError, configparser.Error):
         return False
-    nodes = [arg for arg in arguments if arg not in {"-q", "-v", "-s", "-x"}]
-    return (len(nodes) == 1 and not nodes[0].startswith("-")
-            and ".py::" in nodes[0] and nodes[0].split("::")[-1].startswith("test_"))
+    files = 0
+    directories = 0
+    selection = False
+    index = 0
+    while index < len(options):
+        arg = options[index]
+        index += 1
+        if arg in {"-q", "-v", "-vv", "-s", "-x", "-ra", "--disable-warnings", "--no-header", "--no-summary"}:
+            continue
+        if arg in {"-k", "-o", "--override-ini", "--junitxml", "--junit-xml", "--basetemp", "--tb", "--capture"}:
+            if index == len(options):
+                return False
+            value = options[index]
+            index += 1
+            if arg == "-k":
+                if not value.strip():
+                    return False
+                selection = True
+            elif arg in {"-o", "--override-ini"} and not value.startswith(("addopts=", "junit_family=")):
+                return False
+            continue
+        if arg.startswith(("--junitxml=", "--junit-xml=", "--basetemp=", "--tb=", "--capture=")):
+            continue
+        if arg.startswith("-") or arg.startswith("@"):
+            return False
+        if arg.split("::")[0].endswith(".py"):
+            files += 1
+        else:
+            directories += 1
+    return files <= 5 and (selection or (files > 0 and directories == 0))
 
 
 def enforce(command: list[str], arguments: list[str]) -> None:
     if (not os.environ.get("MIMIR_HEAVY_LOCK_FILE")
-            or os.environ.get("MIMIR_HEAVY_LOCK_HELD") or single_node(arguments)):
+            or os.environ.get("MIMIR_HEAVY_LOCK_HELD") or focused_run(arguments)):
         return
     helper = Path(__file__).resolve().parents[1] / "heavy_run.sh"
     environment = {**os.environ, "MIMIR_HEAVY_TIER": "medium"}

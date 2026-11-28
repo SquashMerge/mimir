@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 
 import pytest
@@ -152,6 +154,7 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
         timeout_s: int = 5
         backend_config: dict | None = None
         factory_credential_settings: tuple[tuple[str, str], ...] = ()
+        builder_lease_credit: bool = False
 
     class Backend:
         name = "opencode"
@@ -165,6 +168,8 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
 
     class Compute:
         async def launch(self, spec):
+            # CI repair builders receive the same queue-time credit as initial builds.
+            assert spec.builder_lease_credit is True
             return LaunchHandle("local_subprocess", "42")
 
         async def wait(self, handle, timeout):
@@ -243,6 +248,208 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
         assert "reviewer" in result.reason and "not trusted" in result.reason
     if scenario in ("closed", "merged"):
         assert "closed or merged" in result.reason
+
+
+@pytest.mark.parametrize("staged_metadata", [False, True])
+@pytest.mark.parametrize("other_leftover", [False, True])
+@pytest.mark.asyncio
+async def test_ci_repair_consumes_publication_files_before_real_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    staged_metadata: bool, other_leftover: bool,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(checkout), *args],
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    git("config", "commit.gpgsign", "false")
+    git("config", "remote.origin.url", "https://github.com/acme/widget.git")
+    (checkout / "fix.py").write_text("version = 0\n")
+    git("add", "fix.py")
+    git("commit", "-qm", "Base")
+    base = git("rev-parse", "HEAD")
+    forge = Forge({})
+    pushed = []
+    opened = []
+    interpretations = []
+    committed_paths = []
+
+    def runner(args, **kwargs):
+        if args[0] == "git":
+            # Only the forge is fake: staging, commit and cleanliness use Git.
+            if args[3] == "push":
+                forge.head = git("rev-parse", "HEAD")
+                pushed.append(forge.head)
+                return subprocess.CompletedProcess(args, 0, "", "")
+            result = subprocess.run(
+                args, capture_output=True, text=kwargs.get("text", True), timeout=30,
+            )
+            if args[3] == "commit" and result.returncode == 0:
+                committed_paths.append(git("show", "--format=", "--name-only", "HEAD").splitlines())
+                if other_leftover and len(committed_paths) == 2:
+                    # Model a post-commit hook/byproduct: not part of the
+                    # selected repair diff, and never eligible for exclusion.
+                    (checkout / "unexpected.txt").write_text("must block publication\n")
+            return result
+        if args[:3] == ["gh", "pr", "create"]:
+            opened.append(args)
+            forge.body = args[args.index("--body") + 1]
+            return subprocess.CompletedProcess(args, 0, PR + "\n", "")
+        return forge(args, **kwargs)
+
+    @dataclass(frozen=True)
+    class Spec:
+        repo_url: str = "https://github.com/acme/widget.git"
+        base_ref: str = "main"
+        timeout_s: int = 5
+        backend_config: dict | None = None
+        factory_credential_settings: tuple[tuple[str, str], ...] = ()
+        builder_lease_credit: bool = False
+
+    class Backend:
+        name = "opencode"
+
+        def work_spec(self, order, **kwargs):
+            return Spec(backend_config={"test_env": {}})
+
+        async def interpret(self, order, result):
+            interpretations.append(order)
+            version = len(interpretations)
+            (checkout / "fix.py").write_text(f"version = {version}\n")
+            (checkout / ".worklink-commit-subject").write_text(
+                "Original subject\n" if version == 1 else "Repair supplied subject\n"
+            )
+            (checkout / ".worklink-pr-body.md").write_text(
+                "Original build summary" if version == 1 else "Repair supplied summary"
+            )
+            if staged_metadata:
+                git("add", ".worklink-commit-subject", ".worklink-pr-body.md")
+            return RawResult(0, None, "success", None)
+
+    class Compute:
+        async def launch(self, spec):
+            return LaunchHandle("local_subprocess", "42")
+
+        async def wait(self, handle, timeout):
+            return ComputeResult(0, "", "")
+
+        async def cleanup(self, handle):
+            pass
+
+    started = datetime.now(UTC)
+    claim = ClaimRecord(2050, 1, "agent", started)
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=runner)
+    lease = CheckoutLease(2050, 1, checkout, checkout, "issue/2050-a1", base)
+
+    async def observe(**kwargs):
+        return validate_evidence(WorklinkEvidence(
+            issue=2050, attempt=1, backend="opencode", branch=lease.branch, checkout=str(checkout),
+            started_at=started.isoformat(), finished_at=started.isoformat(), files_changed=["fix.py"],
+            diff_stat="1 file", commands=[], tests=None, pr_url=None, status="completed",
+            gate_mode="ci", diff_observed=True,
+        ))
+
+    async def wait_for_ci(*args, **kwargs):
+        # Exercise consumption before *each* repair, not just the first one.
+        return ci_gate.CIResult(
+            "red" if len(pushed) < 3 else "green", "test failed",
+            checks=(("tests", "failure" if len(pushed) < 3 else "success"),),
+        )
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observe)
+    monkeypatch.setattr(orchestrator, "wait_for_ci", wait_for_ci)
+    monkeypatch.setattr(orchestrator, "_with_outside_checkout_detection", lambda value, **kw: value)
+    monkeypatch.setattr(orchestrator, "_persist_run_state", lambda *a, **kw: None)
+    monkeypatch.setattr(orchestrator, "_cleanup_checkout_after_transition", lambda *a, **kw: None)
+    config = WorklinkConfig(defaults=WorklinkDefaults(max_ci_repair_rounds=2))
+    result = await orchestrator.WorklinkRunner(home=tmp_path, repo=checkout)._finalize(
+        issue=orchestrator.IssueContext(2050, "Fallback title", "body", set()),
+        claims=claims, claim_record=claim, attempt=1, config=config,
+        backend=Backend(), compute=Compute(), compute_result=ComputeResult(0, "", ""),
+        order=WorkOrder(issue_id=2050, checkout=checkout, prompt="fix", rules=None, timeout_s=5),
+        lease=lease, spec=Spec(backend_config={"test_env": {}}), started=started,
+        test_cmd=None, root_dirty_before=(), runner=runner,
+        terminal_release=orchestrator._TerminalClaimRelease(claims, home=tmp_path, issue_id=2050, attempt=1),
+        gate_mode="ci",
+    )
+    assert result.status == ("blocked" if other_leftover else "completed"), result.reason
+    assert result.review_ready is (not other_leftover)
+    assert forge.ready is (not other_leftover)
+    assert len(pushed) == (1 if other_leftover else 3)
+    assert len(interpretations) == (2 if other_leftover else 3)
+    assert committed_paths == [["fix.py"]] * len(interpretations)
+    assert git("log", f"{base}..HEAD", "--format=%s").splitlines() == [
+        "Original subject"
+    ] * len(interpretations)
+    for name in (".worklink-commit-subject", ".worklink-pr-body.md"):
+        assert not (checkout / name).exists()
+        assert not git("log", "--format=%H", "--all", "--", name)
+    assert len(opened) == 1 and "--draft" in opened[0]
+    assert opened[0][opened[0].index("--title") + 1] == "Original subject"
+    assert "Build summary:\n\nOriginal build summary" in forge.body
+    assert "Repair supplied" not in forge.body
+    if other_leftover:
+        assert result.reason == (
+            "CI repair publication failed: checkout still dirty after Worklink commit"
+        )
+        assert git("status", "--porcelain=v1", "--untracked-files=all") == "?? unexpected.txt"
+    else:
+        assert not git("status", "--porcelain=v1", "--untracked-files=all")
+        assert json.loads(result.evidence_path.read_text())["ci_repair_rounds"] == 2
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "oversized"])
+@pytest.mark.parametrize("name", [".worklink-commit-subject", ".worklink-pr-body.md"])
+def test_repair_publication_readers_are_bounded_regular_and_no_follow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, kind: str,
+) -> None:
+    is_subject = name == ".worklink-commit-subject"
+    limit = (
+        orchestrator._COMMIT_SUBJECT_MAX_BYTES if is_subject
+        else orchestrator._PR_BODY_SECTION_MAX_BYTES
+    )
+    path = tmp_path / name
+    target = tmp_path / "target"
+    target.write_text("Must not follow this target")
+    if kind == "symlink":
+        path.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(path)
+    else:
+        path.write_bytes(b"x" * (limit * 2))
+    read = os.read
+    reads = []
+
+    def bounded_regular_read(fd, count):
+        assert stat.S_ISREG(os.fstat(fd).st_mode), "non-regular publication file was read"
+        assert count <= limit + 1, "publication read exceeded its bound"
+        reads.append(count)
+        return read(fd, count)
+
+    monkeypatch.setattr(os, "read", bounded_regular_read)
+    value = (
+        orchestrator._read_commit_subject(tmp_path, "Original subject")
+        if is_subject else orchestrator._read_pr_body_section(tmp_path)
+    )
+    if kind == "oversized":
+        assert reads == [limit + 1]
+        if is_subject:
+            assert value == "Original subject"
+        else:
+            assert len(value.encode("utf-8")) <= limit
+            assert value.endswith("[Build summary truncated by Worklink.]")
+    else:
+        assert reads == []
+        assert value == ("Original subject" if is_subject else None)
+    assert not path.exists() and not path.is_symlink()
+    assert target.read_text() == "Must not follow this target"
 
 
 def test_ci_gate_inventory_and_defaults(tmp_path: Path) -> None:

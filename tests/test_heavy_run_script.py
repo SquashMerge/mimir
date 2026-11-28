@@ -26,6 +26,9 @@ TIMEOUT_HELPER = Path(__file__).with_name("heavy_timeout.py")
 
 @pytest.fixture(autouse=True)
 def _hermetic_tools(tmp_path: Path, monkeypatch) -> None:
+    # These tests own their lease, not an enclosing Worklink builder's relay.
+    monkeypatch.delenv("WORKLINK_LEASE_SOCKET", raising=False)
+    monkeypatch.delenv("WORKLINK_LEASE_AUTH", raising=False)
     # Exercise every lease test as on a macOS runner without coreutils. Only
     # ordinary POSIX utilities needed by the wrapper/payloads are available.
     bindir = tmp_path / "posix-bin"

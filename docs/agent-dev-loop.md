@@ -542,7 +542,7 @@ Each rule below exists because breaking it once cost a bad merge, a false diagno
 1. **Any concern means request changes.** No "approve with nits". The builder fixes nits as cheaply as blockers, and an approval ends the loop.
 2. **Mutation-test every guard.** Revert or invert each fail-closed branch and confirm a *named* test fails. Untested guards are the most common finding. Check that the mutation actually hit the code path; a mis-aimed mutation looks like a pass.
 3. **Range-diff every re-review.** Run `git range-diff <old-base>...<old-head> <new-base>...<new-head>`. The builder's first push after a review is often only a rebase. If so, request changes again in two lines and skip the expensive checks.
-4. **The full suite, merged into current main, is the evidence.** A scoped run is not. A test that passes alone and fails in the full run is leaking ambient state (environment variables, `sys.modules`, event-loop tasks); it isn't flaky.
+4. **The full suite, merged into current main, is the evidence.** For Worklink issue builds, run focused tests locally (directly, without xdist or the heavy lease); PR CI runs both full-suite legs and all checks. Keep the PR draft until CI is green. A test that passes alone and fails in the full run is leaking ambient state (environment variables, `sys.modules`, event-loop tasks); it isn't flaky.
 5. **Live-check what mocks can hide.** Fakes encode yesterday's API. Example: a dependency renamed `inputSchema` to `input_schema`. 107 mocked tests stayed green while every real server's tools vanished. When a change touches an external boundary, run the real thing once per review.
 
 **Merge**

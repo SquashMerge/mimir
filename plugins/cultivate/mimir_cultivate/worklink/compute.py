@@ -31,6 +31,7 @@ from ..contained_execution import (
 )
 from .backends.base import LaunchHandle, SessionRequest, SessionOutcome, SessionError, SessionTransportLostError
 from .execution_policy import ExecutionPolicy, home_projection_documents
+from .lease_wait import BuilderLeaseCompute
 
 if TYPE_CHECKING:
     from .worker_client import CheckoutCapability, WorkerClient
@@ -76,6 +77,7 @@ class WorkSpec:
     factory_credential_settings: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     session_request: SessionRequest | None = None
     execution: ExecutionPolicy = field(default_factory=ExecutionPolicy)
+    builder_lease_credit: bool = False
 
 
 def with_worker_environment(
@@ -130,6 +132,7 @@ class ComputeResult:
     lease_wait_timed_out: bool = False
     lease_wait_s: float = 0.0
     run_duration_s: float = 0.0
+    lease_extension_s: float = 0.0
 
 
 class ComputeLaunchError(RuntimeError):
@@ -188,7 +191,7 @@ async def admit_session(client: WorkerClient, request: SessionRequest, **kwargs:
 _OBSERVE_INTERVAL_CAP_S = 2.0
 
 
-class OpenCodeDaemonComputeBackend:
+class OpenCodeDaemonComputeBackend(BuilderLeaseCompute):
     """Session identity and authoritative outcomes, not helper PIDs or exits."""
 
     name = "opencode_daemon"
@@ -235,7 +238,7 @@ class OpenCodeDaemonComputeBackend:
         if isinstance(self._client, WorkerClient) and self._client.path_checkout is not None:
             self._bind_on_launch = True
 
-    async def launch(self, spec: WorkSpec) -> LaunchHandle:
+    async def _launch(self, spec: WorkSpec) -> LaunchHandle:
         from .backends.base import SessionAdmissionCancelled, SessionAdmissionError
         if spec.session_request is None:
             raise ComputeLaunchError("daemon compute requires a typed session request")
@@ -295,7 +298,7 @@ class OpenCodeDaemonComputeBackend:
         self._deadlines[handle.identifier] = deadline
         return handle
 
-    async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+    async def _wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
         deadline = self._deadlines.get(handle.identifier, float("inf"))
         remaining = deadline - asyncio.get_running_loop().time()
         try:
@@ -385,7 +388,7 @@ class OpenCodeDaemonComputeBackend:
             raise ComputeCleanupError(handle, str(exc)) from exc
         self._quiescent.add(handle.identifier)
 
-    async def cleanup(self, handle: LaunchHandle) -> None:
+    async def _cleanup(self, handle: LaunchHandle) -> None:
         try:
             await self._client.session_release(handle)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -485,7 +488,9 @@ def _local_child_env() -> dict[str, str]:
     Infra vars + provider-credential families from the parent process; nothing
     else (no bridge/operator secrets). Mirrors ``tools.registry`` spawn-env
     philosophy on the worklink compute path."""
-    env: dict[str, str] = _heavy_lock_environment()
+    from .network_environment import network_retry_environment
+
+    env: dict[str, str] = {**_heavy_lock_environment(), **network_retry_environment()}
     for key in _LOCAL_ENV_INFRA:
         val = os.environ.get(key)
         if val is not None:
@@ -632,6 +637,10 @@ def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
         from .pytest_environment import pytest_session_environment
 
         env.update(pytest_session_environment(env["PATH"]))
+    from .network_environment import network_retry_environment
+
+    for name, value in network_retry_environment().items():
+        env.setdefault(name, value)
     return filter_otlp_env(env)
 
 
@@ -677,7 +686,7 @@ class _PathCheckoutCapability:
 
 
 @dataclass
-class LocalSubprocessComputeBackend:
+class LocalSubprocessComputeBackend(BuilderLeaseCompute):
     """Run a WorkSpec as a local subprocess in the current container."""
 
     name: str = "local_subprocess"
@@ -741,7 +750,7 @@ class LocalSubprocessComputeBackend:
     def worker_executor_process_epoch(self, handle: LaunchHandle) -> str | None:
         return self._executor_process_epochs.get(handle.identifier)
 
-    async def launch(self, spec: WorkSpec) -> LaunchHandle:
+    async def _launch(self, spec: WorkSpec) -> LaunchHandle:
         if spec.local_checkout is None:
             raise ComputeLaunchError("local_subprocess requires spec.local_checkout")
         if spec.local_argv is None:
@@ -1022,7 +1031,7 @@ class LocalSubprocessComputeBackend:
             raise asyncio.CancelledError
         return handle
 
-    async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+    async def _wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
         job, _spec, command = self._job(handle)
         stdout_path, stderr_path = self._output_files.get(handle.identifier, (None, None))
         if isinstance(job, asyncio.Task):
@@ -1162,7 +1171,7 @@ class LocalSubprocessComputeBackend:
             return
         await _kill_process_group(proc)
 
-    async def cleanup(self, handle: LaunchHandle) -> None:
+    async def _cleanup(self, handle: LaunchHandle) -> None:
         known = self._handles.get(handle.identifier)
         if known is not None and known != handle:
             raise KeyError(f"unknown {self.name} handle: {handle.identifier}")

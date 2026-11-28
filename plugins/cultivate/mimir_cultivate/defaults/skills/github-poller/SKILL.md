@@ -247,10 +247,21 @@ For each repo in `GITHUB_REPOS`:
 ### CI remediation scope
 
 Classify before editing: call `repo_diff(mode='base', failing_test=<test path>,
-imported_modules=<repo-relative module paths imported by that test>)` against
+imported_modules=<repo-relative module paths imported by that test>,
+inputs=<repo-relative data/config/fixture/resource files read by that test>)` against
 the published PR diff. Remediate when the failing test or an imported module is
-in the PR's changed paths. When both the failing test and its imported modules
-are outside those paths, report the unrelated failure using `pr_comment` or
+in the PR's changed paths, or any `inputs` file is changed there. All evidence
+paths must be repository-relative without traversal; local drafts never count.
+A trusted collaborator can authorize an otherwise out-of-diff repair with a
+whole PR comment `WORKLINK_REMEDIATION_SCOPE {"head": "<full sha>",
+"paths": ["tests/test_x.py"], "reason": "why this repair is needed"}`.
+Call the classifier again with `paths=<exact intended edit paths>` (defaults to
+the failing test only). Every requested path must be listed literally; no globs
+or traversal. The tool attests the author using forge-trust rules, checks the
+current live head, logs authorization and returns `authorized_by` and
+`matched_paths`. Edit only those exact authorized paths. Stale-head, untrusted,
+or malformed markers never widen scope. Without changed evidence or exact
+authorization, report the unrelated failure using `pr_comment` or
 operator escalation and leave the PR unchanged. Report insufficient evidence
 rather than drafting a speculative fix. A green rerun ends investigation.
 

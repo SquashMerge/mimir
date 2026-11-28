@@ -19,15 +19,21 @@ Use them unmodified: never recolour, trace, crop or retype the logos or wordmark
 
 ## Evidence
 
-**Run both suites, and require both green.** A scoped run is not evidence:
+**Worklink issue builds run focused tests locally.** PR CI (both legs, all
+checks) supplies full-suite evidence; a draft PR is not ready for review until
+CI is green. Do not run the whole suite locally for a regular issue build.
 
 ```bash
-sh scripts/heavy_run.sh uv run pytest -q tests/test_<file>.py  # the file you touched
-sh scripts/heavy_run.sh uv run pytest -q               # the whole suite
+uv run env PYTEST_ADDOPTS='' pytest -o addopts='' -q tests/test_<file>.py
+uv run env PYTEST_ADDOPTS='' pytest -o addopts='' -q tests/test_one.py tests/test_two.py -k selection
+# Only when a local full-suite run is explicitly required (not Worklink CI mode):
+sh scripts/heavy_run.sh uv run pytest -q
 ```
 
-Run any pytest invocation beyond a single test (several files, `-n`, or loops),
-and every heavy command, through `scripts/heavy_run.sh`. When the
+Run focused tests directly: one or a few files or `-k` selections, without `-n`.
+Clear inherited xdist options as in the examples (this repo defaults to `-n auto`).
+Run the whole suite, any `-n`/xdist run, loops, timing-sensitive runs, and other
+heavy commands (Docker, builds) through `scripts/heavy_run.sh`. When the
 host shares a heavy-run lease (`MIMIR_HEAVY_LOCK_FILE` is set; Worklink passes it
 to builders and gates), it waits for other agents' heavy runs instead of competing
 with them for CPU; when it is unset, it runs the command directly.
@@ -49,6 +55,15 @@ review, re-run it on the unmodified base and compare the dependency pin.
 **Never `uv run` or `uv sync` against a live deployment checkout.** In a sandbox
 or worktree it is correct and expected. Against a running deployment it recreates
 the venv underneath the live process. Use `.venv/bin/python` directly there.
+
+### Factory runs: targeted acceptance tests only
+
+For feature-factory runs, the test-verifier at Gate 3 runs only the targeted
+acceptance tests, directly, without `-n` or `scripts/heavy_run.sh`. Do not run the
+full suite locally. This overrides the local full-suite evidence rules above and
+in CONTRIBUTING.md: leave full-suite evidence to integration `verify` (CI) and
+the PR's own CI. If CI verify is unavailable (exit 75), pause; never fall back to
+the local heavy run.
 
 ## Reading outside the diff
 
@@ -97,9 +112,10 @@ Compare against `headRefOid`. `dismiss_stale_reviews` handles this for approvals
 `main`, but it dismisses **approvals only** — a `CHANGES_REQUESTED` still carries
 forward onto a head it never saw, and branches without protection get neither.
 
-**Do not open a PR whose integrated suite is red**, even when every scoped command
-passed. If the full suite fails, that is the finding; publish nothing until it is
-green or the failure is understood and stated in the PR body.
+**Do not mark a PR ready for review whose integrated suite is red**, even when
+every focused command passed. Worklink issue builds run focused tests locally
+and publish a draft PR; PR CI (both legs, all checks) is the full-suite evidence.
+Keep the PR draft and repair red CI before requesting review.
 
 ## Proving a negative
 

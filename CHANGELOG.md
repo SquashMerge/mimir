@@ -8,6 +8,36 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [1.0.0rc9] — 2026-11-27
+
+- Validate Cultivate deployment upgrades before writing files, restore setup-owned files on failure, and accept case-only GitHub repository differences.
+
+- Retry transient Worklink base-fetch network failures with bounded backoff, release them without consuming a build attempt or raising an operator incident, and cap repeated deferrals.
+
+- Bound Worklink gate snapshot reads and fingerprint unreadable build artifacts from metadata; preserve readable attempt work while reporting omitted unreadable untracked files.
+
+- Fix home commit secret scans falsely rejecting hyphenated branch names containing `pa-`, while retaining bare provider key detection (#2224).
+
+- Worklink runs focused tests without the heavy lease, credits authenticated lease queue time against builder deadlines, and retries bounded queue-dominated timeouts without spending build attempts.
+
+- Retry transient GitHub reads while waiting for Worklink CI, bounded by ten consecutive failures and the CI wait timeout; report the unwatched PR and head if observation fails.
+
+- Tolerate bounded GitHub PR head propagation lag after Worklink CI repair pushes without weakening foreign-head detection.
+
+- Cultivate Rust setups now install checksum-pinned sccache and share a private, worker-owned compiler cache across Worklink attempts and evidence gates. Use `--sccache-cache-size` to change the default 20G cap or `--no-sccache` to opt out.
+
+- Add operator-owned `worklink.local.yaml` tuning, `mimir worklink config-describe`, and audited per-leaf `grant-attempt` credits without editing setup-generated configuration or raising the global retry limit.
+
+- Add `mimir worklink release-publication <issue> --attempt <n> --reason <text>` to release an audited, forge-verified closed-unmerged PR so a re-armed leaf can publish again.
+
+- CI remediation now recognizes changed data inputs and trusted, exact-path operator authorization bound to the current PR head.
+
+- Cultivate Rust setups allow Worklink builders to run focused tests with `cargo nextest run *` and `cargo test *`, so builders can check their changes without the full verify lane (#2232).
+
+- Exclude PR-lease draft snapshots (`state/pr-lease-drafts/`) from the agent home repository, so recoverable local drafts are never committed or pushed (#2225).
+
+- Pin feature-factory, opencode2-feature-factory and claude-code-feature-factory to exactly 0.14.3 across container installs, daemon configuration and admission checks. This enables a later adoption of CI-backed `verify_unavailable_exit` and `verify_scope` configuration without changing `.factory.json` here.
+
 ## [1.0.0rc8] — 2026-11-26
 
 - Treat Chainlink's recognised empty ready-queue text as a successful read so Worklink no longer reports degraded on idle cycles; retain degraded reporting for failed or unrecognised reads.
