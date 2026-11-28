@@ -2404,6 +2404,12 @@ class WorklinkRunner:
                     executor_failed = raw.exit_code != 0
                     backend_reported_failure = raw.backend_status not in {"success", "blocked"}
                     spec = repair_spec
+                    # Keep the original commit subject and PR narrative. Consume
+                    # and discard repair metadata with the same bounded,
+                    # no-follow readers used for first publication, before it
+                    # can enter the observed diff or survive the clean check.
+                    _read_pr_body_section(lease.path)
+                    _read_commit_subject(lease.path, issue.title, issue_id=issue.issue_id)
                     builder_paths.clear()
                     gate_excluded.clear()
                     validation = await _observe()

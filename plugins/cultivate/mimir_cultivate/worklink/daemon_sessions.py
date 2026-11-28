@@ -173,7 +173,7 @@ class ControllerRecord:
             raise ValueError("inconsistent session controller state")
 
 
-def session_permissions(request: SessionRequest) -> list[dict[str, str]]:
+def session_permissions(request: SessionRequest, *, jobs_enabled: bool = False) -> list[dict[str, str]]:
     # Native subagents inherit this ruleset (Session.create), after agent rules.
     # Headless sessions must report decisions to their caller, never open a form.
     rules = [{"action": "external_directory", "resource": "*", "effect": "deny"},
@@ -183,6 +183,10 @@ def session_permissions(request: SessionRequest) -> list[dict[str, str]]:
             raise ValueError("leaf requires a bounded shell allowlist")
         rules.append({"action": "shell", "resource": "*", "effect": "deny"})
         rules.extend({"action": "shell", "resource": rule, "effect": "allow"} for rule in request.shell_allowlist)
+        # Installed helper checks payloads against the original rules, not this
+        # transport permission. Apply even to operator-managed configurations.
+        if jobs_enabled:
+            rules.append({"action": "shell", "resource": "worklink-job *", "effect": "allow"})
     elif request.kind == "spawn":
         rules.append({"action": "shell", "resource": "*", "effect": "allow"})
     elif request.kind == "epic":
@@ -312,7 +316,8 @@ class SessionController:
         deadline = int(time.time() * 1000) + timeout_s * 1000
         async with asyncio.timeout(timeout_s):
             response = await client.create_session(directory=str(checkout), model=request.model,
-                                                   permissions=session_permissions(request),
+                                                   permissions=session_permissions(
+                                                       request, jobs_enabled="HOME" in environment),
                                                    **({"agent": request.agent} if request.agent is not None else {}))
         sid = response["data"]["id"]
         record = ControllerRecord(1, str(uuid.uuid4()), issue_id, attempt, request.kind, sid,
@@ -329,6 +334,14 @@ class SessionController:
             if len(messages) > 16 or inbox or any(m.get("type") == "user" for m in messages) or controller.record.execution_state != "pending":
                 raise DaemonClientError("session is not fresh")
             controller._persist(baseline_message_ids=[m["id"] for m in messages])
+            # A job service requires the executor's private session home. Small
+            # protocol-only clients without a home do not expose this facility.
+            if request.kind == "leaf" and "HOME" in environment:
+                from .jobs import start_service
+                environment.update(await start_service(
+                    path, sid, policy=list(request.shell_allowlist), checkout=checkout,
+                    environment=environment, deadline_ms=deadline,
+                ))
             await controller._bounded(client.set_environment(sid, environment))
         except TimeoutError:
             await controller.cancel()
@@ -622,7 +635,9 @@ class SessionController:
             raise DaemonClientError("unowned input in fresh session")
         if users and not self.record.input_id:
             self._persist(input_id=next(iter(users)), admission_state="admitted")
-        state = self._execution_state(messages, inbox, self._shells, stable=stable)
+        from .jobs import session_jobs
+        jobs_active = await session_jobs(self.path, self.record.opencode_session_id)
+        state = self._execution_state(messages, inbox, self._shells, stable=stable and not jobs_active)
         if state != self.record.execution_state:
             self._persist(execution_state=state)
         return messages, inbox
@@ -704,6 +719,8 @@ class SessionController:
             try:
                 self._persist(stop_requested=True, cancellation_state="requested")
                 async with asyncio.timeout(min(timeout_s, 25)):
+                    from .jobs import session_jobs
+                    await session_jobs(self.path, self.record.opencode_session_id, close=True)
                     while True:
                         try:
                             tree_clean = (await self._cancel_epic_shells() if self.record.kind == "epic" else True)
@@ -753,6 +770,10 @@ class SessionController:
             return
         if not await self.cancel():
             raise RuntimeError(self.record.cleanup_error or "session cleanup unverified; retaining controller and checkout")
+        from .jobs import reference_path
+        # Quiescence is now durable in the controller's verified cancellation.
+        # Do not leave a reference to a marker beneath the home we will remove.
+        reference_path(self.path, self.record.opencode_session_id).unlink(missing_ok=True)
         retired_path = self.path.with_name(f"{self.path.stem}.{self.record.opencode_session_id}.retired.json")
         self.path.replace(retired_path)
         self._record_path = retired_path
@@ -802,6 +823,9 @@ class SessionController:
                 raise DaemonClientError("retained_running_shells")
             if self.record.cleanup_processes:
                 raise DaemonClientError("retained_process_cleanup_unverified")
+            from .jobs import session_jobs
+            if await session_jobs(self.path, self.record.opencode_session_id):
+                raise DaemonClientError("retained_running_jobs")
             return tails
 
         self._cancelling = True
@@ -868,6 +892,7 @@ def session_environment(pass_env: object, *, home: Path, git_settings: object,
     from mimir.otel_credentials import is_sensitive_otlp_env
     from ..contained_execution import heavy_lock_environment
     from .compute import _validate_dynamic_worker_name, _validate_worker_value
+    from .network_environment import network_retry_environment
     from .pytest_environment import pytest_session_environment
 
     if not isinstance(pass_env, dict) or len(pass_env) > 128:
@@ -894,6 +919,8 @@ def session_environment(pass_env: object, *, home: Path, git_settings: object,
                 or any(part in name.upper() for part in ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "BASE_URL"))):
             raise ValueError("sensitive session pass_env refused")
         environment[name] = value
+    for name, value in network_retry_environment().items():
+        environment.setdefault(name, value)
     if not isinstance(git_settings, (tuple, list)) or len(git_settings) > 32:
         raise ValueError("invalid session git settings")
     settings = [("safe.directory", str(home)), *git_settings]

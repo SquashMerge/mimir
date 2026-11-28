@@ -1,0 +1,81 @@
+#!/usr/local/bin/python3 -I
+"""Keep sccache's startup socket short without changing the caller's TMPDIR."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+SCCACHE = "/usr/local/libexec/sccache"
+SCCACHE_TMPDIR = "/var/tmp/mimir-sccache"
+
+
+def run_cache(args: list[str]) -> tuple[int, str, bool]:
+    # sccache 0.20.1 creates <TMPDIR>/sccacheXXXXXX/sock even when its
+    # *server* listens on TCP or SCCACHE_SERVER_UDS. Never use the long worker
+    # home here. Setup provisions this short, uid-private directory separately
+    # from the cache. It must outlive a client: the daemon inherits TMPDIR too.
+    metadata = os.lstat(SCCACHE_TMPDIR)
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077):
+        raise PermissionError("sccache temporary directory must be private and worker-owned")
+    env = {**os.environ, "TMPDIR": SCCACHE_TMPDIR}
+    with tempfile.TemporaryFile(dir=SCCACHE_TMPDIR) as errors:
+        result = subprocess.run([SCCACHE, *args], env=env, stderr=errors, check=False)
+        errors.seek(0)
+        # sccache returns the compiler's nonzero status too. Only its own
+        # diagnostic prefix identifies a cache failure; never retry an ordinary
+        # compiler error. Scan all stderr (not just the bounded warning tail),
+        # preserving output once and keeping memory bounded even for long lines.
+        marker = b"\nsccache: error:"
+        overlap = b"\n"
+        cache_failed = False
+        tail = b""
+        while chunk := errors.read(65536):
+            sys.stderr.buffer.write(chunk)
+            window = overlap + chunk
+            cache_failed |= marker in window
+            overlap = window[-(len(marker) - 1):]
+            tail = (tail + chunk)[-1024:]
+        sys.stderr.flush()
+        cause = tail.decode("utf-8", errors="replace").strip()
+    return result.returncode, cause, cache_failed
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    # Administrative commands must retain their actual status, never attempt
+    # to execute an option as a compiler (and never pretend --version worked).
+    compile_request = bool(args) and not args[0].startswith("-")
+    try:
+        status, diagnostics, cache_failed = run_cache(args)
+        if status == 0 or (compile_request and not cache_failed):
+            return status if status >= 0 else 128 - status
+        cause = f"sccache exited with status {status}"
+        if diagnostics:
+            cause += f": {diagnostics}"
+    except OSError as exc:
+        status = 1
+        cause = f"{type(exc).__name__}: {exc}"
+    if not compile_request:
+        print(f"sccache: error: {cause}", file=sys.stderr)
+        return status if status > 0 else 128 - status
+    print(json.dumps({
+        "event": "worklink_sccache_fallback",
+        "level": "warning",
+        "cause": cause,
+        "message": "Compiling without sccache",
+    }), file=sys.stderr, flush=True)
+    # Retry once with the original environment, including the private session
+    # TMPDIR. Do not turn a genuine compiler failure into a successful build.
+    os.execvp(args[0], args)
+    return 1  # exec only returns by raising OSError
+
+
+if __name__ == "__main__":
+    sys.exit(main())
