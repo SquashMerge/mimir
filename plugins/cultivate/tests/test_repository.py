@@ -2583,6 +2583,90 @@ def _lease_start(identifier, started, stderr=b""):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["paths", "node", "explicit", "default", "full_focused"])
+@pytest.mark.parametrize("sccache", [True, False])
+async def test_repo_test_rust_focused_selectors_argv_and_lease(tmp_path, monkeypatch, selection, sccache):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.setup import rust_focused_test_suites, toolchain_test_env
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    root = state.checkout_lease.path
+    (root / 'tests/native_records.rs').write_text('#[test] fn native_records() {}\n')
+    (root / 'tests/other.rs').write_text('#[test] fn other() {}\n')
+    (root / 'tools').mkdir()
+    verify = root / 'tools/verify'
+    verify.write_text('#!/bin/sh\nexit 0\n')
+    verify.chmod(0o755)
+    # Match the deployment's rustup symlink layout, without running host cargo.
+    binaries = tmp_path / 'bin'
+    binaries.mkdir()
+    rustup = binaries / 'rustup'
+    rustup.write_text('#!/bin/sh\nexit 0\n')
+    rustup.chmod(0o755)
+    cargo = binaries / 'cargo'
+    cargo.symlink_to(rustup)
+    monkeypatch.setattr(repository, '_PATH', str(binaries) + ':' + repository._PATH)
+    _configure_test_suites(
+        tmp_path / 'home', state, test_command='./tools/verify',
+        test_suites=rust_focused_test_suites(sccache=sccache),
+    )
+    selectors = {
+        'paths': ('tests/native_records.rs', 'tests/other.rs'),
+        'node': ('tests/native_records.rs::native_records',),
+        'explicit': ('tests/native_records.rs',),
+    }.get(selection, ())
+    suite = 'focused' if selection in {'explicit', 'full_focused'} else None
+    calls = []
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        calls.append((argv, env))
+        leased = argv[0] == 'sh'
+        return CollectedExecutionResult(
+            0, b'ok', _lease_start(kwargs['identifier'], repository.time.monotonic()) if leased else b'',
+            False, False, 0, 0,
+        )
+
+    result = await repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(selectors, suite=suite)
+    assert result.ok and len(calls) == 1
+    argv, env = calls[0]
+    if selectors:
+        assert argv == (str(cargo), 'nextest', 'run', '--locked', *selectors)
+        assert not any(key.startswith('MIMIR_HEAVY_') for key in env)
+    else:
+        assert argv[:2] == ('sh', './scripts/heavy_run.sh')
+        expected = ('./tools/verify',) if selection == 'default' else (
+            str(cargo), 'nextest', 'run', '--locked')
+        assert argv[10:] == expected
+        assert env['MIMIR_HEAVY_LOCK_FILE'] == str(tmp_path / 'heavy.lock')
+    if selection != 'default':
+        for key, value in toolchain_test_env('rust', sccache=sccache).items():
+            assert env[key] == value
+        assert ('RUSTC_WRAPPER' in env) is sccache
+        assert result.suite == 'focused'
+    else:
+        assert result.suite == 'default'
+
+
+@pytest.mark.parametrize("key,value", [
+    ('GITHUB_TOKEN', 'credential'),
+    ('RUSTUP_HOME', '../rustup'),
+    ('CARGO_HOME', '/cache/../controller'),
+    ('RUSTC_WRAPPER', '/arbitrary/wrapper'),
+    ('SCCACHE_DIR', '/cache\ninjection'),
+    ('SCCACHE_CACHE_SIZE', 'unbounded'),
+])
+def test_repo_test_rust_suite_environment_fails_closed(key, value):
+    from mimir_cultivate.setup import rust_focused_test_suites
+
+    suites = rust_focused_test_suites()
+    suites[0]['legs'][0]['env'][key] = value
+    with pytest.raises(ValueError):
+        repository._parse_test_suites(suites, 'test_suites', './tools/verify')
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["create", "acquire", "recover", "rebind", "queue", "checkout"])
 @pytest.mark.parametrize("fresh_scope", [False, True])
 async def test_repo_test_pending_blocks_lease_lifecycle_without_mutation(

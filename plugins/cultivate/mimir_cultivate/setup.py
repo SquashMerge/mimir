@@ -1194,6 +1194,21 @@ def toolchain_test_env(kind: str, *, sccache: bool = True,
     return env
 
 
+def rust_focused_test_suites(*, sccache: bool = True,
+                            sccache_cache_size: str = DEFAULT_SCCACHE_CACHE_SIZE) -> list[dict]:
+    """Keep selector arguments away from the repository's full verification script."""
+    return [{
+        'name': 'focused',
+        'selector_prefixes': ['src/', 'tests/', 'crates/'],
+        'selector_suffixes': ['.rs'],
+        'legs': [{
+            'name': 'nextest', 'command': 'cargo nextest run --locked',
+            'env': toolchain_test_env('rust', sccache=sccache,
+                                      sccache_cache_size=sccache_cache_size),
+        }],
+    }]
+
+
 def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
                         git_auth: list[str], force: bool = False,
                         toolchain: str | None = None, tracker: dict | None = None,
@@ -2483,7 +2498,7 @@ from mimir.identities import hash_web_key
 from mimir.plugins.skills import (resolve_skill, selected_skills, install_skill, skill_state, skill_inventory,
                                    previous_skill_inventories, upgrade_command)
 from mimir.skill_install import _file_hashes
-from mimir_cultivate.setup import _provision_saga, _provision_worklink
+from mimir_cultivate.setup import _provision_saga, _provision_worklink, rust_focused_test_suites
 
 m = json.loads(Path('/opt/cultivate-manifest.json').read_text())
 changed = False
@@ -2535,9 +2550,12 @@ entry = {'slug': m['slug'], 'root': str(repo), 'mode': 'rw', 'origin': origin,
            'worklink_base': str(base)}
 rows = config.setdefault('repositories', [])
 old = next((r for r in rows if r.get('slug') == m['slug']), None)
+if m.get('toolchain') == 'rust' and (old is None or 'test_suites' not in old):
+    entry['test_suites'] = rust_focused_test_suites(
+        sccache=m.get('sccache', True), sccache_cache_size=m.get('sccache_cache_size', '20G'))
 # Back-fill only fields absent from an otherwise identical legacy declaration.
 # Explicit values (including the gate mode) are never silently replaced.
-optional = {'worklink_base', 'review_tests', 'auto_review', 'worklink_gate', 'quick_gate_command'}
+optional = {'worklink_base', 'review_tests', 'auto_review', 'worklink_gate', 'quick_gate_command', 'test_suites'}
 if old is not None and set(entry) - set(old) <= optional and all(old[k] == entry[k] for k in old.keys() & entry.keys()):
     missing = {k: v for k, v in entry.items() if k not in old}
     old.update(missing)

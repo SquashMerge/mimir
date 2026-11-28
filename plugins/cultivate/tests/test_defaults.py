@@ -26,8 +26,8 @@ NAMES = {
     "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
-GITHUB_POLLER_RELEASE = "2235-ci-remediation-scope"
-CI_WATCH_RELEASE = "2235-ci-remediation-scope"
+GITHUB_POLLER_RELEASE = "2247-rust-focused-tests"
+CI_WATCH_RELEASE = "2247-rust-focused-tests"
 
 # The identity cleanup from #2024 is integrated; no exceptions are allowed.
 IDENTITY_EXCEPTIONS: dict[str, set[str]] = {}
@@ -136,6 +136,16 @@ def test_ci_remediation_guidance_reports_unrelated_failures():
         assert "report the unrelated" in text
         assert "leave the PR unchanged" in text
     assert "report unrelated failures" in repo_checkout.description
+
+
+@pytest.mark.parametrize("name", ["github-poller", "github-ci-watch"])
+def test_rust_remediation_uses_focused_suite(name):
+    text = " ".join((SKILLS / name / "SKILL.md").read_text().split())
+    assert 'suite="focused"' in text
+    assert "cargo nextest run --locked" in text
+    assert "without the heavy lease" in text
+    assert "./tools/verify" in text
+    assert "shell `cargo test`" in text
 
 
 def test_current_tracker_poller_release_inventory_is_complete():

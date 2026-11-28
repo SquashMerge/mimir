@@ -172,6 +172,13 @@ For each repo in `GITHUB_REPOS`:
   For changes-requested remediation, read the latest review, inline, and PR
   comments on the bound PR. Honour explicit reviewer publication instructions
   ("push", "CI is the gate") on the next turn, subject to passing scoped tests.
+  For setup-managed Rust repositories, use `repo_test` with `suite="focused"`
+  and diff-related Rust selectors (for example `tests/native_records.rs` or
+  `tests/native_records.rs::test_name`). This runs `cargo nextest run --locked`
+  without the heavy lease; selectors are validated as checkout-relative paths/node
+  ids and passed as nextest arguments. Do not fall back to shell `cargo test`.
+  Without selectors, omit the suite to run the configured default (`./tools/verify`
+  when configured); do not pass selectors to that full-verification script.
   Attempt the full suite, but a full-suite `repo_test` `test_timeout` or
   infrastructure refusal (snapshot unavailable, runner unavailable) is NOT a
   publication blocker. Only a completed failing full-suite run with counts

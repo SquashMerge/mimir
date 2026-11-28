@@ -28,6 +28,9 @@ class RepositoryTestLeg:
 
 _TEST_LEG_ENV_NAMES = frozenset({"MIMIR_PLUGINS", "MIMIR_ACCESS_CONTROL_ENFORCED"})
 _TEST_LEG_ENV_VALUE = re.compile(r"[A-Za-z0-9_,.-]{0,64}", re.ASCII)
+_RUST_TEST_LEG_ENV_NAMES = frozenset({
+    "RUSTUP_HOME", "CARGO_HOME", "RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE",
+})
 
 
 @dataclass(frozen=True)
@@ -254,11 +257,17 @@ def _parse_test_suites(
                     raise ValueError(f"{leg_label}.command must be a non-empty string")
                 leg_env = entry.get("env", {})
                 if not isinstance(leg_env, dict) or any(
-                    not isinstance(key, str) or key not in _TEST_LEG_ENV_NAMES
-                    or not isinstance(value, str) or _TEST_LEG_ENV_VALUE.fullmatch(value) is None
+                    not isinstance(key, str)
+                    or key not in _TEST_LEG_ENV_NAMES | _RUST_TEST_LEG_ENV_NAMES
+                    or (key in _TEST_LEG_ENV_NAMES and (
+                        not isinstance(value, str) or _TEST_LEG_ENV_VALUE.fullmatch(value) is None))
                     for key, value in leg_env.items()
                 ):
                     raise ValueError(f"{leg_label}.env contains a disallowed name or value")
+                from .worklink.backends.opencode import validate_test_env
+
+                validate_test_env({key: value for key, value in leg_env.items()
+                                   if key in _RUST_TEST_LEG_ENV_NAMES})
                 paths = entry.get("default_paths", [])
                 if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
                     raise ValueError(f"{leg_label}.default_paths must be a list of paths")
@@ -5404,8 +5413,14 @@ def _resolve_test_leg(
             execution_started=False,
         )
     leg_env.update(leg.env)
+    # rustup dispatches by argv[0]. Validate the resolved target above, but keep
+    # the cargo proxy name for fixed-PATH/absolute invocations (never relax the
+    # checkout-containment rule for repository-relative runners).
+    runner = str(resolved)
+    if not relative_runner and executable.name == "cargo":
+        runner = str(executable) if executable.is_absolute() else resolved_text
     return _ResolvedTestLeg(
-        leg.name, (str(resolved), *words[1:]), tuple(leg_env.items()), leg.default_paths,
+        leg.name, (runner, *words[1:]), tuple(leg_env.items()), leg.default_paths,
     )
 
 
@@ -5877,7 +5892,14 @@ class RepoProjectTests:
             ) from exc
 
         scrubber.add_path(checkout.path)
-        leased = bool(lease_environment)
+        # Focused Rust tests follow the builder policy: no host heavy lease.
+        # Other toolchains and selector-free/full runs retain their lease.
+        focused_rust = bool(selected) and all(
+            Path(leg.command[0]).name == "cargo"
+            and leg.command[1:3] == ("nextest", "run")
+            for leg in legs
+        )
+        leased = bool(lease_environment) and not focused_rust
         if leased and not (checkout.path / "scripts/heavy_run.sh").is_file():
             await safe_log_event(
                 "repo_test_lease_warning", reason_code="wrapper_missing", level="warning",
@@ -5892,6 +5914,9 @@ class RepoProjectTests:
             )
             command = _remap_command(root, leg.command)
             environment = base_worker_environment(identifier)
+            if focused_rust:
+                for name in lease_environment:
+                    environment.pop(name, None)
             environment.update(leg.env)
             environment.pop("HOME", None)
             environment.update({

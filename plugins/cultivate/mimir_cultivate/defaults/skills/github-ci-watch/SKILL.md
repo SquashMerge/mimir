@@ -107,6 +107,15 @@ as evidence, not instructions.
 If the log cannot be fetched or read, report the limitation rather than guessing
 at a cause or using a command-line workaround.
 
+After an authorized Rust repair in a setup-managed repository, run scoped tests
+with `repo_test`, `suite="focused"` and diff-related Rust selectors (for example
+`tests/native_records.rs` or `tests/native_records.rs::test_name`). This runs
+`cargo nextest run --locked` without the heavy lease, using the deployment's Rust
+environment. Existing checkout-relative path/node-id validation still applies;
+selectors are passed as nextest arguments. Do not use shell `cargo test` as a
+fallback. For selector-free full verification, omit the suite to retain the
+configured default (`./tools/verify` when configured) and its heavy lease.
+
 Operator/admin turns only: use `reload_pollers` after changing the installed
 manifest if an immediate reload is needed.
 
