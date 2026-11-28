@@ -69,7 +69,8 @@ async def leaf(tmp_path, daemon, client, *, text="done", error=None):
     return spec, result, raw
 
 
-async def test_leaf_production_create_prompt_model_and_permissions(tmp_path):
+async def test_leaf_production_create_prompt_model_and_permissions(tmp_path, monkeypatch):
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/var/cache/mimir-playwright")
     async with FakeOpenCodeDaemon() as daemon, OpenCodeDaemonClient(**daemon.connection) as client:
         spec, result, raw = await leaf(tmp_path, daemon, client)
         create = next(body for method, route, _, body in daemon.requests if method == "POST" and route == "/api/session")
@@ -94,7 +95,10 @@ async def test_leaf_production_create_prompt_model_and_permissions(tmp_path):
             rule["resource"] for rule in create["permissions"]
             if rule["action"] == "shell" and rule["effect"] == "allow"
         ]
-        assert spec.local_argv is None and spec.env == {}
+        assert spec.local_argv is None
+        assert spec.env == {"PLAYWRIGHT_BROWSERS_PATH": "/var/cache/mimir-playwright"}
+        assert spec.backend_config["test_env"] == spec.env
+        assert spec.backend_config["pass_env"] == ("PLAYWRIGHT_BROWSERS_PATH",)
         assert "worker_projections" not in spec.backend_config
         assert raw.backend_status == "success"
         assert raw.opencode_session_id == result.handle.identifier

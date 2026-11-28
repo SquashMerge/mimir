@@ -861,6 +861,7 @@ def test_session_environment_refuses_untrusted_overrides(tmp_path, name, value):
 
 
 def test_session_environment_is_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/var/cache/mimir-playwright")
     monkeypatch.delenv("CARGO_NET_RETRY", raising=False)
     monkeypatch.delenv("CARGO_HTTP_TIMEOUT", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "fragment-" + "not-in-session")
@@ -874,6 +875,7 @@ def test_session_environment_is_closed(tmp_path, monkeypatch):
         "MIMIR_SPAWN_DEPTH": "1", "CFLAGS": "-O2", "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": str(tmp_path),
+        "PLAYWRIGHT_BROWSERS_PATH": "/var/cache/mimir-playwright",
         "CARGO_NET_RETRY": "5", "CARGO_HTTP_TIMEOUT": "30",
     }
 

@@ -1,0 +1,1 @@
+- Persist Worklink's Playwright browser downloads in a worker-private named volume across builder attempts and evidence gates, for every setup toolchain.

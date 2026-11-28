@@ -76,6 +76,24 @@ def test_legacy_setup_renderer_bytes_and_modes(setup_environment, monkeypatch, p
     assert expected["scaffold-workspace"]["text"].count(pinned) == 1
     expected["scaffold-workspace"]["text"] = expected["scaffold-workspace"]["text"].replace(
         pinned, f"\nARG FACTORY_VERSION={FACTORY_VERSION}\n")
+    # Authorize only the browser-cache addition to the legacy Compose oracle.
+    compose = yaml.safe_load(expected["compose.yml"]["text"])
+    agent_env = compose["services"]["agent"]["environment"]
+    agent_env["MIMIR_SHELL_PASS_ENV"] = "PLAYWRIGHT_BROWSERS_PATH"
+    for service in ("agent", "init"):
+        mounts = compose["services"][service]["volumes"]
+        mounts.insert(mounts.index("worklink-daemon:/var/lib/mimir-worklink/daemon") + 1,
+                      "playwright:/var/cache/mimir-playwright")
+    compose["services"]["init"]["command"][0] = compose["services"]["init"]["command"][0].replace(
+        "&& chmod 0755 /workspace/.worklink",
+        "&& chmod 0755 /workspace/.worklink"
+        " && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-playwright")
+    compose["volumes"]["playwright"] = None
+    old_digest = hashlib.sha256(expected["compose.yml"]["text"].encode()).hexdigest()
+    header = expected["compose.yml"]["text"].split("services:\n", 1)[0]
+    expected["compose.yml"]["text"] = header + yaml.safe_dump(compose, sort_keys=False)
+    new_digest = hashlib.sha256(expected["compose.yml"]["text"].encode()).hexdigest()
+    expected["manifest.json"]["text"] = expected["manifest.json"]["text"].replace(old_digest, new_digest)
     import difflib
     differences = []
     for name in sorted(actual.keys() | expected.keys()):
@@ -1089,7 +1107,9 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert compose["services"]["agent"]["environment"]["XDG_CACHE_HOME"] == "/home/mimir/.cache"
     assert "cache:/home/mimir/.cache" in compose["services"]["agent"]["volumes"]
     assert compose["services"]["agent"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
-    assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon"}
+    assert set(compose["volumes"]) == {
+        "home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon", "playwright",
+    }
     assert "worklink-daemon:/var/lib/mimir-worklink/daemon" in compose["services"]["agent"]["volumes"]
     assert any('MIMIR_VERSION=' + VERSION in part for argv in calls for part in argv)
     assert sum("docker" == argv[0] and "exec" in argv and argv[-1] != installer._OPENCODE_DAEMON_PROBE
@@ -3407,6 +3427,22 @@ def test_sccache_compose_persists_private_worker_cache_and_opt_out():
     from mimir.scaffold_docker import render_compose_yml
     template = render_compose_yml(service_name='agent', web_port=8123, mode='pypi')
     uncached = installer.render_compose(template, 'image:sha', 'rust', 'repo', sccache=False)
+    # Pin the combined renderer against the historical Playwright rendering,
+    # authorizing only main's exact cargo mounts, volume and init addition.
+    historical = yaml.safe_load(uncached)
+    assert historical['volumes'].pop('cargo') is None
+    for service in ('agent', 'init'):
+        historical['services'][service]['volumes'].remove('cargo:/var/cache/mimir-cargo')
+    cargo_init = ' && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-cargo'
+    assert historical['services']['init']['command'][0].count(cargo_init) == 1
+    historical['services']['init']['command'][0] = historical['services']['init']['command'][0].replace(cargo_init, '')
+    previous = yaml.safe_dump(historical, sort_keys=False)
+    anchor = '      MIMIR_ACP_ENABLED:'
+    assert previous.count(anchor) == 1
+    previous = previous.replace(anchor,
+        '      PLAYWRIGHT_BROWSERS_PATH: /var/cache/mimir-playwright\n' + anchor)
+    assert hashlib.sha256(previous.encode()).hexdigest() == (
+        '97a8a160da4d2ce15adbe93d693b8a304ffe7d24835ce18c0cd03d4141fa7c21')
     cached = yaml.safe_load(installer.render_compose(template, 'image:sha', 'rust', 'repo'))
     plain = yaml.safe_load(uncached)
     assert plain['volumes']['cargo'] is None
@@ -3419,13 +3455,25 @@ def test_sccache_compose_persists_private_worker_cache_and_opt_out():
     command = cached['services']['init']['command'][0]
     assert command.endswith(' && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-sccache')
     assert cached['services']['agent']['environment']['MIMIR_SHELL_PASS_ENV'].endswith(
-        ',RUSTC_WRAPPER,SCCACHE_DIR,SCCACHE_CACHE_SIZE')
+        ',RUSTC_WRAPPER,SCCACHE_DIR,SCCACHE_CACHE_SIZE,PLAYWRIGHT_BROWSERS_PATH')
     for kind in ('node', 'python'):
         assert 'cargo' not in yaml.safe_load(
             installer.render_compose(template, 'image:sha', kind, 'repo'))['volumes']
         assert installer.render_compose(template, 'image:sha', kind, 'repo') == (
             installer.render_compose(template, 'image:sha', kind, 'repo', sccache=False))
-    assert hashlib.sha256(uncached.encode()).hexdigest() == (
+    # Independently preserve main's byte oracle, removing only this PR's
+    # browser mount, init and pass-through additions from the combined tree.
+    historical = yaml.safe_load(uncached)
+    assert historical['volumes'].pop('playwright') is None
+    for service in ('agent', 'init'):
+        historical['services'][service]['volumes'].remove('playwright:/var/cache/mimir-playwright')
+    browser_init = ' && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-playwright'
+    assert historical['services']['init']['command'][0].count(browser_init) == 1
+    historical['services']['init']['command'][0] = historical['services']['init']['command'][0].replace(browser_init, '')
+    assert historical['services']['agent']['environment']['MIMIR_SHELL_PASS_ENV'] == (
+        'RUSTUP_HOME,CARGO_HOME,PLAYWRIGHT_BROWSERS_PATH')
+    historical['services']['agent']['environment']['MIMIR_SHELL_PASS_ENV'] = 'RUSTUP_HOME,CARGO_HOME'
+    assert hashlib.sha256(yaml.safe_dump(historical, sort_keys=False).encode()).hexdigest() == (
         '3aa6761a9ec0f5166b5744a077cee96b270896e23e91bad7d18157402c603cb2')
 
 
@@ -3438,7 +3486,9 @@ def test_rust_cache_volume_init_repairs_owner_mode_and_preserves_contents(tmp_pa
         template, 'image:sha', 'rust', 'repo', sccache=sccache))['services']['init']
     assert init['user'] == 'root'
     command = init['command'][0]
-    caches = ['/var/cache/mimir-cargo']
+    # The composed init now creates both caches; remap and verify both so this
+    # real-utility regression never tries to install the browser cache on host.
+    caches = ['/var/cache/mimir-playwright', '/var/cache/mimir-cargo']
     if sccache:
         caches.append(installer.SCCACHE_DIR)
     # Run the rendered init without Docker or host accounts. Only paths and

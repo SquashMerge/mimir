@@ -1051,6 +1051,7 @@ async def test_closed_worker_direct_parity_inventory(
 
 
 def test_enabled_environment_is_exact_and_closed(monkeypatch) -> None:
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/var/cache/mimir-playwright")
     monkeypatch.delenv("CARGO_NET_RETRY", raising=False)
     monkeypatch.delenv("CARGO_HTTP_TIMEOUT", raising=False)
     identifier = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -1074,6 +1075,7 @@ def test_enabled_environment_is_exact_and_closed(monkeypatch) -> None:
         "OPENCODE_PERMISSION": '{"edit":"allow"}',
         "MIMIR_WORKLINK_GATE": "1",
         "ANTHROPIC_API_KEY": "selected",
+        "PLAYWRIGHT_BROWSERS_PATH": "/var/cache/mimir-playwright",
         "CARGO_NET_RETRY": "5",
         "CARGO_HTTP_TIMEOUT": "30",
     }

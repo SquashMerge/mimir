@@ -907,6 +907,8 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                    heavy_lock_dir: str | None = None, heavy_lock_timeout: str | None = "14400",
                    worklink_host: str = "opencode", sccache: bool = True) -> str:
     """Modify the scaffold structurally; fail closed on incompatible shapes."""
+    from .worklink.browser_environment import PLAYWRIGHT_CACHE_DIR, PLAYWRIGHT_ENV
+
     if worklink_host not in {"opencode", "claude_code"}:
         raise SetupError("Worklink host must be opencode or claude_code.")
     try:
@@ -925,6 +927,9 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
         passthrough = "UV_PYTHON_INSTALL_DIR" if kind == "python" else "RUSTUP_HOME,CARGO_HOME" if kind == "rust" else ""
         if kind == "rust" and sccache:
             passthrough += ",RUSTC_WRAPPER,SCCACHE_DIR,SCCACHE_CACHE_SIZE"
+        passthrough = ",".join(filter(None, (passthrough, PLAYWRIGHT_ENV)))
+        # Do not turn the implicit default into an operator override: runtime
+        # checks the volume's worker ownership and privacy before exporting it.
         environment.update({"MIMIR_ACP_ENABLED": "1", "MIMIR_PR_CHECKOUT_LEASE_ROOT": "/workspace/pr-leases",
                             "MIMIR_SHELL_PASS_ENV": passthrough, "MIMIR_ENABLE_CLAUDE_CODE": "0",
                             "MIMIR_HOME": "/home/mimir/agent", "MIMIR_PLUGINS": "cultivate",
@@ -941,6 +946,8 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                    "worklink-daemon:/var/lib/mimir-worklink/daemon"]
         if worklink_host == "claude_code":
             volumes.pop()
+        # Browser tests are not specific to any one repository toolchain.
+        volumes.append("playwright:" + PLAYWRIGHT_CACHE_DIR)
         if kind == "rust":
             volumes.append("cargo:/var/cache/mimir-cargo")
         if kind == "rust" and sccache:
@@ -961,14 +968,16 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
         doc["services"]["init"] = {
             "image": layer_tag, "user": "root", "entrypoint": ["/bin/sh", "-c"],
             "command": ["mkdir -p /workspace/pr-leases /workspace/worklink /workspace/.worklink /home/mimir/agent /home/mimir/.cache "
-                        "&& chown -R 1001:1001 /workspace /home/mimir/agent /home/mimir/.cache "
-                        "&& chmod 0755 /workspace/.worklink" +
+                         "&& chown -R 1001:1001 /workspace /home/mimir/agent /home/mimir/.cache "
+                         "&& chmod 0755 /workspace/.worklink"
+                         f" && install -d -o worklink -g worklink -m 0700 {PLAYWRIGHT_CACHE_DIR}" +
                         (" && chown -R 1001:1001 /home/mimir/.codex && chmod 0700 /home/mimir/.codex" if codex else "")],
             "volumes": volumes,
         }
         doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon")}
         if worklink_host == "claude_code":
             del doc["volumes"]["worklink-daemon"]
+        doc["volumes"]["playwright"] = None
         if kind == "rust":
             doc["volumes"]["cargo"] = None
             # Volume roots can hide the image-layer ownership, including on upgrade.

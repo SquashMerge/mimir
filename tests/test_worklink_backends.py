@@ -1215,7 +1215,8 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
     assert spec.backend_config["variant"] == "high"
     assert spec.test_command == "uv run pytest -q"
-    assert spec.env == {}
+    from mimir_cultivate.worklink.browser_environment import browser_environment
+    assert spec.env == browser_environment()
     assert spec.session_request.shell_allowlist == ("git *", "uv *")
     assert result.transcript_path is not None
     assert result.transcript_path.parent == transcript_root
@@ -1234,6 +1235,7 @@ def test_opencode_test_env_reaches_pytest_through_bash(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool, opencode_binary: Path
 ) -> None:
     monkeypatch.setattr(opencode_module, "_coding_enabled", lambda: enabled)
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/worker/browser-override")
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(
         'backends:\n  opencode:\n    test_env:\n      PYTEST_ADDOPTS: "-n 2"\n',
@@ -1246,11 +1248,13 @@ def test_opencode_test_env_reaches_pytest_through_bash(
         test_command="uv run pytest -q -n 6",
     )
     assert spec.env["PYTEST_ADDOPTS"] == "-n 2"
-    assert spec.backend_config["test_env"] == {"PYTEST_ADDOPTS": "-n 2"}
+    assert spec.backend_config["test_env"] == {
+        "PLAYWRIGHT_BROWSERS_PATH": spec.env["PLAYWRIGHT_BROWSERS_PATH"], "PYTEST_ADDOPTS": "-n 2",
+    }
     assert "MIMIR_MODEL_SPEC" not in spec.env
     assert spec.test_command == "uv run pytest -q -n 6"
     from mimir_cultivate.worklink.daemon_sessions import session_environment
-    assert spec.backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
+    assert spec.backend_config["pass_env"] == ("PLAYWRIGHT_BROWSERS_PATH", "PYTEST_ADDOPTS")
     env = session_environment(dict(spec.env), home=tmp_path / "home", git_settings=(), credentials={})
 
     (tmp_path / "pyproject.toml").write_text(
@@ -1348,7 +1352,8 @@ def test_opencode_backend_logs_native_model_divergence_from_home_default(
         )
 
     assert spec.session_request.model == {"providerID": "openai", "id": "gpt-agent"}
-    assert spec.env == {}
+    from mimir_cultivate.worklink.browser_environment import browser_environment
+    assert spec.env == browser_environment()
     assert "differs from configured agent model" not in caplog.text
 
 

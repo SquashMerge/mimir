@@ -894,6 +894,7 @@ def session_environment(pass_env: object, *, home: Path, git_settings: object,
     from .compute import _validate_dynamic_worker_name, _validate_worker_value
     from .network_environment import network_retry_environment
     from .pytest_environment import pytest_session_environment
+    from .browser_environment import browser_environment
 
     if not isinstance(pass_env, dict) or len(pass_env) > 128:
         raise ValueError("invalid session pass_env")
@@ -919,6 +920,9 @@ def session_environment(pass_env: object, *, home: Path, git_settings: object,
                 or any(part in name.upper() for part in ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "BASE_URL"))):
             raise ValueError("sensitive session pass_env refused")
         environment[name] = value
+    # Explicit pass_env (including operator-configured test_env) wins. Do this
+    # after checking reserved names so callers still cannot override HOME/TMPDIR.
+    environment.update(browser_environment({**os.environ, **environment}))
     for name, value in network_retry_environment().items():
         environment.setdefault(name, value)
     if not isinstance(git_settings, (tuple, list)) or len(git_settings) > 32:
