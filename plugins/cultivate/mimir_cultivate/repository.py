@@ -5521,6 +5521,73 @@ def _validated_selectors(
     return tuple(validated)
 
 
+def _nextest_selector_arguments(root: Path, selectors: tuple[str, ...]) -> tuple[str, ...]:
+    """Map conventional Rust source paths to a union of nextest filtersets.
+
+    Never treat a file path as a test-name substring. Only Rust identifiers
+    enter regexes; package/target names use exact matchers with a narrow alphabet.
+    Custom Cargo targets and non-conventional source layouts are refused.
+    """
+    import tomllib
+
+    def refuse() -> None:
+        raise ProjectTestRefusal(
+            "test_selector_invalid", "Rust selector cannot be mapped to a conventional nextest target",
+            execution_started=False,
+        )
+
+    expressions = []
+    for selector in selectors:
+        path, separator, node = selector.partition("::")
+        parts = list(Path(path).parts)
+        package_root = root
+        if len(parts) >= 3 and parts[0] == "crates":
+            package_root = root.joinpath(*parts[:2])
+            parts = parts[2:]
+        manifest = package_root / "Cargo.toml"
+        if manifest.is_symlink() or not manifest.is_file():
+            refuse()
+        try:
+            config = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            package = config["package"]["name"]
+        except (OSError, ValueError, KeyError, TypeError):
+            refuse()
+        if not isinstance(package, str) or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", package) is None:
+            refuse()
+        # Explicit target declarations may rename or remap a source path.
+        if config.get("test") or config.get("lib") or config.get("bin"):
+            refuse()
+        if separator and (not node or any(
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", segment) is None
+            for segment in node.split("::")
+        )):
+            refuse()
+        if len(parts) < 2 or not parts[-1].endswith(".rs"):
+            refuse()
+        stem = parts[-1][:-3]
+        if parts[0] == "tests" and len(parts) == 2:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", stem) is None or config["package"].get("autotests") is False:
+                refuse()
+            expression = f"package(={package}) & kind(test) & binary(={stem})"
+            if separator:
+                expression += f" & test(={node})"
+        elif parts[0] == "src" and (package_root / "src/lib.rs").is_file():
+            module = parts[1:-1] + ([] if stem in {"lib", "mod"} else [stem])
+            if stem == "main" or "bin" in module or any(
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", segment) is None for segment in module
+            ) or (stem == "lib" and len(parts) != 2):
+                refuse()
+            expression = f"package(={package}) & kind(lib)"
+            if separator:
+                expression += f" & test(={'::'.join([*module, node])})"
+            elif module:
+                expression += f" & test(/^{ '::'.join(module) }::/)"
+        else:
+            refuse()
+        expressions.append(f"({expression})")
+    return ("-E", " | ".join(expressions)) if expressions else ()
+
+
 def _remap_command(root: Path, command: tuple[str, ...]) -> tuple[str, ...]:
     executable = Path(command[0])
     try:
@@ -5807,6 +5874,14 @@ class RepoProjectTests:
             paths_by_leg = tuple(
                 selected if selectors else _validated_selectors(root, leg.default_paths, suite=suite_name)
                 for leg in legs
+            )
+            nextest_legs = tuple(
+                Path(leg.command[0]).name == "cargo" and leg.command[1:3] == ("nextest", "run")
+                for leg in legs
+            )
+            paths_by_leg = tuple(
+                _nextest_selector_arguments(root, paths) if nextest and paths else paths
+                for nextest, paths in zip(nextest_legs, paths_by_leg)
             )
         except ProjectTestRefusal as exc:
             raise ProjectTestRefusal(
@@ -6109,6 +6184,8 @@ class RepoProjectTests:
                 stderr_path=stderr_relative,
             )
         if result.exit_code != 0 or result.output_overflow:
+            if nextest_legs[len(leg_summaries) - 1] and result.exit_code == 4:
+                stderr = "No tests matched the selectors (cargo nextest exit 4).\n" + stderr
             code = "tests_failed"
             if result.output_overflow:
                 # Preserve the exit distinction without treating truncated evidence

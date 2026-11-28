@@ -133,7 +133,10 @@ with `repo_test`, `suite="focused"` and diff-related Rust selectors (for example
 `tests/native_records.rs` or `tests/native_records.rs::test_name`). This runs
 `cargo nextest run --locked` without the heavy lease, using the deployment's Rust
 environment. Existing checkout-relative path/node-id validation still applies;
-selectors are passed as nextest arguments. Do not use shell `cargo test` as a
+selectors are translated to package-qualified nextest filtersets, never raw path
+name filters. Conventional integration targets and library module paths are
+supported; unmappable/custom targets are refused. Zero matches remains a failure.
+Do not use shell `cargo test` as a
 fallback. For selector-free full verification, omit the suite to retain the
 configured default (`./tools/verify` when configured) and its heavy lease.
 
