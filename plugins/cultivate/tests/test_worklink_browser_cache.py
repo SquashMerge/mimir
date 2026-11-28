@@ -206,6 +206,13 @@ def test_browser_cache_setup_volume_is_worker_private(kind, host):
     assert init["user"] == "root"
     assert " && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-playwright" in init["command"][0]
     assert "chown -R 1001:1001 /var/cache/mimir-playwright" not in init["command"][0]
+    if kind == "rust":
+        # Main's cargo cache must coexist with the all-toolchain browser cache
+        # for both worker hosts, including both private ownership init steps.
+        assert "cargo" in doc["volumes"]
+        for service in ("agent", "init"):
+            assert "cargo:/var/cache/mimir-cargo" in doc["services"][service]["volumes"]
+        assert " && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-cargo" in init["command"][0]
 
 
 def test_browser_cache_setup_preserves_operator_override():
