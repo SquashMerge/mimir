@@ -828,6 +828,17 @@ def render_layer(kind: str, version: str, root_image: str, *,
                 f"RUN set -eu; install -d -o worklink -g worklink -m 0700 {SCCACHE_DIR}\n"
                 + "ENV " + " ".join(f"{key}={env[key]}" for key in
                                     ("RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE")) + "\n")
+            # Leave the checksum-verified install above and all public env
+            # values intact. The launcher covers every consumer of sccache,
+            # including builder sessions, Rust gates and evidence commands.
+            launcher = resources.files("mimir_cultivate").joinpath("docker/worklink-sccache").read_bytes()
+            encoded = base64.b64encode(launcher).decode("ascii")
+            install += (
+                "RUN set -eu; install -d -o worklink -g worklink -m 0700 /var/tmp/mimir-sccache\n"
+                "RUN set -eu; install -d -o root -g root -m 0755 /usr/local/libexec && "
+                "mv /usr/local/bin/sccache /usr/local/libexec/sccache && "
+                f"printf %s {encoded} | base64 -d > /usr/local/bin/sccache && "
+                "chown root:root /usr/local/bin/sccache && chmod 0755 /usr/local/bin/sccache\n")
     elif kind == "node":
         install = (f"RUN set -eu; arch=$(dpkg --print-architecture); case $arch in amd64) arch=x64;; arm64) ;; *) exit 2;; esac && "
                     "apt-get update && apt-get install -y --no-install-recommends g++ make python3 && "
@@ -930,6 +941,8 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                    "worklink-daemon:/var/lib/mimir-worklink/daemon"]
         if worklink_host == "claude_code":
             volumes.pop()
+        if kind == "rust":
+            volumes.append("cargo:/var/cache/mimir-cargo")
         if kind == "rust" and sccache:
             volumes.append("sccache:" + SCCACHE_DIR)
         if codex:
@@ -956,6 +969,11 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
         doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink", "worklink-daemon")}
         if worklink_host == "claude_code":
             del doc["volumes"]["worklink-daemon"]
+        if kind == "rust":
+            doc["volumes"]["cargo"] = None
+            # Volume roots can hide the image-layer ownership, including on upgrade.
+            doc["services"]["init"]["command"][0] += (
+                " && install -d -o worklink -g worklink -m 0700 /var/cache/mimir-cargo")
         if kind == "rust" and sccache:
             doc["volumes"]["sccache"] = None
             doc["services"]["init"]["command"][0] += (
@@ -1131,9 +1149,10 @@ def _check_in_flight(deploy: Path, run) -> None:
     elif rows and rows[0].startswith("ISSUE  STATE "):
         active = []
         for row in rows[1:]:
-            fields = row.split()
-            if row.startswith("  disagreement:"):
+            # Indented rows annotate the preceding issue, not in-flight work.
+            if row.startswith("  "):
                 continue
+            fields = row.split()
             if len(fields) < 2 or not fields[0].isdigit():
                 raise SetupError("Cannot read Worklink status; retry after inspecting the agent.")
             if fields[1] != "clean":
@@ -1260,7 +1279,7 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         allowlist.append(entry['test_command'] + ' *')
 
     def render(section: dict | None, *, legacy_exact_script: bool = False,
-               legacy_toolchain_allowlist: bool = False) -> str:
+               legacy_toolchain_allowlist: bool = False, legacy_job_helper: bool = False) -> str:
         rendered = dict(config)
         if legacy_exact_script and script_arguments:
             rendered['backends'] = {'opencode': {
@@ -1276,7 +1295,13 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
             rendered['backends'] = backends
         if section:
             rendered['tracker'] = section
-        return yaml.safe_dump(rendered, sort_keys=False)
+        # This transport rule is installed by SessionController for every leaf,
+        # including operator-managed allowlists. Keeping it out of the payload
+        # policy prevents the helper from authorizing itself recursively.
+        header = ("" if legacy_job_helper else
+                  "# Installed OpenCode session permission: worklink-job *\n"
+                  "# Job payloads must still match the bash_allowlist below.\n")
+        return header + yaml.safe_dump(rendered, sort_keys=False)
 
     text = render(tracker)
     data = text.encode()
@@ -1298,8 +1323,10 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         unedited = (hashlib.sha256(current).hexdigest() == recorded if recorded
                     else current in tuple(
                         render(section, legacy_exact_script=legacy,
-                               legacy_toolchain_allowlist=old_toolchain).encode()
+                               legacy_toolchain_allowlist=old_toolchain,
+                               legacy_job_helper=old_job).encode()
                         for section in (previous_tracker, None)
+                        for old_job in (False, True)
                         for legacy, old_toolchain in ((False, False), (False, True), (True, True))))
         if not unedited:
             print(_WORKLINK_EDITED, flush=True)
@@ -1922,7 +1949,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
                             "(default: 14400); omit to preserve the saved timeout. Only written with a shared directory.")
     setup.add_argument("--mimir-version", help="Exact common PyPI release of mimir-agent and mimir-cultivate; omit to preserve the saved version (fresh setup: latest common stable, then prerelease).")
     setup.add_argument("--sccache", action=argparse.BooleanOptionalAction, default=None,
-                       help="Enable the pinned Rust compiler cache (default); --no-sccache restores the uncached layer and test environment.")
+                       help="Enable the pinned Rust compiler cache (default); --no-sccache restores the uncached layer and test environment, leaving any existing sccache volume unused.")
     setup.add_argument("--sccache-cache-size", help="Rust compiler cache size, e.g. 20G (default); preserved on re-setup.")
     setup.add_argument("--platform", choices=tuple(_DOCKER_ARCHITECTURES),
                        help="Docker target platform (linux/amd64 or linux/arm64; default: host architecture, or saved platform on rerun).")
