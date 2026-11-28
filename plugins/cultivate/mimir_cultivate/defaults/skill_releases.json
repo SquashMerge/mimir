@@ -1331,7 +1331,7 @@
       "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
     },
     "github-ci-watch": {
-      "SKILL.md": "2279aed8e855efe52f0da138fad03cd525dc46d4edd37bfa22e03575374ff21c",
+      "SKILL.md": "ee7a7ec61ccb4ee789c2349655b9bd5dc5d1a6599df7b898806f6d04adc7d664",
       "pollers.json": "cf12bace495179efb472e5d1d8d65a7dd3a2a4dccd17c5f312dfdbc6a639bcd2",
       "scripts/ci_logs.py": "897902c578741b17b8987da7bd4126a9f918198df05148f4f981c6b012f68c87",
       "scripts/poller.py": "8f600defe469eea2d0445136a5da31ae430b9a65cab054b9a1bcbd9b5eec8c14",
