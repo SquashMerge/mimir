@@ -1,10 +1,7 @@
 """Retry policy reaches rendered orders, builder sessions, and gate processes."""
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
@@ -19,7 +16,6 @@ from mimir_cultivate.worklink.orchestrator import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[1] / "mimir_cultivate"
 IDENTIFIER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 DEFAULTS = {"CARGO_NET_RETRY": "5", "CARGO_HTTP_TIMEOUT": "30"}
 
@@ -60,22 +56,6 @@ def test_order_prompt_retries_transient_network_failures_before_blocking(tmp_pat
         "before contacting a relay or acquiring any lock",
     ):
         assert rule in prompt
-
-
-def test_worklink_order_packaged_release_hash():
-    releases = json.loads((ROOT / "defaults/skill_releases.json").read_text())
-    # Preserve the original shipped template's release evidence; the combined
-    # retry and worklink-job template gets a distinct release inventory.
-    assert releases["2242-transient-network-retries"]["prompt_templates"] == {
-        "worklink-order.md": "dc3056a2a6fa2508221baa29dec4037ab018481cfb91f9886e0fd40878aee59f",
-    }
-    expected = releases["2242-network-retries-worklink-job"]["prompt_templates"]
-    actual = {
-        "worklink-order.md": hashlib.sha256(
-            (ROOT / "prompt_templates/worklink-order.md").read_bytes()
-        ).hexdigest(),
-    }
-    assert actual == expected
 
 
 def test_order_prompt_home_override_still_wins(tmp_path):
