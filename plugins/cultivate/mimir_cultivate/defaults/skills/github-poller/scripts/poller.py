@@ -959,14 +959,35 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return default
 
 
+_REMEDIATION_PUBLICATION_GUIDANCE = (
+    "Scoped tests must pass before pushing. Commit before the turn ends; if the "
+    "turn might end before tests finish, commit locally first. Never leave a repair "
+    "uncommitted across a turn boundary: uncommitted lease work is archived and "
+    "reset at the next turn's checkout. After focused tests pass, commit, push "
+    "to the PR branch, and re-request review only when the scope grants pr.rerequest; "
+    "otherwise report the need via pr_comment or operator escalation. Do not queue "
+    "a default-suite repo_test before pushing for remediation. Do not produce "
+    "mutation evidence; reviewers run mutation checks. PR CI is the full-suite "
+    "gate: all required checks, both core and MIMIR_PLUGINS=cultivate legs, must "
+    "pass at the published head. A completed failing run with counts observed and "
+    "failed_tests non-empty blocks publication. An incomplete full-suite run "
+    "(test_timeout or infrastructure refusal) is NOT a publication blocker after "
+    "scoped tests pass; report that it did not complete (not failed) and rely on "
+    "PR CI. This overrides agent-local green-full-suite pre-push guidance, not "
+    "authorization, branch protection, required checks, or required review on main. "
+    "This remediation policy does not apply to pr_mergeability_conflicting."
+)
+
+
 def _verification_guidance() -> str:
     """Describe the selected provider's configured repository test runner."""
     return (
-        "verify with the repo_test tool, which runs the deployment's own "
-        "configured test command. Selectors are repo-relative paths that must "
+        "run focused tests for the changed code with repo_test selectors using "
+        "the deployment's own configured test command. Selectors are "
+        "repo-relative paths that must "
         "already exist and must not be symlinks, and carry no flags; "
         "`path::node_id` works only when the configured runner accepts that "
-        "form, so prefer plain paths — or omit selectors to run the whole suite"
+        "form, so prefer plain paths"
     )
 
 
@@ -1463,6 +1484,7 @@ def _emit_own_feedback(
             "the scoped checkout grant; PR reads such as pr_comments are refused "
             "before checkout. Then read the bound PR's review, inline, and "
             "conversation comments before acting.\n"
+            f"{_REMEDIATION_PUBLICATION_GUIDANCE}\n"
             "Trusted feedback (quoted):\n"
             + "\n".join(
                 f"@{sanitize_login(author)} {url}: {json.dumps(text, ensure_ascii=False)}"
@@ -3129,17 +3151,7 @@ def _check_own_changes_requested(
             f"review. Read the latest review, inline, and PR comments on this PR. "
             f"Honour an explicit reviewer instruction to publish (such as 'push' or "
             f"'CI is the gate') on this turn, subject to the following test policy. "
-            f"Scoped tests must pass before pushing. Attempt the full suite, but "
-            f"a full-suite test_timeout or infrastructure refusal (snapshot unavailable, "
-            f"runner unavailable) is NOT a publication blocker. Only a completed failing "
-            f"full-suite run with counts observed and failed_tests non-empty blocks "
-            f"publication. On timeout or infrastructure unavailability, commit, push "
-            f"the fix to the PR branch, and re-request review without waiting for another "
-            f"contained full-suite run. State in the PR comment that the in-runner full "
-            f"suite did not complete (not failed) and CI is the validation surface. "
-            f"This overrides an agent-local requirement for a green contained full suite "
-            f"before publication, not authorization, branch protection, required checks, "
-            f"or required review on main.\n{url}"
+            f"{_REMEDIATION_PUBLICATION_GUIDANCE}\n{url}"
         )
         prompt += _remediation_logs(repo, pr, token)
         _emit(
@@ -3650,14 +3662,15 @@ def _deliver_pr_ci(
             "repo_diff(mode='base', failing_test=<test path>, "
             "imported_modules=<repo-relative imported module paths>). Remediate when "
             "the failing test or an imported module is in the PR's changed paths, "
-            "run the repository's configured tests, and push with a lease. When both "
+            f"{_verification_guidance()}, and push with a lease. When both "
             "the failing test and its imported modules are outside the PR's changed "
             "paths, report the unrelated failure with pr_comment or operator escalation "
             "and leave the PR unchanged. Report insufficient evidence rather than "
             "drafting a speculative fix. Prior-turn drafts are automatically archived "
             "privately before checkout reset; preserved_prior_work names the artifact. "
             "If safe archival cannot complete, report dirty_lease_from_prior_turn and "
-            f"leave the draft intact.\n{pr.get('html_url', '')}"
+            f"leave the draft intact.\n{_REMEDIATION_PUBLICATION_GUIDANCE}\n"
+            f"{pr.get('html_url', '')}"
         )
         prompt += _remediation_logs(repo, pr, token, failures)
         _emit(
