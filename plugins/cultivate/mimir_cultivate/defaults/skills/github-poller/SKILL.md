@@ -173,6 +173,16 @@ For each repo in `GITHUB_REPOS`:
   `repo_test_complete` continuations), read the latest review, inline, and PR
   comments on the bound PR. Honour explicit reviewer publication instructions
   ("push", "CI is the gate") on the next turn, subject to passing scoped tests.
+  For setup-managed Rust repositories, use `repo_test` with `suite="focused"`
+  and diff-related Rust selectors (for example `tests/native_records.rs` or
+  `tests/native_records.rs::test_name`). This runs `cargo nextest run --locked`
+  without the heavy lease; selectors are validated as checkout-relative paths/node
+  ids and translated to package-qualified nextest filtersets, never raw path
+  name filters. Conventional integration targets and library module paths are
+  supported; unmappable/custom targets are refused. Zero matches remains a failure.
+  Do not fall back to shell `cargo test`.
+  Without selectors, omit the suite to run the configured default (`./tools/verify`
+  when configured); do not pass selectors to that full-verification script.
   Run focused tests for the changed code with `repo_test` selectors.
   Scoped tests must pass before pushing. Commit before the turn ends; if the
   turn might end before tests finish, commit locally first. Never leave a repair

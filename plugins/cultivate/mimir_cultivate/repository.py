@@ -28,6 +28,9 @@ class RepositoryTestLeg:
 
 _TEST_LEG_ENV_NAMES = frozenset({"MIMIR_PLUGINS", "MIMIR_ACCESS_CONTROL_ENFORCED"})
 _TEST_LEG_ENV_VALUE = re.compile(r"[A-Za-z0-9_,.-]{0,64}", re.ASCII)
+_RUST_TEST_LEG_ENV_NAMES = frozenset({
+    "RUSTUP_HOME", "CARGO_HOME", "RUSTC_WRAPPER", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE",
+})
 
 
 @dataclass(frozen=True)
@@ -254,11 +257,17 @@ def _parse_test_suites(
                     raise ValueError(f"{leg_label}.command must be a non-empty string")
                 leg_env = entry.get("env", {})
                 if not isinstance(leg_env, dict) or any(
-                    not isinstance(key, str) or key not in _TEST_LEG_ENV_NAMES
-                    or not isinstance(value, str) or _TEST_LEG_ENV_VALUE.fullmatch(value) is None
+                    not isinstance(key, str)
+                    or key not in _TEST_LEG_ENV_NAMES | _RUST_TEST_LEG_ENV_NAMES
+                    or (key in _TEST_LEG_ENV_NAMES and (
+                        not isinstance(value, str) or _TEST_LEG_ENV_VALUE.fullmatch(value) is None))
                     for key, value in leg_env.items()
                 ):
                     raise ValueError(f"{leg_label}.env contains a disallowed name or value")
+                from .worklink.backends.opencode import validate_test_env
+
+                validate_test_env({key: value for key, value in leg_env.items()
+                                   if key in _RUST_TEST_LEG_ENV_NAMES})
                 paths = entry.get("default_paths", [])
                 if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
                     raise ValueError(f"{leg_label}.default_paths must be a list of paths")
@@ -5404,8 +5413,14 @@ def _resolve_test_leg(
             execution_started=False,
         )
     leg_env.update(leg.env)
+    # rustup dispatches by argv[0]. Validate the resolved target above, but keep
+    # the cargo proxy name for fixed-PATH/absolute invocations (never relax the
+    # checkout-containment rule for repository-relative runners).
+    runner = str(resolved)
+    if not relative_runner and executable.name == "cargo":
+        runner = str(executable) if executable.is_absolute() else resolved_text
     return _ResolvedTestLeg(
-        leg.name, (str(resolved), *words[1:]), tuple(leg_env.items()), leg.default_paths,
+        leg.name, (runner, *words[1:]), tuple(leg_env.items()), leg.default_paths,
     )
 
 
@@ -5504,6 +5519,73 @@ def _validated_selectors(
             ) from exc
         validated.append(f"{canonical}::{node_id}" if separator else canonical)
     return tuple(validated)
+
+
+def _nextest_selector_arguments(root: Path, selectors: tuple[str, ...]) -> tuple[str, ...]:
+    """Map conventional Rust source paths to a union of nextest filtersets.
+
+    Never treat a file path as a test-name substring. Only Rust identifiers
+    enter regexes; package/target names use exact matchers with a narrow alphabet.
+    Custom Cargo targets and non-conventional source layouts are refused.
+    """
+    import tomllib
+
+    def refuse() -> None:
+        raise ProjectTestRefusal(
+            "test_selector_invalid", "Rust selector cannot be mapped to a conventional nextest target",
+            execution_started=False,
+        )
+
+    expressions = []
+    for selector in selectors:
+        path, separator, node = selector.partition("::")
+        parts = list(Path(path).parts)
+        package_root = root
+        if len(parts) >= 3 and parts[0] == "crates":
+            package_root = root.joinpath(*parts[:2])
+            parts = parts[2:]
+        manifest = package_root / "Cargo.toml"
+        if manifest.is_symlink() or not manifest.is_file():
+            refuse()
+        try:
+            config = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            package = config["package"]["name"]
+        except (OSError, ValueError, KeyError, TypeError):
+            refuse()
+        if not isinstance(package, str) or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", package) is None:
+            refuse()
+        # Explicit target declarations may rename or remap a source path.
+        if config.get("test") or config.get("lib") or config.get("bin"):
+            refuse()
+        if separator and (not node or any(
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", segment) is None
+            for segment in node.split("::")
+        )):
+            refuse()
+        if len(parts) < 2 or not parts[-1].endswith(".rs"):
+            refuse()
+        stem = parts[-1][:-3]
+        if parts[0] == "tests" and len(parts) == 2:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", stem) is None or config["package"].get("autotests") is False:
+                refuse()
+            expression = f"package(={package}) & kind(test) & binary(={stem})"
+            if separator:
+                expression += f" & test(={node})"
+        elif parts[0] == "src" and (package_root / "src/lib.rs").is_file():
+            module = parts[1:-1] + ([] if stem in {"lib", "mod"} else [stem])
+            if stem == "main" or "bin" in module or any(
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", segment) is None for segment in module
+            ) or (stem == "lib" and len(parts) != 2):
+                refuse()
+            expression = f"package(={package}) & kind(lib)"
+            if separator:
+                expression += f" & test(={'::'.join([*module, node])})"
+            elif module:
+                expression += f" & test(/^{ '::'.join(module) }::/)"
+        else:
+            refuse()
+        expressions.append(f"({expression})")
+    return ("-E", " | ".join(expressions)) if expressions else ()
 
 
 def _remap_command(root: Path, command: tuple[str, ...]) -> tuple[str, ...]:
@@ -5793,6 +5875,14 @@ class RepoProjectTests:
                 selected if selectors else _validated_selectors(root, leg.default_paths, suite=suite_name)
                 for leg in legs
             )
+            nextest_legs = tuple(
+                Path(leg.command[0]).name == "cargo" and leg.command[1:3] == ("nextest", "run")
+                for leg in legs
+            )
+            paths_by_leg = tuple(
+                _nextest_selector_arguments(root, paths) if nextest and paths else paths
+                for nextest, paths in zip(nextest_legs, paths_by_leg)
+            )
         except ProjectTestRefusal as exc:
             raise ProjectTestRefusal(
                 exc.code,
@@ -5877,7 +5967,14 @@ class RepoProjectTests:
             ) from exc
 
         scrubber.add_path(checkout.path)
-        leased = bool(lease_environment)
+        # Focused Rust tests follow the builder policy: no host heavy lease.
+        # Other toolchains and selector-free/full runs retain their lease.
+        focused_rust = bool(selected) and all(
+            Path(leg.command[0]).name == "cargo"
+            and leg.command[1:3] == ("nextest", "run")
+            for leg in legs
+        )
+        leased = bool(lease_environment) and not focused_rust
         if leased and not (checkout.path / "scripts/heavy_run.sh").is_file():
             await safe_log_event(
                 "repo_test_lease_warning", reason_code="wrapper_missing", level="warning",
@@ -5892,6 +5989,9 @@ class RepoProjectTests:
             )
             command = _remap_command(root, leg.command)
             environment = base_worker_environment(identifier)
+            if focused_rust:
+                for name in lease_environment:
+                    environment.pop(name, None)
             environment.update(leg.env)
             environment.pop("HOME", None)
             environment.update({
@@ -6084,6 +6184,8 @@ class RepoProjectTests:
                 stderr_path=stderr_relative,
             )
         if result.exit_code != 0 or result.output_overflow:
+            if nextest_legs[len(leg_summaries) - 1] and result.exit_code == 4:
+                stderr = "No tests matched the selectors (cargo nextest exit 4).\n" + stderr
             code = "tests_failed"
             if result.output_overflow:
                 # Preserve the exit distinction without treating truncated evidence

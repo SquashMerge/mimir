@@ -94,6 +94,24 @@ def test_legacy_setup_renderer_bytes_and_modes(setup_environment, monkeypatch, p
     expected["compose.yml"]["text"] = header + yaml.safe_dump(compose, sort_keys=False)
     new_digest = hashlib.sha256(expected["compose.yml"]["text"].encode()).hexdigest()
     expected["manifest.json"]["text"] = expected["manifest.json"]["text"].replace(old_digest, new_digest)
+    # #2247 adds only Rust suite provisioning; preserve the historical oracle.
+    provision = expected["provision.py"]["text"]
+    provision = provision.replace(
+        "from mimir_cultivate.setup import _provision_saga, _provision_worklink\n",
+        "from mimir_cultivate.setup import _provision_saga, _provision_worklink, rust_focused_test_suites\n")
+    anchor = "old = next((r for r in rows if r.get('slug') == m['slug']), None)\n"
+    assert provision.count(anchor) == 1
+    provision = provision.replace(anchor, anchor + (
+        "if m.get('toolchain') == 'rust' and (old is None or 'test_suites' not in old):\n"
+        "    entry['test_suites'] = rust_focused_test_suites(\n"
+        "        sccache=m.get('sccache', True), sccache_cache_size=m.get('sccache_cache_size', '20G'))\n"))
+    provision = provision.replace(
+        "optional = {'worklink_base', 'review_tests', 'auto_review', 'worklink_gate', 'quick_gate_command'}",
+        "optional = {'worklink_base', 'review_tests', 'auto_review', 'worklink_gate', 'quick_gate_command', 'test_suites'}")
+    expected["provision.py"]["text"] = provision
+    manifest = json.loads(expected["manifest.json"]["text"])
+    manifest["generated_sha256"]["provision.py"] = hashlib.sha256(provision.encode()).hexdigest()
+    expected["manifest.json"]["text"] = json.dumps(manifest, indent=2) + "\n"
     import difflib
     differences = []
     for name in sorted(actual.keys() | expected.keys()):
@@ -1292,6 +1310,32 @@ def upgrade_setup(setup_environment):
     state['running'] = True
     calls.clear()
     return deploy, args, state, calls, invoke
+
+
+def test_rust_focused_suite_upgrade_uses_generated_hashes(setup_environment, monkeypatch):
+    deploy, args, state, calls, invoke = setup_environment
+    state['repository_files'] = {'rust-toolchain.toml': '[toolchain]\nchannel = "1.99.1"'}
+    args.test_command = './tools/verify'
+    current = installer._PROVISION
+    start = current.index("if m.get('toolchain') == 'rust' and (old is None")
+    end = current.index("# Back-fill only fields", start)
+    previous = (current[:start] + current[end:]).replace(
+        ", rust_focused_test_suites\n", "\n").replace(
+        "'quick_gate_command', 'test_suites'}", "'quick_gate_command'}")
+    with monkeypatch.context() as old:
+        old.setattr(installer, '_PROVISION', previous)
+        invoke()
+    prior = (deploy / 'provision.py').read_bytes()
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['generated_sha256']['provision.py'] == hashlib.sha256(prior).hexdigest()
+    invoke()  # No --force: the recorded old bytes authorize this upgrade.
+    upgraded = (deploy / 'provision.py').read_bytes()
+    assert upgraded != prior and b"entry['test_suites'] = rust_focused_test_suites(" in upgraded
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['generated_sha256']['provision.py'] == hashlib.sha256(upgraded).hexdigest()
+    (deploy / 'provision.py').write_bytes(upgraded + b'\n# operator edit\n')
+    with pytest.raises(installer.SetupError, match='already differs'):
+        invoke()
 
 
 def _deployment_snapshot(deploy):
@@ -4010,7 +4054,8 @@ def test_provision_keeps_current_skill_and_installs_missing(provisioned_skills, 
 
 
 @pytest.mark.parametrize('review_tests', ['targeted', 'full', 'none'])
-def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monkeypatch, capsys, caplog, review_tests):
+@pytest.mark.parametrize('toolchain', ['rust', 'python'])
+def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monkeypatch, capsys, caplog, review_tests, toolchain):
     monkeypatch.setenv("HOME", "/home/mimir")
     monkeypatch.setenv("XDG_CACHE_HOME", "/home/mimir/.cache")
     home = tmp_path / "home"
@@ -4020,7 +4065,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     existing = {"people": [{"canonical": "another", "aliases": ["email:another@example.com"]}]}
     (state / "identities.yaml").write_text(yaml.safe_dump(existing))
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "toolchain": "rust", "owner": "owner",
+    manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "toolchain": toolchain, "owner": "owner",
                                       "display": "Owner", "email": "owner@example.com",
                                       "test": "npm run verify", "review_tests": review_tests, "auto_review": "requested-only", "rotate": False,
                                       "worklink_gate": "ci", "quick_gate_command": "npm run smoke",
@@ -4090,6 +4135,16 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert inventory["repositories"][0]["worklink_gate"] == 'ci'
     assert inventory["repositories"][0]["quick_gate_command"] == 'npm run smoke'
     assert len(inventory["repositories"]) == 1
+    if toolchain == 'rust':
+        [suite] = inventory['repositories'][0]['test_suites']
+        assert suite['name'] == 'focused' and not suite.get('default', False)
+        assert suite['selector_suffixes'] == ['.rs']
+        assert suite['legs'] == [{
+            'name': 'nextest', 'command': 'cargo nextest run --locked',
+            'env': installer.toolchain_test_env('rust'),
+        }]
+    else:
+        assert 'test_suites' not in inventory['repositories'][0]
     assert base_identity == {'user.name': 'trellisbot-squashmerge', 'user.email': 'trellisbot@example.com'}
     assert {r["root"] for r in inventory["allowed_roots"]} == {"/workspace/pr-leases", "/workspace/worklink"}
     people = yaml.safe_load((state / "identities.yaml").read_text())["people"]
@@ -4105,7 +4160,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert worklink.defaults.base_branch == inventory['repositories'][0]['base_branch']
     assert worklink.defaults.test_command == inventory['repositories'][0]['test_command']
     assert worklink.defaults.allow_autonomous_local_subprocess
-    assert worklink.backend_settings['opencode']['test_env'] == installer.toolchain_test_env('rust')
+    assert worklink.backend_settings['opencode']['test_env'] == installer.toolchain_test_env(toolchain)
     assert (home / '.chainlink/agent.json').read_text() == '{"id":"cultivate-worklink"}'
     assert any(argv[-1] == str(tmp_path / 'worklink/base/repo') for argv in calls if 'clone' in argv)
     assert not any("setup-git" in argv for argv in calls)
@@ -4126,8 +4181,18 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     del legacy['repositories'][0]['worklink_base']
     (home / 'repositories.yaml').write_text(yaml.safe_dump(legacy, sort_keys=False))
     exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
-    assert (home / 'repositories.yaml').read_bytes() == prior_inventory
+    assert yaml.safe_load((home / 'repositories.yaml').read_text()) == inventory
     assert (home / 'worklink.yaml').read_bytes() == prior_worklink
+    if toolchain == 'rust':
+        legacy = yaml.safe_load(prior_inventory)
+        del legacy['repositories'][0]['test_suites']
+        (home / 'repositories.yaml').write_text(yaml.safe_dump(legacy, sort_keys=False))
+        capsys.readouterr()
+        exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert capsys.readouterr().out == 'SETUP_CHANGED=1\n'
+        assert yaml.safe_load((home / 'repositories.yaml').read_text()) == inventory
+        exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert capsys.readouterr().out == 'SETUP_CHANGED=0\n'
     # Upgrade deployed entries with only test_command (no configured suites),
     # including older entries that also predate worklink_base. Exercise the real
     # provisioning writer and its changed/idempotent output, not a copied merge.

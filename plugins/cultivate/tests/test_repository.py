@@ -2583,6 +2583,224 @@ def _lease_start(identifier, started, stderr=b""):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["paths", "node", "explicit", "default", "full_focused"])
+@pytest.mark.parametrize("sccache", [True, False])
+async def test_repo_test_rust_focused_selectors_argv_and_lease(tmp_path, monkeypatch, selection, sccache):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.setup import rust_focused_test_suites, toolchain_test_env
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    root = state.checkout_lease.path
+    (root / 'Cargo.toml').write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+    (root / 'tests/native_records.rs').write_text('#[test] fn native_records() {}\n')
+    (root / 'tests/other.rs').write_text('#[test] fn other() {}\n')
+    (root / 'tools').mkdir()
+    verify = root / 'tools/verify'
+    verify.write_text('#!/bin/sh\nexit 0\n')
+    verify.chmod(0o755)
+    # Match the deployment's rustup symlink layout, without running host cargo.
+    binaries = tmp_path / 'bin'
+    binaries.mkdir()
+    rustup = binaries / 'rustup'
+    rustup.write_text('#!/bin/sh\nexit 0\n')
+    rustup.chmod(0o755)
+    cargo = binaries / 'cargo'
+    cargo.symlink_to(rustup)
+    monkeypatch.setattr(repository, '_PATH', str(binaries) + ':' + repository._PATH)
+    _configure_test_suites(
+        tmp_path / 'home', state, test_command='./tools/verify',
+        test_suites=rust_focused_test_suites(sccache=sccache),
+    )
+    selectors = {
+        'paths': ('tests/native_records.rs', 'tests/other.rs'),
+        'node': ('tests/native_records.rs::native_records',),
+        'explicit': ('tests/native_records.rs',),
+    }.get(selection, ())
+    suite = 'focused' if selection in {'explicit', 'full_focused'} else None
+    calls = []
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        calls.append((argv, env))
+        leased = argv[0] == 'sh'
+        return CollectedExecutionResult(
+            0, b'ok', _lease_start(kwargs['identifier'], repository.time.monotonic()) if leased else b'',
+            False, False, 0, 0,
+        )
+
+    result = await repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(selectors, suite=suite)
+    assert result.ok and len(calls) == 1
+    argv, env = calls[0]
+    if selectors:
+        expected_filter = '(package(=fixture) & kind(test) & binary(=native_records)'
+        expected_filter += ' & test(=native_records))' if selection == 'node' else ')'
+        if selection == 'paths':
+            expected_filter += ' | (package(=fixture) & kind(test) & binary(=other))'
+        assert argv == (str(cargo), 'nextest', 'run', '--locked', '-E', expected_filter)
+        assert not any(key.startswith('MIMIR_HEAVY_') for key in env)
+    else:
+        assert argv[:2] == ('sh', './scripts/heavy_run.sh')
+        expected = ('./tools/verify',) if selection == 'default' else (
+            str(cargo), 'nextest', 'run', '--locked')
+        assert argv[10:] == expected
+        assert env['MIMIR_HEAVY_LOCK_FILE'] == str(tmp_path / 'heavy.lock')
+    if selection != 'default':
+        for key, value in toolchain_test_env('rust', sccache=sccache).items():
+            assert env[key] == value
+        assert ('RUSTC_WRAPPER' in env) is sccache
+        assert result.suite == 'focused'
+    else:
+        assert result.suite == 'default'
+
+
+@pytest.mark.parametrize('selector,expected', [
+    ('tests/native_records.rs', '(package(=fixture) & kind(test) & binary(=native_records))'),
+    ('tests/native_records.rs::native_records', '(package(=fixture) & kind(test) & binary(=native_records) & test(=native_records))'),
+    ('src/records.rs', '(package(=fixture) & kind(lib) & test(/^records::/))'),
+    ('src/records.rs::tests::works', '(package(=fixture) & kind(lib) & test(=records::tests::works))'),
+    ('src/records/mod.rs', '(package(=fixture) & kind(lib) & test(/^records::/))'),
+    ('src/lib.rs', '(package(=fixture) & kind(lib))'),
+    ('crates/dir-name/tests/native_records.rs', '(package(=actual-package) & kind(test) & binary(=native_records))'),
+    ('crates/dir-name/src/records.rs::works', '(package(=actual-package) & kind(lib) & test(=records::works))'),
+])
+def test_nextest_selector_mapping(tmp_path, selector, expected):
+    for directory, name in [(tmp_path, 'fixture'), (tmp_path / 'crates/dir-name', 'actual-package')]:
+        (directory / 'src').mkdir(parents=True)
+        (directory / 'src/lib.rs').write_text('')
+        (directory / 'Cargo.toml').write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\n')
+    assert repository._nextest_selector_arguments(tmp_path, (selector,)) == ('-E', expected)
+
+
+@pytest.mark.parametrize('selector', [
+    'tests/nested/helpers.rs', 'src/main.rs', 'src/bin/tool.rs',
+    'tests/native.rs::bad-name', 'tests/native.rs::foo)|all(',
+    'src/bad-name.rs', 'src/lib.rs::',
+])
+def test_nextest_unmappable_selector_refused(tmp_path, selector):
+    (tmp_path / 'Cargo.toml').write_text('[package]\nname = "fixture"\nversion = "0.1.0"\n')
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src/lib.rs').write_text('')
+    with pytest.raises(repository.ProjectTestRefusal, match='cannot be mapped'):
+        repository._nextest_selector_arguments(tmp_path, (selector,))
+
+
+@pytest.mark.asyncio
+async def test_nextest_zero_match_diagnostic(tmp_path, monkeypatch):
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.setup import rust_focused_test_suites
+
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    root = state.checkout_lease.path
+    (root / 'Cargo.toml').write_text('[package]\nname = "fixture"\nversion = "0.1.0"\n')
+    (root / 'tests/native.rs').write_text('')
+    binaries = tmp_path / 'bin'
+    binaries.mkdir()
+    cargo = binaries / 'cargo'
+    cargo.write_text('#!/bin/sh\nexit 4\n')
+    cargo.chmod(0o755)
+    monkeypatch.setattr(repository, '_PATH', str(binaries) + ':' + repository._PATH)
+    _configure_test_suites(tmp_path / 'home', state, test_suites=rust_focused_test_suites())
+
+    async def runner(argv, *args, **kwargs):
+        return CollectedExecutionResult(4, b'', b'0 tests run', False, False, 0, 0)
+
+    result = await repository.RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(('tests/native.rs::missing',))
+    assert not result.ok and result.returncode == 4
+    assert result.code == 'tests_failed'
+    assert 'No tests matched the selectors' in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_nextest_real_selection_and_zero_match(tmp_path, monkeypatch):
+    """Exercise production argv assembly, not just a helper's expected strings.
+
+    Passing raw paths to nextest again must make the positive controls fail.
+    """
+    import asyncio
+    import shutil
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.setup import rust_focused_test_suites
+
+    cargo = shutil.which('cargo')
+    if cargo is None:
+        pytest.skip('cargo nextest is not installed')
+    probe = await asyncio.create_subprocess_exec(
+        cargo, 'nextest', '--version', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.wait_for(probe.communicate(), 20)
+    if probe.returncode != 0:
+        pytest.skip('cargo nextest is not installed')
+    state = _repo_test_lease_fixture(tmp_path, monkeypatch)
+    root = state.checkout_lease.path
+    (root / 'Cargo.toml').write_text(
+        '[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n'
+        '[workspace]\nmembers = ["crates/member"]\n')
+    (root / 'src').mkdir()
+    (root / 'src/lib.rs').write_text('mod records;\n')
+    (root / 'src/records.rs').write_text('#[test] fn selected() {}\n')
+    (root / 'tests/native_records.rs').write_text('#[test] fn selected() {}\n')
+    (root / 'tests/other.rs').write_text('#[test] fn unselected() { panic!("must not run"); }\n')
+    member = root / 'crates/member'
+    (member / 'src').mkdir(parents=True)
+    (member / 'Cargo.toml').write_text('[package]\nname = "actual-member"\nversion = "0.1.0"\n')
+    (member / 'src/lib.rs').write_text('mod records;\n')
+    (member / 'src/records.rs').write_text('#[test] fn selected() {}\n')
+    (member / 'tests').mkdir()
+    (member / 'tests/native_records.rs').write_text('#[test] fn selected() {}\n')
+    # No external dependencies: a complete deterministic offline lockfile.
+    (root / 'Cargo.lock').write_text(
+        'version = 3\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n'
+        '[[package]]\nname = "actual-member"\nversion = "0.1.0"\n')
+    suites = rust_focused_test_suites(sccache=False)
+    suites[0]['legs'][0]['command'] = f'{cargo} nextest run --locked --offline --color never'
+    suites[0]['legs'][0]['env'] = {}
+    monkeypatch.setattr(repository, '_PATH', str(Path(cargo).parent) + ':' + repository._PATH)
+    _configure_test_suites(tmp_path / 'home', state, test_suites=suites)
+
+    async def runner(argv, capability, env, projections, **kwargs):
+        process = await asyncio.create_subprocess_exec(
+            *argv, cwd=capability.path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 120)
+        return CollectedExecutionResult(process.returncode, stdout, stderr, False, False, 0, 0)
+
+    executor = repository.RepoProjectTests(state, runner=runner, checkout_factory=_test_checkout_factory)
+    for selector in (
+        'tests/native_records.rs', 'tests/native_records.rs::selected',
+        'src/records.rs', 'src/records.rs::selected',
+        'crates/member/tests/native_records.rs', 'crates/member/src/records.rs::selected',
+    ):
+        result = await executor.execute((selector,), suite='focused')
+        output = result.stdout + result.stderr
+        assert result.ok, output
+        assert '1 test run: 1 passed' in output, output
+        assert 'unselected' not in output, output
+    result = await executor.execute(('tests/native_records.rs::missing',), suite='focused')
+    assert not result.ok and result.returncode == 4
+    assert 'No tests matched the selectors' in result.stderr
+
+
+@pytest.mark.parametrize("key,value", [
+    ('GITHUB_TOKEN', 'credential'),
+    ('RUSTUP_HOME', '../rustup'),
+    ('CARGO_HOME', '/cache/../controller'),
+    ('RUSTC_WRAPPER', '/arbitrary/wrapper'),
+    ('SCCACHE_DIR', '/cache\ninjection'),
+    ('SCCACHE_CACHE_SIZE', 'unbounded'),
+])
+def test_repo_test_rust_suite_environment_fails_closed(key, value):
+    from mimir_cultivate.setup import rust_focused_test_suites
+
+    suites = rust_focused_test_suites()
+    suites[0]['legs'][0]['env'][key] = value
+    with pytest.raises(ValueError):
+        repository._parse_test_suites(suites, 'test_suites', './tools/verify')
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["create", "acquire", "recover", "rebind", "queue", "checkout"])
 @pytest.mark.parametrize("fresh_scope", [False, True])
 async def test_repo_test_pending_blocks_lease_lifecycle_without_mutation(
